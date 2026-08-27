@@ -6,6 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+#local files
+apikey.txt 
+tng_download/* 
+*.png 
+*.csv 
+
 # Distribution / packaging
 .Python
 build/
