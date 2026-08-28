@@ -74,17 +74,29 @@ def _chandrasekhar_xfactor(v, sigma):
     return xterm / v**3
 
 
-def _rhs(t, y, m_cluster_msun, host, coulomb_log):
+def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft):
     r_vec = y[:3]
     v_vec = y[3:]
-    r = np.linalg.norm(r_vec)
+    r_actual = np.linalg.norm(r_vec)
+    # SOFTENED radius: used for every force/profile evaluation below, to
+    # avoid the 1/r^2 gravitational singularity blowing up (and forcing the
+    # adaptive integrator to crawl to a near-halt) whenever a near-radial or
+    # highly eccentric orbit swings close to the center. r_soft is tied to
+    # r_stop (the "merged" threshold) by the caller -- once the true
+    # separation would go below that, we're about to declare the cluster
+    # merged anyway, so regularizing the force there doesn't change the
+    # physics we actually care about.
+    r = max(r_actual, r_soft)
     v = max(np.linalg.norm(v_vec), 1e-8)
 
     Menc = host.mass_enclosed(r)
     rho = host.density(r)
     sigma = host.velocity_dispersion(r)
 
-    a_grav = -_G * Menc / r**2 * (r_vec / r)
+    # direction uses the TRUE separation (undefined only exactly at the
+    # origin, where the softened magnitude below makes the force ~0 anyway)
+    r_hat = r_vec / r_actual if r_actual > 1e-12 else np.zeros(3)
+    a_grav = -_G * Menc / r**2 * r_hat
 
     coeff = 4 * np.pi * _G**2 * m_cluster_msun * rho * coulomb_log
     a_df = -coeff * _chandrasekhar_xfactor(v, sigma) * v_vec
@@ -139,7 +151,7 @@ def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape)]
 
     sol = solve_ivp(
-        _rhs, (0, t_max_gyr), y0, args=(m_msun, host, coulomb_log),
+        _rhs, (0, t_max_gyr), y0, args=(m_msun, host, coulomb_log, r_stop),
         events=events, method="RK45", rtol=1e-8, atol=1e-10,
     )
 

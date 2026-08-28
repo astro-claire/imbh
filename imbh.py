@@ -1,6 +1,6 @@
-
 import argparse
 import os
+import signal
 import sys
 sys.path.append("/Users/clairewilliams/Research/Calculations/model-timescales/src")
 
@@ -14,7 +14,7 @@ from cluster_population_sampler import ClusterPopulationSampler
 
  
 # dynamical friction orbit integration (separate module, kept alongside this script)
-from dynamical_friction import NFWHost, sink_time_from_magnitudes
+from dynamical_friction import NFWHost, sink_time
 #timescales stuff
 from timescales import TimescaleEnsemble
 from timescales.data import build_single_system_grid
@@ -28,6 +28,10 @@ alpha = 1.2
 # are less concentrated), possibly per-halo from a mass-concentration-
 # redshift relation rather than one fixed number for every subhalo.
 HOST_CONCENTRATION = 4.0
+
+
+
+
 
 cluster_sampler = ClusterPopulationSampler.load("/Users/clairewilliams/Research/IMBH/cluster_sampler.pkl")
 
@@ -46,7 +50,7 @@ def draw_clusters(subhalo_mass, subhalo_radius):
 
  
 def assign_subhalo_merger_tscale(cluster_props, delta_t, subhalo_mass, subhalo_radius,
-                                  concentration=HOST_CONCENTRATION, rng=None):
+                                  concentration=HOST_CONCENTRATION):
     """
     For each cluster, integrate its dynamical friction sink time through
     the host subhalo's (fixed, formation-time) NFW profile, and compare it
@@ -59,6 +63,13 @@ def assign_subhalo_merger_tscale(cluster_props, delta_t, subhalo_mass, subhalo_r
         "host_merger", tscale = delta_t (unchanged from before -- this is
         the FIXED-formation-time model; a later version can hand the
         cluster off to the new host and continue integrating from there).
+
+    cluster_props['cluster_sep'] and ['cluster_vel'] are now (N,3) VECTOR
+    Quantities (the direction sampling -- isotropic separation, and a
+    velocity direction correlated with separation via a real sampled
+    cos_theta -- already happened in ClusterPopulationSampler.draw_clusters()),
+    so we integrate the actual orbit directly via sink_time() rather than
+    re-inventing a random direction here.
     """
     host = NFWHost(subhalo_mass * u.Msun, subhalo_radius * u.kpc, concentration=concentration)
     delta_t_q = delta_t * u.Gyr
@@ -67,11 +78,11 @@ def assign_subhalo_merger_tscale(cluster_props, delta_t, subhalo_mass, subhalo_r
     which_outcome = []
     for clusteridx in range(len(cluster_props['cluster_mass'])):
         m_cl = cluster_props['cluster_mass'][clusteridx]
-        r0_mag = cluster_props['cluster_sep'][clusteridx]
-        v0_mag = cluster_props['cluster_vel'][clusteridx]
+        r0_vec = cluster_props['cluster_sep'][clusteridx]
+        v0_vec = cluster_props['cluster_vel'][clusteridx]
  
-        t_df, status = sink_time_from_magnitudes(
-            m_cl, r0_mag, v0_mag, host, rng=rng, t_max=delta_t_q,
+        t_df, status = sink_time(
+            m_cl, r0_vec, v0_vec, host, t_max=delta_t_q,
         )
  
         if status == "merged" and t_df < delta_t_q:
@@ -102,9 +113,16 @@ def add_time_evolution(delta_t, model):
     return output
 
 
+def _run_timescale_model(mass, radius, delta_t):
+    """Bundles create_timescale_model + add_time_evolution into one call for run_with_timeout()."""
+    model = create_timescale_model(mass, radius)
+    return add_time_evolution(delta_t, model)
+
+
 # ------- Iteration over all the subhalos
 def iterate_subhalos(df, goodidx): 
     clusters = []
+    failures = []  # (halo_idx, cluster_idx, merger_tscale, which_outcome, error_message)
     #testing mode-just do the first few
     for idx in goodidx[0:10]: 
         cluster_props= draw_clusters(df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
@@ -114,8 +132,7 @@ def iterate_subhalos(df, goodidx):
         cluster_props['merger_tscale'], cluster_props['which_outcome'] = assign_subhalo_merger_tscale(cluster_props, df['delta_t_gyr'][idx], df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
         cluster_props['IMBH_mass']= []
         for clusteridx in range(len(cluster_props['cluster_mass'])):
-            print(cluster_props['merger_tscale'][clusteridx] *u.Gyr, cluster_props['which_outcome'][clusteridx])
-            model = create_timescale_model(cluster_props['cluster_mass'][clusteridx],cluster_props['cluster_radius'][clusteridx])
+            model = create_timescale_model(cluster_props['cluster_mass'][clusteridx],cluster_props['cluster_radius'][clusteridx])            
             out = add_time_evolution(cluster_props['merger_tscale'][clusteridx] *u.Gyr, model)
             cluster_props['IMBH_mass'].append(out['M_VMS'][0])
         clusters.append(cluster_props)
@@ -142,33 +159,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-# def create_grid(masses,radii,*,alpha=3/5,energy_unit=u.erg,cutoff_density=None):
-#     """
-#     Same output structure as build_bulk_energy_grid, but masses[i] is paired
-#     with radii[i] (no meshgrid), and V is derived from virial equilibrium:
-#         2K + U = 0  =>  0.5*M*V^2 = alpha*G*M^2/(2R)  =>  V = sqrt(alpha*G*M/R)
-#     """
-#     masses = u.Quantity(masses)
-#     radii = u.Quantity(radii)
-#     if masses.shape != radii.shape:
-#         raise ValueError("masses and radii must be the same length (paired mode)")
-
-#     # Virial velocity for each (M, R) pair
-#     V = np.sqrt(alpha * G * masses / radii).to(u.km / u.s)
-
-#     # Energies
-#     K = kinetic_energy(masses, V, out_unit=energy_unit)
-#     U = gravitational_potential_energy(masses, radii, alpha=alpha, out_unit=energy_unit)
-
-#     rho = masses / (4. * np.pi / 3 * (radii**3))
-#     if cutoff_density is not None:
-#         mask &= rho < cutoff_density
-
-#     out = {'M': masses[mask],'R': radii[mask],'V': V[mask],'K': K[mask],'U': U[mask],}
-#     return out

@@ -38,6 +38,36 @@ from astropy.constants import G
 G_KPC_MSUN_KMS = G.to(u.kpc * u.km**2 / u.s**2 / u.Msun).value  # for fast plain-float v_circ calc
 
 
+def _random_isotropic_unit_vectors(n, rng):
+    """n independent uniformly-random unit vectors on the sphere."""
+    vec = rng.normal(size=(n, 3))
+    return vec / np.linalg.norm(vec, axis=1, keepdims=True)
+
+
+def _random_perpendicular_unit_vectors(r_hat, rng):
+    """
+    For each unit vector in r_hat (n,3), a random unit vector perpendicular
+    to it (uniformly random azimuthal angle around r_hat).
+    """
+    n = r_hat.shape[0]
+    rand = rng.normal(size=(n, 3))
+    proj = np.sum(rand * r_hat, axis=1, keepdims=True) * r_hat
+    perp = rand - proj
+    perp_norm = np.linalg.norm(perp, axis=1, keepdims=True)
+
+    # Guard the near-zero-probability case where `rand` happened to land
+    # (almost) parallel to r_hat, which would make `perp` numerically ill-defined.
+    bad = perp_norm[:, 0] < 1e-8
+    if np.any(bad):
+        rand2 = rng.normal(size=(int(bad.sum()), 3))
+        proj2 = np.sum(rand2 * r_hat[bad], axis=1, keepdims=True) * r_hat[bad]
+        perp2 = rand2 - proj2
+        perp[bad] = perp2
+        perp_norm[bad] = np.linalg.norm(perp2, axis=1, keepdims=True)
+
+    return perp / perp_norm
+
+
 class ClusterPopulationSampler:
     def __init__(self, pickle_path=None, cluster_mass_key='stellarMass_msun',
                  cluster_hmradius_key='hmradii_kpc', bandwidth_dex=0.3,
@@ -119,6 +149,8 @@ class ClusterPopulationSampler:
         cl_hmradius_parts = []
         cl_dist_over_rvir_parts = []
         cl_vel_over_vcirc_parts = []
+        cl_cos_theta_parts = []
+        have_any_geometry = False
 
         missing_mass_key = missing_hmradius_key = missing_vel_key = 0
         skipped_zero_rvir = 0
@@ -147,6 +179,24 @@ class ClusterPopulationSampler:
             cl_dist_over_rvir_parts.append(np.asarray(entry['cluster_distance']) / rad)
             cl_vel_over_vcirc_parts.append(np.asarray(entry['cluster_rel_vel_mag']) / vcirc)
 
+            # angle between separation and velocity vectors, if we have both
+            # -- this is what lets us sample a REAL (not isotropic-random)
+            # relative direction for the velocity below.
+            if 'cluster_rel_pos' in entry and 'cluster_rel_vel' in entry:
+                pos_vec = np.asarray(entry['cluster_rel_pos'])
+                vel_vec = np.asarray(entry['cluster_rel_vel'])
+                pos_norm = np.linalg.norm(pos_vec, axis=1)
+                vel_norm = np.linalg.norm(vel_vec, axis=1)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    cos_theta = np.sum(pos_vec * vel_vec, axis=1) / (pos_norm * vel_norm)
+                # guard the (rare) zero-norm edge case rather than propagating NaN
+                cos_theta = np.where((pos_norm > 0) & (vel_norm > 0), cos_theta, 0.0)
+                cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                cl_cos_theta_parts.append(cos_theta)
+                have_any_geometry = True
+            else:
+                cl_cos_theta_parts.append(np.full(n, np.nan))
+
         if missing_mass_key or missing_hmradius_key or missing_vel_key:
             print(f"  note: skipped some clusters missing required fields -- "
                   f"mass:{missing_mass_key}, hmradius:{missing_hmradius_key}, vel:{missing_vel_key}")
@@ -164,6 +214,19 @@ class ClusterPopulationSampler:
         cl_hmradius = np.concatenate(cl_hmradius_parts)
         cl_dist_over_rvir = np.concatenate(cl_dist_over_rvir_parts)
         cl_vel_over_vcirc = np.concatenate(cl_vel_over_vcirc_parts)
+        cl_cos_theta = np.concatenate(cl_cos_theta_parts)
+
+        self.have_geometry = have_any_geometry
+        if not have_any_geometry:
+            print("  note: 'cluster_rel_pos'/'cluster_rel_vel' not found in the calibration data -- "
+                  "velocity DIRECTION will fall back to an isotropic random draw, independent of the "
+                  "separation direction (same as the old sink_time_from_magnitudes behavior). Re-run "
+                  "find_clusters_near_halos_exclusive.py to get real relative-orientation sampling.")
+        elif np.any(np.isnan(cl_cos_theta)):
+            n_nan = np.sum(np.isnan(cl_cos_theta))
+            print(f"  note: {n_nan} of {len(cl_cos_theta)} clusters are missing geometry info "
+                  f"(mixed old/new catalog?) -- those will fall back to an isotropic random "
+                  f"velocity direction individually.")
 
         # presort by host log-mass for windowed lookup
         cl_order = np.argsort(cl_log_host_mass)
@@ -172,6 +235,7 @@ class ClusterPopulationSampler:
         self.cl_hmradius = cl_hmradius[cl_order]
         self.cl_dist_over_rvir = cl_dist_over_rvir[cl_order]
         self.cl_vel_over_vcirc = cl_vel_over_vcirc[cl_order]
+        self.cl_cos_theta = cl_cos_theta[cl_order]
 
         print(f"Calibration catalog: {len(self.halo_log_mass)} halos "
               f"(log10 M range [{self.halo_log_mass.min():.2f}, {self.halo_log_mass.max():.2f}]), "
@@ -208,8 +272,22 @@ class ClusterPopulationSampler:
     # ------------------------------------------------------------------
     def draw_clusters(self, subhalo_mass, subhalo_radius):
         """
-        Drop-in replacement for the draw_clusters() placeholder. Takes plain
-        floats (Msun, kpc) and returns the same dict shape as before.
+        Drop-in-ish replacement for the draw_clusters() placeholder.
+        Takes plain floats (Msun, kpc). Returns 'cluster_mass' (Msun),
+        'cluster_radius' (pc) as before, but 'cluster_sep' and 'cluster_vel'
+        are now (N,3) VECTOR Quantities (kpc and km/s respectively), not
+        bare magnitudes -- the separation direction is isotropic random
+        (there's no preferred absolute direction), and the velocity
+        direction is built from a REAL angle-to-separation (cos_theta)
+        bootstrapped from the calibration data jointly with everything
+        else, rather than an independent isotropic guess. Falls back to an
+        independent isotropic velocity direction per-cluster if the
+        calibration catalog (or a given cluster within it) lacks
+        cluster_rel_pos/cluster_rel_vel.
+
+        Pass these vectors straight to dynamical_friction.sink_time()
+        (not sink_time_from_magnitudes()) -- the direction sampling now
+        happens here instead.
         """
         log_target = np.log10(subhalo_mass)
 
@@ -226,8 +304,6 @@ class ClusterPopulationSampler:
             )
 
         if total_weight == 0:
-            # fall back to the single nearest halo in log-mass (still gives
-            # *something*, but the warning above already fired)
             nearest = np.searchsorted(self.halo_log_mass, log_target)
             nearest = np.clip(nearest, 0, len(self.halo_log_mass) - 1)
             n_draw = int(self.halo_n_clusters[nearest])
@@ -239,8 +315,8 @@ class ClusterPopulationSampler:
         empty = {
             'cluster_mass': np.array([]) * u.Msun,
             'cluster_radius': np.array([]) * u.pc,
-            'cluster_sep': np.array([]) * u.kpc,
-            'cluster_vel': np.array([]) * u.km / u.s,
+            'cluster_sep': np.zeros((0, 3)) * u.kpc,
+            'cluster_vel': np.zeros((0, 3)) * u.km / u.s,
         }
         if n_draw == 0:
             return empty
@@ -259,8 +335,26 @@ class ClusterPopulationSampler:
 
         cluster_mass = self.cl_mass[idx] * u.Msun
         cluster_radius = (self.cl_hmradius[idx] * u.kpc).to(u.pc)
-        cluster_sep = self.cl_dist_over_rvir[idx] * subhalo_radius * u.kpc
-        cluster_vel = self.cl_vel_over_vcirc[idx] * v_circ_target * u.km / u.s
+        sep_mag = self.cl_dist_over_rvir[idx] * subhalo_radius       # kpc, plain float
+        vel_mag = self.cl_vel_over_vcirc[idx] * v_circ_target        # km/s, plain float
+        cos_theta = self.cl_cos_theta[idx]                            # may contain NaN (no geometry info)
+
+        r_hat = _random_isotropic_unit_vectors(n_draw, self.rng)
+
+        has_geom = ~np.isnan(cos_theta)
+        v_hat = np.empty((n_draw, 3))
+        if np.any(has_geom):
+            ct = cos_theta[has_geom][:, None]
+            st = np.sqrt(np.clip(1.0 - ct**2, 0.0, 1.0))
+            t_hat = _random_perpendicular_unit_vectors(r_hat[has_geom], self.rng)
+            v_hat[has_geom] = ct * r_hat[has_geom] + st * t_hat
+        if np.any(~has_geom):
+            # no real angle available for these clusters -- fall back to an
+            # independent isotropic direction, same as the old behavior.
+            v_hat[~has_geom] = _random_isotropic_unit_vectors(int((~has_geom).sum()), self.rng)
+
+        cluster_sep = (sep_mag[:, None] * r_hat) * u.kpc
+        cluster_vel = (vel_mag[:, None] * v_hat) * (u.km / u.s)
 
         return {
             'cluster_mass': cluster_mass,
@@ -270,7 +364,7 @@ class ClusterPopulationSampler:
         }
 
     # ------------------------------------------------------------------
-    # Save / load 
+    # Save / load (this is the part you asked about!)
     # ------------------------------------------------------------------
     def __getstate__(self):
         # exclude the RNG from the pickled state -- np.random.Generator IS
