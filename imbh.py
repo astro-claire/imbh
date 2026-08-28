@@ -10,6 +10,7 @@ import h5py
 import matplotlib.pyplot as plt 
 import pandas as pd
 from astropy.constants import G
+from cluster_population_sampler import ClusterPopulationSampler
 
  
 # dynamical friction orbit integration (separate module, kept alongside this script)
@@ -27,6 +28,10 @@ alpha = 1.2
 # are less concentrated), possibly per-halo from a mass-concentration-
 # redshift relation rather than one fixed number for every subhalo.
 HOST_CONCENTRATION = 4.0
+
+cluster_sampler = ClusterPopulationSampler.load("/Users/clairewilliams/Research/IMBH/cluster_sampler.pkl")
+
+
 #--------- Load post-processed illustris merger tree 
 def load_merger_tree_idx(df):
     goodidx = np.where(df['delta_t_gyr']>0)[0]
@@ -36,26 +41,9 @@ def load_merger_tree_idx(df):
 
 # -------- Attach AREPO clusters to the primordial halos
 #          For each cluster, we have delta_r and delta_v away from the central 
-
 def draw_clusters(subhalo_mass, subhalo_radius):
-    """ placeholder - based on the subhalo properties
-        I will draw a distribution of clusters 
-        This will return their mass and their separation and velocity"""
-    cluster_props = {'cluster_mass':np.array([1e4,1e5, 1e5, 1e6, 1e6])*u.Msun,
-                     'cluster_radius':np.array([1,11, 2, 10,4])*u.pc,} #dummmy placeholder
- 
-    # TODO: replace with real separation/velocity draws matched to your
-    # high-resolution simulation's distributions. As a placeholder, scale
-    # separations to a random fraction of the host's virial radius, and
-    # velocities to a random fraction of the host's circular velocity, so
-    # the dynamical friction integration at least sees physically
-    # sensible (not arbitrary) orbits while draw_clusters is a stand-in.
-    n = len(cluster_props['cluster_mass'])
-    v_host = np.sqrt(G * subhalo_mass*u.Msun / (subhalo_radius*u.kpc)).to(u.km/u.s)
-    cluster_props['cluster_sep'] = np.random.uniform(0.05, 0.5, n) * subhalo_radius * u.kpc
-    cluster_props['cluster_vel'] = np.random.uniform(0.3, 1.2, n) * v_host
- 
-    return cluster_props
+    return cluster_sampler.draw_clusters(subhalo_mass, subhalo_radius)
+
  
 def assign_subhalo_merger_tscale(cluster_props, delta_t, subhalo_mass, subhalo_radius,
                                   concentration=HOST_CONCENTRATION, rng=None):
@@ -96,17 +84,6 @@ def assign_subhalo_merger_tscale(cluster_props, delta_t, subhalo_mass, subhalo_r
             which_outcome.append("host_merger" if status != "escaped" else "escaped")
  
     return tscales, which_outcome
- 
-
-# def assign_subhalo_merger_tscale(cluster_props, delta_t, subhalo_mass, subhalo_radius):
-#     tscales =[]
-#     which_outcome = []
-#     for clusteridx in range(len(cluster_props['cluster_mass'])):
-#         tscales.append(delta_t)
-#         which_outcome.append("host_merger")
-#     return tscales, which_outcome
-
-
 
 #-------- time evolution for the IMBH analytic model
 # 
@@ -131,6 +108,9 @@ def iterate_subhalos(df, goodidx):
     #testing mode-just do the first few
     for idx in goodidx[0:10]: 
         cluster_props= draw_clusters(df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
+        print("Generated " +str(len(cluster_props['cluster_mass']))+ " clusters for this halo.")
+        print(cluster_props['cluster_mass'])
+        print(cluster_props['cluster_vel'])
         cluster_props['merger_tscale'], cluster_props['which_outcome'] = assign_subhalo_merger_tscale(cluster_props, df['delta_t_gyr'][idx], df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
         cluster_props['IMBH_mass']= []
         for clusteridx in range(len(cluster_props['cluster_mass'])):

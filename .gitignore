@@ -11,6 +11,7 @@ apikey.txt
 tng_download/* 
 *.png 
 *.csv 
+supersonic_sim_data/*
 
 # Distribution / packaging
 .Python
