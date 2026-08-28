@@ -12,7 +12,7 @@ tng_download/*
 *.png 
 *.csv 
 supersonic_sim_data/*
-
+*.pkl
 # Distribution / packaging
 .Python
 build/
