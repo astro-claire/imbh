@@ -313,7 +313,7 @@ class ClusterPopulationSampler:
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
-    def draw_clusters(self, subhalo_mass, subhalo_radius,cluster_factor = 10):
+    def draw_clusters(self, subhalo_mass, subhalo_radius,cluster_factor = 5):
         """
         Drop-in-ish replacement for the draw_clusters() placeholder.
         Takes plain floats (Msun, kpc). Returns 'cluster_mass' (Msun),

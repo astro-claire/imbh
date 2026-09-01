@@ -108,8 +108,8 @@ cluster_sampler = ClusterPopulationSampler.load(CLUSTER_SAMPLER_PATH)
 
 
 #--------- Load post-processed illustris merger tree 
-def load_merger_tree_idx(df,cutoff_z = 10):
-    goodidx = np.where((df['delta_t_gyr']>0) & (df['formation_redshift']>cutoff_z))[0]
+def load_merger_tree_idx(df,cutoff_z = 9.9):
+    goodidx = np.where((df['delta_t_gyr']>0) & (df['formation_redshift']>=cutoff_z))[0]
     print("There are "+str(len(goodidx))+" subhalos with nonzero merger time and formation time above z cutoff.")
     return goodidx
 
@@ -591,7 +591,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
     clusters = []
     failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
     #testing mode-just do the first few
-    for idx in goodidx[1000:1110]:
+    for idx in goodidx:
         cluster_props = draw_clusters(df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
         print("Generated " + str(len(cluster_props['cluster_mass'])) + " clusters for this halo.")
 
@@ -612,6 +612,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
         cluster_props['IMBH_mass'] = []
         cluster_props['IMBH_final_formation_time']=[]
         cluster_props['which_final_formation_time']=[]
+        cluster_props['initial_subhalo_mass_msun']=[]
+        cluster_props['initial_subhalo_formation_redshift']=[]
         for clusteridx in range(len(cluster_props['cluster_mass'])):
             m_cl = cluster_props['cluster_mass'][clusteridx]
             r0_vec = cluster_props['cluster_sep'][clusteridx]
@@ -641,6 +643,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
                 cluster_props['total_time_gyr'].append(np.nan)
                 cluster_props['final_subhalo_id'].append(None)
                 cluster_props['initial_subhalo_id'].append(idx)
+                cluster_props['initial_subhalo_mass_msun'].append(df['group_m_crit200_msun'][idx])
+                cluster_props['initial_subhalo_formation_redshift'].append(df['formation_redshift'][idx])
                 cluster_props['final_r_over_rvir'].append(np.nan)
                 cluster_props['n_hops'].append(None)
                 cluster_props['n_steps'].append(None)
@@ -664,6 +668,9 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
             cluster_props['total_time_gyr'].append(trace['total_time_gyr'])
             cluster_props['final_subhalo_id'].append(trace['final_subhalo_id'])
             cluster_props['initial_subhalo_id'].append(idx)
+            cluster_props['initial_subhalo_mass_msun'].append(df['group_m_crit200_msun'][idx])
+            cluster_props['initial_subhalo_formation_redshift'].append(df['formation_redshift'][idx])
+
             cluster_props['final_r_over_rvir'].append(trace['final_r_over_rvir'])
             cluster_props['n_hops'].append(trace['n_hops'])
             cluster_props['n_steps'].append(trace['n_steps'])
@@ -775,6 +782,8 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'status': cluster_props['status'][i],
                 'total_time_gyr': cluster_props['total_time_gyr'][i],
                 'initial_subhalo_id': cluster_props['initial_subhalo_id'][i],
+                'initial_subhalo_mass_msun': cluster_props['initial_subhalo_mass_msun'][i],
+                'initial_subhalo_formation_redshift': cluster_props['initial_subhalo_formation_redshift'][i],
                 'final_subhalo_id': final_id if final_id is not None else np.nan,
                 'final_r_over_rvir': cluster_props['final_r_over_rvir'][i],
                 'n_hops': n_hops if n_hops is not None else np.nan,
@@ -784,8 +793,8 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'final_bound': final_bound if final_bound is not None else np.nan,
                 'min_roche_radius_kpc': min_roche_radius_kpc if min_roche_radius_kpc is not None else np.nan,
                 'time_of_min_roche_gyr': time_of_min_roche_gyr if time_of_min_roche_gyr is not None else np.nan,
-                'IMBH_mass': cluster_props['IMBH_mass'][i],
-                'IMBH_final_formation_time': cluster_props['IMBH_final_formation_time'][i],
+                'IMBH_mass_msun': cluster_props['IMBH_mass'][i].to('Msun').value,
+                'IMBH_final_formation_time_gyr': cluster_props['IMBH_final_formation_time'][i].to('Gyr').value,
                 'which_final_formation_time': cluster_props['which_final_formation_time'][i],
             })
 
