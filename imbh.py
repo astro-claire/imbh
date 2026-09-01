@@ -158,16 +158,19 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
     is exactly what's needed to cap any single solve_ivp call's duration
     even when there's no "next" host to interpolate toward.
 
-    Returns (status, elapsed, r_vec, v_vec, n_pericenters) matching
-    integrate_orbit's signature, with elapsed being the TOTAL time
-    actually used (less than leg_duration if merged/escaped partway
-    through a sub-step), and n_pericenters the TOTAL pericenter count
-    summed across every sub-step.
+    Returns (status, elapsed, r_vec, v_vec, n_pericenters,
+    min_roche_radius_kpc) matching integrate_orbit's signature, with
+    elapsed being the TOTAL time actually used (less than leg_duration if
+    merged/escaped partway through a sub-step), n_pericenters the TOTAL
+    pericenter count summed across every sub-step, and
+    min_roche_radius_kpc the smallest tidal radius found at ANY pericenter
+    across every sub-step (None if none occurred).
     """
     n_sub = max(1, int(np.ceil((leg_duration / max_leg_duration).to(u.dimensionless_unscaled).value)))
     sub_dt = leg_duration / n_sub
     total_elapsed = 0 * u.Gyr
     total_pericenters = 0
+    min_roche_radius_kpc = None
 
     for k in range(n_sub):
         frac = k / n_sub
@@ -182,20 +185,22 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
         # rule as intermediate legs generally.
         this_escape_frac = escape_frac if k == n_sub - 1 else np.inf
 
-        status, elapsed, r_vec, v_vec, n_peri = integrate_orbit(
+        status, elapsed, r_vec, v_vec, n_peri, roche_this = integrate_orbit(
             cluster_mass, r_vec, v_vec, host_k, t_max=sub_dt, escape_frac=this_escape_frac,
             background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_k,
         )
         total_elapsed += elapsed
         total_pericenters += n_peri
+        if roche_this is not None and (min_roche_radius_kpc is None or roche_this < min_roche_radius_kpc):
+            min_roche_radius_kpc = roche_this
 
         if status in ("merged", "escaped"):
-            return status, total_elapsed, r_vec, v_vec, total_pericenters
+            return status, total_elapsed, r_vec, v_vec, total_pericenters, min_roche_radius_kpc
 
         r_vec = r_vec + rel_pos_total / n_sub
         v_vec = v_vec + rel_vel_total / n_sub
 
-    return "ongoing", total_elapsed, r_vec, v_vec, total_pericenters
+    return "ongoing", total_elapsed, r_vec, v_vec, total_pericenters, min_roche_radius_kpc
 
 
 def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, target_age,
@@ -297,6 +302,13 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             alone, which can't distinguish a wide-but-bound eccentric
             orbit from genuine unconfined drift.
         final_bound: bool, final_energy_kms2 < 0
+        min_roche_radius_kpc: the smallest Jacobi tidal radius (see
+            NFWHost.tidal_radius) found at ANY pericenter passage across
+            the ENTIRE trace, computed as a cheap post-processing step on
+            solve_ivp's already-recorded pericenter-event states (not
+            re-evaluated at every integration step). None if the cluster
+            never had a pericenter (e.g. it merged/escaped before ever
+            completing one).
     """
     current_id = start_subhalo_id
     r_vec, v_vec = r0_vec, v0_vec
@@ -305,6 +317,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
     current_age = formation_age
     n_hops = 0
     n_pericenters = 0
+    min_roche_radius_kpc = None
 
     def make_result(status, host_id, r, v, r_over_rvir, steps):
         final_energy_kms2, _, _, _ = _compute_specific_energy_kms2(
@@ -322,6 +335,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             'n_pericenters': n_pericenters,
             'final_energy_kms2': final_energy_kms2,
             'final_bound': bool(final_energy_kms2 < 0),
+            'min_roche_radius_kpc': min_roche_radius_kpc,
         }
 
     for step in range(max_steps):
@@ -431,7 +445,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 
         if subdivided:
             if capped_by == 'step':
-                status, elapsed, r_vec, v_vec, n_peri = _integrate_leg_with_subdivision(
+                status, elapsed, r_vec, v_vec, n_peri, roche_this = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, next_mass_msun, next_radius_kpc,
                     rel_pos_full, rel_vel_full, t_leg_max, concentration, bg_host, bg_offset, max_leg_duration,
                     hubble_start, hubble_end,
@@ -442,7 +456,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 # integrating within the SAME unchanging host, zero reframe.
                 zero_pos = np.zeros(3) * u.kpc
                 zero_vel = np.zeros(3) * u.km / u.s
-                status, elapsed, r_vec, v_vec, n_peri = _integrate_leg_with_subdivision(
+                status, elapsed, r_vec, v_vec, n_peri, roche_this = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, mass_msun, radius_kpc,
                     zero_pos, zero_vel, t_leg_max, concentration, bg_host, bg_offset, max_leg_duration,
                     hubble_start, hubble_start, escape_frac=escape_frac,
@@ -450,14 +464,16 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         else:
             host = NFWHost(mass_msun * u.Msun, radius_kpc * u.kpc, concentration=concentration)
             if t_leg_max > 0 * u.Gyr:
-                status, elapsed, r_vec, v_vec, n_peri = integrate_orbit(
+                status, elapsed, r_vec, v_vec, n_peri, roche_this = integrate_orbit(
                     cluster_mass, r_vec, v_vec, host, t_max=t_leg_max, escape_frac=escape_frac,
                     background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_start,
                 )
             else:
-                status, elapsed, n_peri = "ongoing", 0 * u.Gyr, 0
+                status, elapsed, n_peri, roche_this = "ongoing", 0 * u.Gyr, 0, None
         current_age = current_age + elapsed
         n_pericenters += n_peri
+        if roche_this is not None and (min_roche_radius_kpc is None or roche_this < min_roche_radius_kpc):
+            min_roche_radius_kpc = roche_this
 
         if verbose:
             r_mag_post_integrate = np.linalg.norm(r_vec.to(u.kpc).value)
@@ -501,6 +517,17 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 #-------- time evolution for the IMBH analytic model
 # 
 def create_timescale_model(mass, radius, Nsampling = 5):
+    # build_single_system_grid expects `radius` to be r0 of a power-law
+    # density profile (rho ~ r^-alpha), with `mass` being the mass
+    # ENCLOSED WITHIN r0 -- but the cluster sampler gives us the HALF-MASS
+    # radius r_1/2 (paired with the cluster's FULL mass). For a pure
+    # power law, M(r) ~ r^(3-alpha), so M(r1)/M(r2) = (r1/r2)^(3-alpha)
+    # for any two radii on the same profile. Setting M(r_1/2)=mass/2 and
+    # M(r0)=mass (since `mass` is what we're passing in as the enclosed
+    # mass at r0) gives (r_1/2 / r0)^(3-alpha) = 1/2, i.e.
+    # r0 = r_1/2 * 2^(1/(3-alpha)). Requires alpha < 3 (needed for the
+    # power-law mass integral to converge at r->0 in the first place).
+    radius = radius * 2 ** (1. / (3 - alpha))
     grid = build_single_system_grid(mass,radius)
     model_nobh = TimescaleEnsemble(grid, 
                         verbose = False,
@@ -524,9 +551,9 @@ def _run_timescale_model(mass, radius, delta_t):
 # ------- Iteration over all the subhalos
 def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
     clusters = []
-    failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message)
+    failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
     #testing mode-just do the first few
-    for idx in goodidx[1000:1010]:
+    for idx in goodidx[1000:1100]:
         cluster_props = draw_clusters(df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
         print("Generated " + str(len(cluster_props['cluster_mass'])) + " clusters for this halo.")
 
@@ -542,6 +569,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
         cluster_props['n_pericenters'] = []
         cluster_props['final_energy_kms2'] = []
         cluster_props['final_bound'] = []
+        cluster_props['min_roche_radius_kpc'] = []
         cluster_props['IMBH_mass'] = []
         cluster_props['IMBH_final_formation_time']=[]
         cluster_props['which_final_formation_time']=[]
@@ -573,13 +601,14 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
                 cluster_props['status'].append("trace_failed")
                 cluster_props['total_time_gyr'].append(np.nan)
                 cluster_props['final_subhalo_id'].append(None)
-                cluster_props['initial_subhalo_id'].append(start_subhalo_id)
+                cluster_props['initial_subhalo_id'].append(idx)
                 cluster_props['final_r_over_rvir'].append(np.nan)
                 cluster_props['n_hops'].append(None)
                 cluster_props['n_steps'].append(None)
                 cluster_props['n_pericenters'].append(None)
                 cluster_props['final_energy_kms2'].append(np.nan)
                 cluster_props['final_bound'].append(None)
+                cluster_props['min_roche_radius_kpc'].append(None)
                 cluster_props['IMBH_mass'].append(np.nan)
                 cluster_props['IMBH_final_formation_time'].append(np.nan)
                 cluster_props['which_final_formation_time'].append(None)
@@ -593,13 +622,14 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
             cluster_props['status'].append(trace['status'])
             cluster_props['total_time_gyr'].append(trace['total_time_gyr'])
             cluster_props['final_subhalo_id'].append(trace['final_subhalo_id'])
-            cluster_props['initial_subhalo_id'].append(start_subhalo_id)
+            cluster_props['initial_subhalo_id'].append(idx)
             cluster_props['final_r_over_rvir'].append(trace['final_r_over_rvir'])
             cluster_props['n_hops'].append(trace['n_hops'])
             cluster_props['n_steps'].append(trace['n_steps'])
             cluster_props['n_pericenters'].append(trace['n_pericenters'])
             cluster_props['final_energy_kms2'].append(trace['final_energy_kms2'])
             cluster_props['final_bound'].append(trace['final_bound'])
+            cluster_props['min_roche_radius_kpc'].append(trace['min_roche_radius_kpc'])
 
             out, err = run_with_timeout(
                 _run_timescale_model, TIMESCALES_CALL_TIMEOUT_S,
@@ -609,8 +639,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
             )
             if err is not None:
                 print(f"    WARNING: timescales call failed/timed out ({err}) -- "
-                      f"logging and using NaN for this cluster's IMBH_mass.")
-                failures.append((idx, clusteridx, trace['total_time_gyr'], trace['status'], err))
+                      f"using NaN for this cluster's IMBH_mass.")
                 cluster_props['IMBH_mass'].append(np.nan)
                 cluster_props['IMBH_final_formation_time'].append(np.nan)
                 cluster_props['which_final_formation_time'].append(None)
@@ -622,14 +651,10 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
         clusters.append(cluster_props)
 
     if failures:
-        print(f"\n{len(failures)} cluster(s) failed/timed out in the timescales step:")
+        print(f"\n{len(failures)} cluster(s) had a failed/timed-out orbit trace:")
         for halo_idx, cl_idx, ttime, status, err in failures:
             print(f"  halo_idx={halo_idx}, cluster={cl_idx}, total_time={ttime:.4f} Gyr, "
                   f"status={status}, error={err}")
-        print("These are worth reproducing standalone (call create_timescale_model + "
-              "add_time_evolution directly with the logged mass/radius/time) to find "
-              "the actual bug inside the timescales package -- this timeout is only a "
-              "workaround to keep the batch moving.")
 
     return clusters
 
@@ -690,6 +715,7 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
             n_steps = cluster_props['n_steps'][i]
             n_pericenters = cluster_props['n_pericenters'][i]
             final_bound = cluster_props['final_bound'][i]
+            min_roche_radius_kpc = cluster_props['min_roche_radius_kpc'][i]
             rows.append({
                 'cluster_mass_msun': cluster_props['cluster_mass'][i].to(u.Msun).value,
                 'cluster_radius_pc': cluster_props['cluster_radius'][i].to(u.pc).value,
@@ -712,6 +738,7 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'IMBH_mass': cluster_props['IMBH_mass'][i],
                 'IMBH_final_formation_time': cluster_props['IMBH_final_formation_time'][i],
                 'which_final_formation_time': cluster_props['which_final_formation_time'][i],
+                'min_roche_radius_kpc': min_roche_radius_kpc if min_roche_radius_kpc is not None else np.nan,
             })
 
     df = pd.DataFrame(rows)
@@ -794,7 +821,7 @@ def main():
     goodidx = load_merger_tree_idx(df)
     output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace)
     summarize_status(output_clusters)
-    print(output_clusters[0])
+
     save_path = args.save_path
     if save_path is None:
         base = os.path.basename(args.csv_path)

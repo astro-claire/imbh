@@ -75,6 +75,22 @@ class NFWHost:
         v_esc_kpcgyr = np.sqrt(2 * np.abs(self.potential(r)))
         return v_esc_kpcgyr / _KMS_TO_KPCGYR
 
+    def tidal_radius(self, m_satellite_msun, r):
+        """
+        Jacobi ("Roche") tidal radius, in kpc, at separation r (kpc) for a
+        satellite of mass m_satellite_msun (Msun): r_t = r * (m_sat /
+        (3*M_enc(r)))^(1/3), using this host's actual ENCLOSED mass at r
+        (via mass_enclosed) rather than its total M200. This is the
+        standard point-mass-orbit approximation -- it doesn't account for
+        orbital eccentricity or the host's local logarithmic density slope
+        at r, which a fully rigorous eccentric-orbit tidal radius would --
+        but that level of precision isn't warranted for a coarse,
+        pericenter-only estimate.
+        """
+        r_safe = max(r, 1e-6)
+        m_enc = self.mass_enclosed(r_safe)
+        return r_safe * (m_satellite_msun / (3.0 * m_enc)) ** (1.0 / 3.0)
+
 
 def _chandrasekhar_xfactor(v, sigma):
     """
@@ -262,6 +278,13 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
         can register more than one if the orbital period is short
         relative to t_max. Always 0 for the already-merged/already-escaped
         short-circuit returns below, since no integration happens there.
+    min_roche_radius_kpc : float or None
+        The smallest Jacobi tidal radius (see NFWHost.tidal_radius)
+        encountered AT ANY pericenter passage detected during this call --
+        computed as a cheap post-processing step on the pericenter event's
+        already-recorded state (solve_ivp's sol.y_events), not by
+        evaluating it at every integration step. None if no pericenter
+        occurred during this call (including the short-circuit returns).
     """
     m_msun = m_cluster.to(u.Msun).value
     r0 = r0_vec.to(u.kpc).value
@@ -295,9 +318,9 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     # Jacobian.
     r0_mag = np.linalg.norm(r0)
     if r0_mag <= r_stop:
-        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0
+        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None
     if r0_mag > r_escape:
-        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0
+        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None
 
     y0 = np.concatenate([r0, v0])
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]
@@ -313,11 +336,21 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     elapsed = sol.t[-1] * u.Gyr
     n_pericenters = int(sol.t_events[2].size)
 
+    # Roche/tidal radius at each pericenter -- cheap post-processing on the
+    # state solve_ivp already recorded for the event, not an extra
+    # per-step evaluation.
+    min_roche_radius_kpc = None
+    for y_peri in sol.y_events[2]:
+        r_peri = np.linalg.norm(y_peri[:3])
+        r_t = host.tidal_radius(m_msun, r_peri)
+        if min_roche_radius_kpc is None or r_t < min_roche_radius_kpc:
+            min_roche_radius_kpc = r_t
+
     if sol.t_events[0].size > 0:
-        return "merged", elapsed, r_final, v_final, n_pericenters
+        return "merged", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc
     if sol.t_events[1].size > 0:
-        return "escaped", elapsed, r_final, v_final, n_pericenters
-    return "ongoing", elapsed, r_final, v_final, n_pericenters
+        return "escaped", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc
+    return "ongoing", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc
 
 
 def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
