@@ -285,6 +285,12 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
         already-recorded state (solve_ivp's sol.y_events), not by
         evaluating it at every integration step. None if no pericenter
         occurred during this call (including the short-circuit returns).
+    time_at_min_roche : astropy Quantity (Gyr) or None
+        Time elapsed SINCE THE START OF THIS CALL at which the pericenter
+        giving min_roche_radius_kpc occurred (i.e. LOCAL to this call, not
+        an absolute cosmic age -- the caller, which knows what absolute
+        time this call started at, is responsible for that conversion).
+        None under the same conditions as min_roche_radius_kpc.
     """
     m_msun = m_cluster.to(u.Msun).value
     r0 = r0_vec.to(u.kpc).value
@@ -318,9 +324,9 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     # Jacobian.
     r0_mag = np.linalg.norm(r0)
     if r0_mag <= r_stop:
-        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None
+        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None
     if r0_mag > r_escape:
-        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None
+        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None
 
     y0 = np.concatenate([r0, v0])
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]
@@ -340,17 +346,19 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     # state solve_ivp already recorded for the event, not an extra
     # per-step evaluation.
     min_roche_radius_kpc = None
-    for y_peri in sol.y_events[2]:
+    time_at_min_roche = None
+    for t_peri, y_peri in zip(sol.t_events[2], sol.y_events[2]):
         r_peri = np.linalg.norm(y_peri[:3])
         r_t = host.tidal_radius(m_msun, r_peri)
         if min_roche_radius_kpc is None or r_t < min_roche_radius_kpc:
             min_roche_radius_kpc = r_t
+            time_at_min_roche = t_peri * u.Gyr
 
     if sol.t_events[0].size > 0:
-        return "merged", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc
+        return "merged", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche
     if sol.t_events[1].size > 0:
-        return "escaped", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc
-    return "ongoing", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc
+        return "escaped", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche
+    return "ongoing", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche
 
 
 def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
