@@ -11,6 +11,7 @@ apikey.txt
 tng_download/* 
 *.png 
 *.csv 
+check_final_host.py
 supersonic_sim_data/*
 *.pkl
 # Distribution / packaging
@@ -223,3 +224,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+check_early_velocity.py
+test.py
