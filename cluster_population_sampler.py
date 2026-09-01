@@ -313,7 +313,7 @@ class ClusterPopulationSampler:
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
-    def draw_clusters(self, subhalo_mass, subhalo_radius):
+    def draw_clusters(self, subhalo_mass, subhalo_radius,cluster_factor = 10):
         """
         Drop-in-ish replacement for the draw_clusters() placeholder.
         Takes plain floats (Msun, kpc). Returns 'cluster_mass' (Msun),
@@ -349,11 +349,11 @@ class ClusterPopulationSampler:
         if total_weight == 0:
             nearest = np.searchsorted(self.halo_log_mass, log_target)
             nearest = np.clip(nearest, 0, len(self.halo_log_mass) - 1)
-            n_draw = int(self.halo_n_clusters[nearest])
+            n_draw = int(self.halo_n_clusters[nearest]/cluster_factor)
         else:
             h_weights = h_weights / total_weight
             chosen_local = self.rng.choice(h_i1 - h_i0, p=h_weights)
-            n_draw = int(self.halo_n_clusters[h_i0 + chosen_local])
+            n_draw = int(self.halo_n_clusters[h_i0 + chosen_local]/cluster_factor)
 
         empty = {
             'cluster_mass': np.array([]) * u.Msun,
