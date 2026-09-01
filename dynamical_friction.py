@@ -60,6 +60,21 @@ class NFWHost:
         """
         return self.circular_velocity(r) / np.sqrt(2)
 
+    def potential(self, r):
+        """
+        r in kpc -> Newtonian potential in (kpc/Gyr)^2, i.e. energy per
+        unit mass in this module's internal unit system. Standard closed-form
+        NFW potential: Phi(r) = -(4 pi G rho_s rs^3 / r) * ln(1 + r/rs).
+        """
+        r_safe = np.maximum(r, 1e-6)
+        x = r_safe / self.rs
+        return -4 * np.pi * _G * self.rho_s * self.rs**3 * np.log(1 + x) / r_safe
+
+    def escape_velocity(self, r):
+        """r in kpc -> escape velocity in km/s (v_esc = sqrt(2*|Phi(r)|))."""
+        v_esc_kpcgyr = np.sqrt(2 * np.abs(self.potential(r)))
+        return v_esc_kpcgyr / _KMS_TO_KPCGYR
+
 
 def _chandrasekhar_xfactor(v, sigma):
     """
@@ -74,7 +89,7 @@ def _chandrasekhar_xfactor(v, sigma):
     return xterm / v**3
 
 
-def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft):
+def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate):
     r_vec = y[:3]
     v_vec = y[3:]
     r_actual = np.linalg.norm(r_vec)
@@ -101,7 +116,34 @@ def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft):
     coeff = 4 * np.pi * _G**2 * m_cluster_msun * rho * coulomb_log
     a_df = -coeff * _chandrasekhar_xfactor(v, sigma) * v_vec
 
-    return np.concatenate([v_vec, a_grav + a_df])
+    a_total = a_grav + a_df
+
+    # HUBBLE DRAG: in an expanding universe, a peculiar velocity decays as
+    # v ~ 1/a purely from cosmic expansion (no force needed) -- this is the
+    # standard -H(t)*v term. It's linear in v, so it survives unchanged for
+    # a RELATIVE velocity (cluster - host) too. This matters a lot at high
+    # redshift, where H(z) is large: without it, a large peculiar velocity
+    # correctly imparted at high-z (from the tree's own recorded kinematics)
+    # never decays the way it physically should as the universe expands,
+    # and just persists for the rest of cosmic time.
+    a_total = a_total - hubble_rate * v_vec
+
+    # Optional BACKGROUND potential: gravity only (no dynamical friction --
+    # DF is a local-density effect and should be dominated by whatever the
+    # cluster is actually embedded in, not a distant structure). This
+    # represents the larger, still-assembling structure the local host
+    # itself sits within, whose confining gravity we'd otherwise be
+    # missing entirely (see trace_cluster_to_snapshot in imbh.py).
+    if bg_host is not None:
+        r_bg_vec = r_vec - bg_offset
+        r_bg_actual = np.linalg.norm(r_bg_vec)
+        r_bg = max(r_bg_actual, r_soft)
+        Menc_bg = bg_host.mass_enclosed(r_bg)
+        r_bg_hat = r_bg_vec / r_bg_actual if r_bg_actual > 1e-12 else np.zeros(3)
+        a_total = a_total - _G * Menc_bg / r_bg**2 * r_bg_hat
+
+    return np.concatenate([v_vec, a_total])
+
 
 
 def _make_stop_event(r_stop):
@@ -118,6 +160,164 @@ def _make_escape_event(r_escape):
     escaped.terminal = True
     escaped.direction = 1
     return escaped
+
+
+def _make_pericenter_event():
+    """
+    Non-terminal event: fires every time the radial velocity (r . v, which
+    shares the sign of dr/dt whenever r>0) crosses from negative
+    (infalling) to positive (outfalling) -- i.e. every time r(t) passes
+    through a LOCAL MINIMUM. direction=1 selects only this crossing
+    direction (not apocenter, the opposite crossing), and terminal=False
+    means integration continues -- solve_ivp just records every time it
+    happens in sol.t_events, so a single call can register multiple
+    pericenter passages if the orbital period is short relative to the
+    leg's duration.
+    """
+    def pericenter(t, y, *args):
+        return np.dot(y[:3], y[3:])
+    pericenter.terminal = False
+    pericenter.direction = 1
+    return pericenter
+
+
+def _solve_ivp_robust(rhs_args, t_span, y0, events):
+    """
+    Try LSODA first (fast, auto-switches between stiff/non-stiff internally
+    -- the right choice for most of this problem's parameter space), but
+    fall back to RK45 (a simple, robust, non-Jacobian explicit method) if
+    LSODA raises anything, or reports failure via sol.success. This exists
+    because some parameter combinations in this problem (likely stemming
+    from the interaction between the Hubble-drag term's fast timescale at
+    high z and the orbital dynamics) have been observed to make LSODA's
+    internal stiff-mode solver print "capi_return is NULL / Call-back
+    cb_f_in_lsoda__user__routines failed" diagnostics and then stall for a
+    long time rather than failing cleanly -- RK45 has not shown this
+    failure mode in any testing so far, at the cost of being slower for
+    the (common) well-behaved case, which is why it's the fallback rather
+    than the default.
+    """
+    try:
+        sol = solve_ivp(_rhs, t_span, y0, args=rhs_args, events=events,
+                         method="LSODA", rtol=1e-8, atol=1e-10)
+        if sol.success:
+            return sol
+    except Exception:
+        pass
+    return solve_ivp(_rhs, t_span, y0, args=rhs_args, events=events,
+                      method="RK45", rtol=1e-8, atol=1e-10)
+
+
+def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
+                     t_max=50 * u.Gyr, r_stop_frac=0.01, escape_frac=3.0,
+                     background_host=None, background_offset=None,
+                     hubble_rate=0.0 / u.Gyr):
+    """
+    Like sink_time(), but returns the full final STATE (position and
+    velocity relative to the host) at whatever time the integration
+    actually stops -- whether that's because it merged, escaped, or simply
+    ran out of the allotted t_max -- not just the terminal merge time.
+
+    This is what you need to hand off a partially-evolved orbit to a new
+    host after a merger (see trace_cluster_to_snapshot in imbh.py), rather
+    than only knowing whether/when it eventually merges within a single
+    fixed host.
+
+    Parameters:
+        background_host (NFWHost or None): an OPTIONAL second, larger-scale
+            potential -- e.g. the eventual final structure's own main-branch
+            progenitor at this same snapshot -- contributing GRAVITY ONLY
+            (no dynamical friction; DF is a local-density effect and should
+            be dominated by whichever structure the cluster is actually
+            embedded in). Fixed for the whole integration, same
+            approximation level as `host` itself.
+        background_offset: astropy Quantity 3-vector (kpc) -- the
+            background potential's center, relative to `host`'s own center
+            (i.e. in the SAME coordinate frame as r0_vec). Required if
+            background_host is given.
+        hubble_rate: astropy Quantity (1/Gyr) -- H(z) at this leg's cosmic
+            time, applied as a -H(t)*v drag on the RELATIVE velocity (see
+            _rhs's docstring comment). Defaults to 0 (no expansion damping)
+            for backward compatibility / non-cosmological uses of this
+            function; pass the real H(z) for cosmological orbit traces,
+            especially important at high redshift where H(z) is large.
+
+    Returns
+    -------
+    status : str
+        One of "merged", "escaped", "ongoing" (ran out of t_max without
+        merging or escaping -- NOT "never merges", just "not yet, within
+        the t_max given").
+    elapsed : astropy Quantity (Gyr)
+        Time actually elapsed (== t_max if status == "ongoing").
+    r_final : astropy Quantity (kpc), shape (3,)
+        Position relative to the host at the end of the integration.
+    v_final : astropy Quantity (km/s), shape (3,)
+        Velocity relative to the host at the end of the integration.
+    n_pericenters : int
+        Number of pericenter passages (radial velocity going from
+        infalling to outfalling, i.e. r(t) passing through a local
+        minimum) detected DURING this call -- relative to `host` only,
+        not `background_host` (see _make_pericenter_event). A single call
+        can register more than one if the orbital period is short
+        relative to t_max. Always 0 for the already-merged/already-escaped
+        short-circuit returns below, since no integration happens there.
+    """
+    m_msun = m_cluster.to(u.Msun).value
+    r0 = r0_vec.to(u.kpc).value
+    v0 = v0_vec.to(u.km / u.s).value * _KMS_TO_KPCGYR
+    hubble_rate_gyr = hubble_rate.to(1 / u.Gyr).value
+
+    if coulomb_log is None:
+        coulomb_log = np.log(1 + host.M200 / m_msun)
+
+    r_stop = r_stop_frac * host.R200
+    r_escape = escape_frac * host.R200
+    t_max_gyr = t_max.to(u.Gyr).value
+
+    bg_offset_kpc = background_offset.to(u.kpc).value if background_host is not None else None
+
+    # If we're ALREADY at/inside the merge radius, OR already beyond the
+    # escape radius, at t=0 -- short-circuit here rather than relying on
+    # solve_ivp's crossing-detection events -- those events only fire on a
+    # crossing DURING the integration, and never fire if the starting
+    # position already satisfies the condition (no crossing occurs, since
+    # there's no sign change to detect). Without this check, an
+    # already-unbound cluster silently runs to t_max and gets reported as
+    # "ongoing"/never escaped; and an already-merged cluster (r0 ~ 0,
+    # sitting essentially exactly at the host's center) gets integrated
+    # from a starting point where the RHS function's r_hat direction is
+    # genuinely discontinuous (undefined at the exact origin, well-defined
+    # a hair away from it) -- this has been observed to make LSODA's
+    # stiff-mode Jacobian estimation choke and hang right at t=0 rather
+    # than failing cleanly, since it needs to probe the RHS in several
+    # directions from the starting point to build a finite-difference
+    # Jacobian.
+    r0_mag = np.linalg.norm(r0)
+    if r0_mag <= r_stop:
+        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0
+    if r0_mag > r_escape:
+        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0
+
+    y0 = np.concatenate([r0, v0])
+    events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]
+
+    sol = _solve_ivp_robust(
+        (m_msun, host, coulomb_log, r_stop, background_host, bg_offset_kpc, hubble_rate_gyr),
+        (0, t_max_gyr), y0, events,
+    )
+
+    y_final = sol.y[:, -1]
+    r_final = y_final[:3] * u.kpc
+    v_final = (y_final[3:] / _KMS_TO_KPCGYR) * u.km / u.s
+    elapsed = sol.t[-1] * u.Gyr
+    n_pericenters = int(sol.t_events[2].size)
+
+    if sol.t_events[0].size > 0:
+        return "merged", elapsed, r_final, v_final, n_pericenters
+    if sol.t_events[1].size > 0:
+        return "escaped", elapsed, r_final, v_final, n_pericenters
+    return "ongoing", elapsed, r_final, v_final, n_pericenters
 
 
 def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
@@ -147,12 +347,21 @@ def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     r_escape = escape_frac * host.R200
     t_max_gyr = t_max.to(u.Gyr).value
 
+    # Same short-circuit as in integrate_orbit -- see that function's
+    # comment for why this is needed (crossing-based events never fire if
+    # already inside r_stop or outside r_escape at t=0).
+    r0_mag = np.linalg.norm(r0)
+    if r0_mag <= r_stop:
+        return 0 * u.Gyr, "merged"
+    if r0_mag > r_escape:
+        return np.inf * u.Gyr, "escaped"
+
     y0 = np.concatenate([r0, v0])
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape)]
 
-    sol = solve_ivp(
-        _rhs, (0, t_max_gyr), y0, args=(m_msun, host, coulomb_log, r_stop),
-        events=events, method="RK45", rtol=1e-8, atol=1e-10,
+    sol = _solve_ivp_robust(
+        (m_msun, host, coulomb_log, r_stop, None, None, 0.0),
+        (0, t_max_gyr), y0, events,
     )
 
     if sol.t_events[0].size > 0:
