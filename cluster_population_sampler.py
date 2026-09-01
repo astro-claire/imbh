@@ -35,6 +35,8 @@ import numpy as np
 import astropy.units as u
 from astropy.constants import G
 
+from dynamical_friction import NFWHost
+
 G_KPC_MSUN_KMS = G.to(u.kpc * u.km**2 / u.s**2 / u.Msun).value  # for fast plain-float v_circ calc
 
 
@@ -72,6 +74,7 @@ class ClusterPopulationSampler:
     def __init__(self, pickle_path=None, cluster_mass_key='stellarMass_msun',
                  cluster_hmradius_key='hmradii_kpc', bandwidth_dex=0.3,
                  window_sigma=6.0, max_window_points=3000, min_effective_weight=5.0,
+                 filter_unbound=True, host_concentration=4.0,
                  rng=None, _skip_build=False):
         """
         Parameters:
@@ -97,6 +100,21 @@ class ClusterPopulationSampler:
             min_effective_weight (float): warn if the (windowed) total kernel
                 weight for a query falls below this -- signals the query is
                 poorly supported by the calibration data (likely extrapolating).
+            filter_unbound (bool): if True (default), clusters in the
+                calibration catalog whose speed exceeds the escape velocity
+                of their matched host (an NFW profile built from that host's
+                own mass/radius) are EXCLUDED from the calibration pool. The
+                raw catalog is matched purely on spatial separation (up to
+                n_rvir*R_vir), which says nothing about whether a cluster is
+                actually gravitationally bound to that specific halo --
+                without this filter, weakly/unbound pairs get resampled and
+                fed into the orbit integrator as if they were representative
+                bound examples.
+            host_concentration (float): NFW concentration assumed when
+                building each host's profile for the boundedness check
+                (only used if filter_unbound=True). Should match whatever
+                concentration your orbit integration downstream assumes,
+                for consistency.
             rng (np.random.Generator or None): defaults to np.random.default_rng().
             _skip_build (bool): internal use (for load()) -- skip __init__'s
                 normal pickle-loading path.
@@ -107,6 +125,8 @@ class ClusterPopulationSampler:
         self.window_sigma = window_sigma
         self.max_window_points = max_window_points
         self.min_effective_weight = min_effective_weight
+        self.filter_unbound = filter_unbound
+        self.host_concentration = host_concentration
         self.rng = rng if rng is not None else np.random.default_rng()
 
         if _skip_build:
@@ -154,6 +174,8 @@ class ClusterPopulationSampler:
 
         missing_mass_key = missing_hmradius_key = missing_vel_key = 0
         skipped_zero_rvir = 0
+        n_unbound_filtered = 0
+        n_total_seen = 0
 
         for entry, hm, rad, n, vcirc, ok in zip(
             matched_valid, halo_mass_msun, halo_radius_kpc, halo_n_clusters, v_circ_all, has_clusters
@@ -173,18 +195,33 @@ class ClusterPopulationSampler:
                 missing_vel_key += n
                 continue
 
-            cl_log_host_mass_parts.append(np.full(n, np.log10(hm)))
-            cl_mass_parts.append(np.asarray(entry[cluster_mass_key]))
-            cl_hmradius_parts.append(np.asarray(entry[cluster_hmradius_key]))
-            cl_dist_over_rvir_parts.append(np.asarray(entry['cluster_distance']) / rad)
-            cl_vel_over_vcirc_parts.append(np.asarray(entry['cluster_rel_vel_mag']) / vcirc)
+            n_total_seen += n
+            cluster_dist_kpc = np.asarray(entry['cluster_distance'])       # physical kpc
+            cluster_vel_kms = np.asarray(entry['cluster_rel_vel_mag'])     # physical km/s
+
+            if self.filter_unbound:
+                host = NFWHost(hm * u.Msun, rad * u.kpc, concentration=self.host_concentration)
+                v_esc_kms = host.escape_velocity(cluster_dist_kpc)
+                bound_mask = cluster_vel_kms <= v_esc_kms
+                n_unbound_filtered += int(np.sum(~bound_mask))
+            else:
+                bound_mask = np.ones(n, dtype=bool)
+
+            if not np.any(bound_mask):
+                continue
+
+            cl_log_host_mass_parts.append(np.full(int(np.sum(bound_mask)), np.log10(hm)))
+            cl_mass_parts.append(np.asarray(entry[cluster_mass_key])[bound_mask])
+            cl_hmradius_parts.append(np.asarray(entry[cluster_hmradius_key])[bound_mask])
+            cl_dist_over_rvir_parts.append(cluster_dist_kpc[bound_mask] / rad)
+            cl_vel_over_vcirc_parts.append(cluster_vel_kms[bound_mask] / vcirc)
 
             # angle between separation and velocity vectors, if we have both
             # -- this is what lets us sample a REAL (not isotropic-random)
             # relative direction for the velocity below.
             if 'cluster_rel_pos' in entry and 'cluster_rel_vel' in entry:
-                pos_vec = np.asarray(entry['cluster_rel_pos'])
-                vel_vec = np.asarray(entry['cluster_rel_vel'])
+                pos_vec = np.asarray(entry['cluster_rel_pos'])[bound_mask]
+                vel_vec = np.asarray(entry['cluster_rel_vel'])[bound_mask]
                 pos_norm = np.linalg.norm(pos_vec, axis=1)
                 vel_norm = np.linalg.norm(vel_vec, axis=1)
                 with np.errstate(divide='ignore', invalid='ignore'):
@@ -195,7 +232,13 @@ class ClusterPopulationSampler:
                 cl_cos_theta_parts.append(cos_theta)
                 have_any_geometry = True
             else:
-                cl_cos_theta_parts.append(np.full(n, np.nan))
+                cl_cos_theta_parts.append(np.full(int(np.sum(bound_mask)), np.nan))
+
+        if self.filter_unbound and n_total_seen > 0:
+            print(f"  boundedness filter: excluded {n_unbound_filtered} of {n_total_seen} clusters "
+                  f"({100*n_unbound_filtered/n_total_seen:.1f}%) whose speed exceeded their matched "
+                  f"host's escape velocity (host_concentration={self.host_concentration}).")
+
 
         if missing_mass_key or missing_hmradius_key or missing_vel_key:
             print(f"  note: skipped some clusters missing required fields -- "
