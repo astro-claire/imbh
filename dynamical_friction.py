@@ -24,6 +24,14 @@ from astropy.constants import G
 # ODE right-hand-side runs on plain floats in these units for speed.)
 _G = G.to(u.kpc**3 / (u.Msun * u.Gyr**2)).value      # kpc^3 / (Msun Gyr^2)
 _KMS_TO_KPCGYR = (1 * u.km / u.s).to(u.kpc / u.Gyr).value
+# When a cluster is allowed to start integrating from inside r_stop (see
+# integrate_orbit's allow_start_inside_stop), its true starting separation
+# can be (and empirically often is) essentially EXACTLY zero -- nudge it
+# out to at least this fraction of r_stop before handing it to solve_ivp,
+# to avoid integrating from the literal origin (see the comment on that
+# short-circuit below for why that's a real numerical hazard, not just a
+# theoretical one).
+_MIN_SOFT_R0_FRAC = 1e-4
 
 
 class NFWHost:
@@ -264,7 +272,8 @@ def _sample_trajectory(sol, t_end_gyr, record_dt_gyr, bg_offset_kpc):
 def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
                      t_max=50 * u.Gyr, r_stop_frac=0.01, escape_frac=3.0,
                      background_host=None, background_offset=None,
-                     hubble_rate=0.0 / u.Gyr, record_dt=None):
+                     hubble_rate=0.0 / u.Gyr, record_dt=None,
+                     allow_start_inside_stop=False):
     """
     Like sink_time(), but returns the full final STATE (position and
     velocity relative to the host) at whatever time the integration
@@ -303,6 +312,27 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
             imbh.py optionally saves (see TRACK_TIME_RESOLUTION there).
             None (the default) skips this entirely at essentially zero
             cost, for callers that don't need it.
+        allow_start_inside_stop: bool (default False). Normally, if the
+            starting separation is already inside r_stop_frac*R200 when
+            this call begins, it's short-circuited as an immediate
+            "merged" (elapsed=0) rather than running the ODE at all -- the
+            right behavior for a cluster that dynamical-friction'd its way
+            down to r_stop DURING a prior call (nothing left to integrate).
+            But if a cluster's very FIRST call starts inside r_stop simply
+            because its DRAWN initial separation (from the cluster
+            population sampler) landed there -- i.e. it never actually
+            needed to inspiral to reach the center -- crediting it with a
+            zero-duration "merger" usually isn't what's wanted; it should
+            get to exist/evolve for as long as its dynamics keep it there
+            (or longer, if it moves back out). Setting this True disables
+            ONLY the t=0 short-circuit (the escape short-circuit below is
+            unaffected); a LATER downward crossing through r_stop DURING
+            the integration -- a genuine merger, however soon it happens --
+            still triggers "merged" normally via the stop event. If the
+            starting separation is essentially exactly zero (common for
+            these clusters -- see imbh.py), it's nudged out to a tiny but
+            safely nonzero radius first (see _MIN_SOFT_R0_FRAC) rather than
+            handed to solve_ivp at the literal origin.
 
     Returns
     -------
@@ -378,14 +408,37 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     # directions from the starting point to build a finite-difference
     # Jacobian.
     r0_mag = np.linalg.norm(r0)
-    if r0_mag <= r_stop or r0_mag > r_escape:
-        status = "merged" if r0_mag <= r_stop else "escaped"
+    if r0_mag <= r_stop and not allow_start_inside_stop:
         traj = None
         if record_dt_gyr is not None:
             r0_from_center = (np.linalg.norm(r0 - bg_offset_kpc) if bg_offset_kpc is not None
                                else float(r0_mag))
             traj = (np.array([0.0]), np.array([r0_from_center]))
-        return status, 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None, traj
+        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None, traj
+
+    if r0_mag <= r_stop:
+        # allow_start_inside_stop=True and we're inside r_stop: don't
+        # short-circuit -- but the SAME numerical hazard flagged above
+        # (an exact-origin starting point tripping up LSODA's Jacobian
+        # probing) still applies here, and is common in practice for
+        # these clusters (a drawn initial separation of essentially
+        # exactly zero). Nudge r0 radially out to a tiny, still
+        # well-inside-r_stop, safely nonzero separation first -- along
+        # its own existing direction if it has one, else an arbitrary
+        # fixed direction.
+        min_r0 = _MIN_SOFT_R0_FRAC * r_stop
+        if r0_mag < min_r0:
+            r_hat0 = r0 / r0_mag if r0_mag > 0 else np.array([1.0, 0.0, 0.0])
+            r0 = r_hat0 * min_r0
+            r0_mag = min_r0
+
+    if r0_mag > r_escape:
+        traj = None
+        if record_dt_gyr is not None:
+            r0_from_center = (np.linalg.norm(r0 - bg_offset_kpc) if bg_offset_kpc is not None
+                               else float(r0_mag))
+            traj = (np.array([0.0]), np.array([r0_from_center]))
+        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None, traj
 
     y0 = np.concatenate([r0, v0])
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]

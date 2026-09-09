@@ -78,6 +78,24 @@ TRACK_MIN_IMBH_MASS_MSUN = 500.0
 # radius tracks get saved into.
 TRACK_OUTPUT_DIRNAME = "radius_tracks"
 
+# Minimum number of sub-steps used to integrate a leg whenever a background
+# potential is active at either end of it (see trace_cluster_to_snapshot),
+# REGARDLESS of the leg's own duration relative to max_leg_duration. This
+# lets the background's mass/radius/offset be linearly interpolated across
+# the leg (same treatment the LOCAL host's mass/radius already gets),
+# rather than held fixed for the whole leg and then discretely reset at the
+# next leg boundary -- which otherwise produces an artificial instantaneous
+# jump in the background-relative distance (and a smaller, less visible one
+# in the background's contribution to the force) exactly at every leg
+# transition, even though the underlying orbit is evolving continuously.
+# Tradeoff: legs that would otherwise take a single fast integrate_orbit
+# call now take BG_MIN_SUBSTEPS shorter ones instead, whenever a background
+# is present -- which is the common case for most of a cluster's early
+# history, before its own branch merges onto the main branch. Increase for
+# smoother background evolution at the cost of runtime; 1 disables this
+# forced subdivision entirely (falls back to the old fixed-per-leg behavior).
+BG_MIN_SUBSTEPS = 4
+
 # Wall-clock timeout for a single cluster's orbit trace (trace_cluster_to_snapshot).
 # This is a defensive safeguard, not a fix for any specific known cause --
 # some parameter combinations (e.g. a bound orbit with an unusually short
@@ -166,11 +184,67 @@ def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentra
 
 
 # -------- Follow a single cluster across host mergers, to a target snapshot
+def _interpolate_bg(bg_mass_start_msun, bg_radius_start_kpc, bg_offset_start,
+                     bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
+                     frac, concentration):
+    """
+    Returns (bg_host_k, bg_offset_k) for a sub-step a fraction `frac` of the
+    way through a leg, given the background's state at the leg's start and
+    end (any of which may be None -- see trace_cluster_to_snapshot).
+
+    Four cases:
+      - both None: no background this whole leg -- returns (None, None).
+      - both given: ordinary case, a genuinely separate background structure
+        the whole leg -- mass/radius/offset are all linearly interpolated
+        between their start and end values, so frac=0 exactly reproduces
+        the start state and frac=1 exactly reproduces the end state (which,
+        by construction, is what the NEXT leg will independently compute as
+        ITS OWN start state -- see trace_cluster_to_snapshot's docstring --
+        so consecutive legs join up continuously with no jump).
+      - start only (fading out): the current host is ABOUT to become the
+        main branch itself by this leg's end (or main-branch tracking runs
+        out). Rather than holding the background at its full, un-faded
+        value all leg and then discontinuously dropping it to nothing at
+        the next leg, fade BOTH its mass and its offset to zero together as
+        frac->1. Scaling mass to zero (not just moving the offset) is what
+        keeps this safe: since the background's mass_enclosed scales with
+        bg_mass_k, its force contribution vanishes smoothly regardless of
+        where its (now irrelevant) offset ends up -- avoiding any risk of
+        double-counting the local host's own gravity as the two structures
+        become indistinguishable.
+      - end only (fading in): the symmetric, rarer case (see
+        trace_cluster_to_snapshot) -- same treatment, mirrored.
+    """
+    have_start = bg_offset_start is not None
+    have_end = bg_offset_end is not None
+
+    if have_start and have_end:
+        bg_mass_k = bg_mass_start_msun + (bg_mass_end_msun - bg_mass_start_msun) * frac
+        bg_radius_k = bg_radius_start_kpc + (bg_radius_end_kpc - bg_radius_start_kpc) * frac
+        bg_offset_k = bg_offset_start + (bg_offset_end - bg_offset_start) * frac
+    elif have_start:
+        bg_mass_k = bg_mass_start_msun * (1 - frac)
+        bg_radius_k = bg_radius_start_kpc
+        bg_offset_k = bg_offset_start * (1 - frac)
+    elif have_end:
+        bg_mass_k = bg_mass_end_msun * frac
+        bg_radius_k = bg_radius_end_kpc
+        bg_offset_k = bg_offset_end * frac
+    else:
+        return None, None
+
+    bg_host_k = NFWHost(bg_mass_k * u.Msun, bg_radius_k * u.kpc, concentration=concentration)
+    return bg_host_k, bg_offset_k
+
+
 def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radius_start,
                                      mass_end, radius_end, rel_pos_total, rel_vel_total,
-                                     leg_duration, concentration, bg_host, bg_offset,
+                                     leg_duration, concentration,
+                                     bg_mass_start_msun, bg_radius_start_kpc, bg_offset_start,
+                                     bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
                                      max_leg_duration, hubble_start, hubble_end,
-                                     escape_frac=np.inf, record_dt=None):
+                                     escape_frac=np.inf, record_dt=None, min_bg_substeps=1,
+                                     allow_start_inside_stop=False):
     """
     Subdivide a leg into shorter sub-steps rather than treating a
     potentially Gyr-long gap as a single static host/single solve_ivp call
@@ -182,9 +256,21 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
     start and end of the leg, and applies the total position/velocity
     reframe (rel_pos_total, rel_vel_total -- the host's own displacement
     over the WHOLE leg) proportionally at each sub-step, rather than all
-    at once at the end. The background potential is held fixed at its
-    start-of-leg value throughout (a secondary structure changing more
-    slowly is a reasonable simplification here).
+    at once at the end. The BACKGROUND potential is ALSO linearly
+    interpolated across the leg's sub-steps (see _interpolate_bg) -- unlike
+    the local host, whose duration-based subdivision this reuses, the
+    background is forced into at least min_bg_substeps sub-steps regardless
+    of the leg's own duration (see BG_MIN_SUBSTEPS), since otherwise a
+    background that's active but has n_sub==1 would still be held fixed at
+    a single value for the whole leg.
+
+    allow_start_inside_stop (see integrate_orbit) is passed through
+    UNCHANGED to every sub-step's integrate_orbit call, not just the
+    first -- so a cluster that's still inside r_stop after one sub-step
+    (its dynamics didn't carry it back out within just that one, possibly
+    short, sub_dt) keeps getting the exemption for the REST of this leg too,
+    rather than spuriously "merging" at the next sub-step boundary purely
+    because it hadn't moved out yet.
 
     Also used for the FINAL (no further host) leg by passing
     mass_end=mass_start, radius_end=radius_start, hubble_end=hubble_start,
@@ -209,6 +295,9 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
     sub-step -- None if record_dt was not given.
     """
     n_sub = max(1, int(np.ceil((leg_duration / max_leg_duration).to(u.dimensionless_unscaled).value)))
+    bg_active = (bg_offset_start is not None) or (bg_offset_end is not None)
+    if bg_active:
+        n_sub = max(n_sub, min_bg_substeps)
     sub_dt = leg_duration / n_sub
     total_elapsed = 0 * u.Gyr
     total_pericenters = 0
@@ -224,6 +313,11 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
         radius_k = radius_start + (radius_end - radius_start) * frac
         hubble_k = hubble_start + (hubble_end - hubble_start) * frac
         host_k = NFWHost(mass_k * u.Msun, radius_k * u.kpc, concentration=concentration)
+        bg_host_k, bg_offset_k = _interpolate_bg(
+            bg_mass_start_msun, bg_radius_start_kpc, bg_offset_start,
+            bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
+            frac, concentration,
+        )
 
         # only the LAST sub-step of the LAST leg should ever use a real
         # (non-infinite) escape check -- earlier sub-steps always pass
@@ -233,13 +327,14 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
 
         status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, traj_sub = integrate_orbit(
             cluster_mass, r_vec, v_vec, host_k, t_max=sub_dt, escape_frac=this_escape_frac,
-            background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_k,
-            record_dt=record_dt,
+            background_host=bg_host_k, background_offset=bg_offset_k, hubble_rate=hubble_k,
+            record_dt=record_dt, allow_start_inside_stop=allow_start_inside_stop,
         )
         if traj_sub is not None:
             t_sub, r_sub = traj_sub
             # t_sub is local to just this sub-step -- shift by the elapsed
             # time of every PRIOR sub-step (total_elapsed's value from
+
             # BEFORE this sub-step's own `elapsed` is added below) to make
             # it local to the whole leg instead.
             track_t_parts.append(t_sub + total_elapsed.to(u.Gyr).value)
@@ -268,7 +363,8 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
 def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, target_age,
                                navigator, concentration=HOST_CONCENTRATION, max_steps=MAX_STEPS,
                                final_escape_frac=3.0, max_leg_duration=1.0 * u.Gyr,
-                               min_host_mass_msun=1e8, verbose=False, record_dt=None):
+                               min_host_mass_msun=1e8, verbose=False, record_dt=None,
+                               allow_formation_inside_r_stop=True):
     """
     Follow one cluster's dynamical-friction evolution, advancing ONE
     SNAPSHOT AT A TIME along its current host's tree branch, until it
@@ -347,6 +443,19 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             record_dt and TRACK_TIME_RESOLUTION below). Adds 'track_time_gyr'
             and 'track_radius_kpc' to the returned dict. None (the default)
             skips this at essentially zero extra cost.
+        allow_formation_inside_r_stop: bool (default True). Some drawn
+            initial separations (from the cluster population sampler) land
+            inside r_stop_frac*R_vir already at formation -- i.e. the
+            cluster never actually needed to dynamically-friction its way
+            to the center. When True (the new default), such a cluster is
+            NOT instantly credited with a zero-duration "merger"; it's
+            allowed to integrate and evolve normally from there for its
+            very first leg (see integrate_orbit's allow_start_inside_stop).
+            r_stop is otherwise completely unaffected -- ordinary clusters
+            that dynamically friction their way down to r_stop, whether on
+            the first leg or any later one, still merge normally the
+            instant that happens. Set False to restore the old behavior
+            (any cluster starting inside r_stop is an instant t=0 merger).
 
     Returns a dict:
         status: 'inspiraled' | 'escaped' | 'outskirts'
@@ -454,7 +563,16 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         # bg_offset to compute a final energy diagnostic, and needs them
         # correctly set even on the very first loop iteration, before any
         # of the later per-leg logic runs.
+        #
+        # bg_mass_msun/bg_radius_kpc/bg_offset here are this leg's START
+        # values; bg_host is built from them for use by the non-subdivided
+        # path and the energy diagnostic below. The matching END-of-leg
+        # values (bg_*_end) are computed further down once next_id/next_snap
+        # are known, and together the two let the leg smoothly interpolate
+        # the background across itself instead of holding it fixed for the
+        # whole leg -- see _interpolate_bg / BG_MIN_SUBSTEPS.
         bg_host, bg_offset = None, None
+        bg_mass_msun = bg_radius_kpc = None
         main_branch_id = navigator.main_branch_id_at_snap(snap)
         if main_branch_id is not None and main_branch_id != current_id:
             bg_mass_msun, bg_radius_kpc, _ = navigator.host_properties(main_branch_id)
@@ -485,6 +603,28 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             hubble_end = hubble_start
             delta_t_to_next = None
 
+        # END-of-leg background state (see the START-of-leg computation
+        # above): what the background would be if evaluated at next_id/
+        # next_snap -- i.e. EXACTLY what the FOLLOWING leg will independently
+        # compute as ITS OWN start-of-leg background, via the identical
+        # main_branch_id_at_snap/relative_state calls. Interpolating THIS
+        # leg's background from bg_offset (start) to bg_offset_end here
+        # therefore joins up continuously with the next leg's own start
+        # value -- no separate bookkeeping needed to "hand off" a value
+        # across the loop boundary. No next host (true final step) or no
+        # next-id background: hold the start value fixed, matching how
+        # hubble_end/next_mass_msun degenerate to their start-of-leg
+        # counterparts in that same case.
+        bg_mass_end_msun = bg_radius_end_kpc = bg_offset_end = None
+        if next_id is not None:
+            main_branch_id_end = navigator.main_branch_id_at_snap(next_snap)
+            if main_branch_id_end is not None and main_branch_id_end != next_id:
+                bg_mass_end_msun, bg_radius_end_kpc, _ = navigator.host_properties(main_branch_id_end)
+                rel_pos_end, _ = navigator.relative_state(next_id, main_branch_id_end)
+                bg_offset_end = -rel_pos_end
+        else:
+            bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end = bg_mass_msun, bg_radius_kpc, bg_offset
+
         if delta_t_to_next is not None and delta_t_to_next <= remaining:
             t_leg_max, capped_by = delta_t_to_next, 'step'
         else:
@@ -507,7 +647,13 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         # still matters because resolving a bound, oscillating orbit over
         # many Gyr in one uninterrupted solve_ivp call can be extremely
         # slow regardless of the leg's stiffness properties.
-        subdivided = t_leg_max > max_leg_duration
+        #
+        # ALSO subdivide (regardless of duration) whenever a background is
+        # active at either end of the leg -- see BG_MIN_SUBSTEPS -- so its
+        # mass/radius/offset get interpolated across the leg rather than
+        # held fixed and then discretely reset at the next boundary.
+        bg_active = (bg_offset is not None) or (bg_offset_end is not None)
+        subdivided = (t_leg_max > max_leg_duration) or bg_active
         rel_pos_full = rel_vel_full = None
         if next_id is not None:
             rel_pos_full, rel_vel_full = navigator.relative_state(current_id, next_id)
@@ -545,35 +691,66 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 
         age_at_leg_start = current_age  # for converting a LOCAL pericenter time (relative to
                                          # the start of THIS leg) into an absolute one, below
+        # Only the cluster's very FIRST leg (step==0) ever gets the
+        # allow_start_inside_stop exemption -- see
+        # allow_formation_inside_r_stop's docstring above. Harmless to pass
+        # for every step==0 sub-step/call regardless of whether r_vec
+        # actually starts inside r_stop (integrate_orbit only acts on it
+        # when relevant), and False from step==1 onward restores ordinary
+        # r_stop behavior for any genuine later merger.
+        allow_start_inside_stop = allow_formation_inside_r_stop and (step == 0)
         leg_traj = None
-        if subdivided:
+        if t_leg_max <= 0 * u.Gyr:
+            # Degenerate leg (e.g. delta_t_to_next<=0 from a tree quirk) --
+            # skip integration entirely, same short-circuit the original
+            # non-subdivided path used. Checked here, BEFORE the subdivided
+            # branch, since background-driven forced subdivision (bg_active
+            # above) would otherwise route this into
+            # _integrate_leg_with_subdivision with a zero/negative
+            # sub_dt -- solve_ivp isn't guaranteed to handle that cleanly.
+            # Force subdivided=False here (even if bg_active made it True
+            # above) so the reframe logic below -- which assumes "subdivided
+            # means the reframe was already applied incrementally inside
+            # _integrate_leg_with_subdivision" -- still applies the full
+            # manual reframe for this leg, since no incremental version ran.
+            status, elapsed, n_peri, roche_this, t_roche_this = "ongoing", 0 * u.Gyr, 0, None, None
+            subdivided = False
+        elif subdivided:
             if capped_by == 'step':
                 status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, next_mass_msun, next_radius_kpc,
-                    rel_pos_full, rel_vel_full, t_leg_max, concentration, bg_host, bg_offset, max_leg_duration,
-                    hubble_start, hubble_end, record_dt=record_dt,
+                    rel_pos_full, rel_vel_full, t_leg_max, concentration,
+                    bg_mass_msun, bg_radius_kpc, bg_offset, bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
+                    max_leg_duration, hubble_start, hubble_end, record_dt=record_dt,
+                    min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
                 )
             else:
                 # 'output'-capped (including the true final step): no next
                 # host to interpolate toward -- degenerate to repeatedly
-                # integrating within the SAME unchanging host, zero reframe.
+                # integrating within the SAME unchanging host, zero reframe
+                # for the LOCAL host (the background, by contrast, may still
+                # be actively interpolating if bg_offset != bg_offset_end --
+                # e.g. a background that's fading out during this final leg).
                 zero_pos = np.zeros(3) * u.kpc
                 zero_vel = np.zeros(3) * u.km / u.s
                 status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, mass_msun, radius_kpc,
-                    zero_pos, zero_vel, t_leg_max, concentration, bg_host, bg_offset, max_leg_duration,
-                    hubble_start, hubble_start, escape_frac=escape_frac, record_dt=record_dt,
+                    zero_pos, zero_vel, t_leg_max, concentration,
+                    bg_mass_msun, bg_radius_kpc, bg_offset, bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
+                    max_leg_duration, hubble_start, hubble_start, escape_frac=escape_frac, record_dt=record_dt,
+                    min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
                 )
         else:
+            # only reached when NOT subdivided, i.e. t_leg_max <= max_leg_duration
+            # AND no background active at either end of this leg (bg_active
+            # is False) -- a single un-subdivided integrate_orbit call is
+            # safe here precisely because there's no background to smooth.
             host = NFWHost(mass_msun * u.Msun, radius_kpc * u.kpc, concentration=concentration)
-            if t_leg_max > 0 * u.Gyr:
-                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = integrate_orbit(
-                    cluster_mass, r_vec, v_vec, host, t_max=t_leg_max, escape_frac=escape_frac,
-                    background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_start,
-                    record_dt=record_dt,
-                )
-            else:
-                status, elapsed, n_peri, roche_this, t_roche_this = "ongoing", 0 * u.Gyr, 0, None, None
+            status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = integrate_orbit(
+                cluster_mass, r_vec, v_vec, host, t_max=t_leg_max, escape_frac=escape_frac,
+                background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_start,
+                record_dt=record_dt, allow_start_inside_stop=allow_start_inside_stop,
+            )
         current_age = current_age + elapsed
         n_pericenters += n_peri
         if roche_this is not None and (min_roche_radius_kpc is None or roche_this < min_roche_radius_kpc):
@@ -689,7 +866,8 @@ def save_radius_track(track_time_gyr, track_radius_kpc, halo_idx, cluster_idx, t
 
 # ------- Iteration over all the subhalos
 def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
-                      record_dt=None, track_dir=None, track_min_mass=TRACK_MIN_IMBH_MASS_MSUN):
+                      record_dt=None, track_dir=None, track_min_mass=TRACK_MIN_IMBH_MASS_MSUN,
+                      allow_formation_inside_r_stop=True):
     """
     Parameters (new ones only -- see the rest of the module for the others):
         record_dt: astropy Quantity (time) or None (default). Passed straight
@@ -703,6 +881,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
             ignored otherwise. Created by the caller (main()), not here.
         track_min_mass: only clusters with IMBH_mass_msun >= this get their
             track actually written to disk (see TRACK_MIN_IMBH_MASS_MSUN).
+        allow_formation_inside_r_stop: passed straight through to
+            trace_cluster_to_snapshot -- see its docstring.
     """
     clusters = []
     failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
@@ -757,6 +937,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                 trace_cluster_to_snapshot, ORBIT_TRACE_TIMEOUT_S,
                 m_cl, r0_vec, v0_vec, start_subhalo_id, target_age, navigator,
                 verbose=debug_trace, record_dt=record_dt,
+                allow_formation_inside_r_stop=allow_formation_inside_r_stop,
             )
             if trace_err is not None:
                 print(f"    WARNING: orbit trace failed/timed out ({trace_err}) -- "
@@ -822,15 +1003,22 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                 cluster_props['which_final_formation_time'].append(None)
                 cluster_props['radius_track_path'].append(None)
                 continue
-            imbh_mass_msun = out['M_VMS'][0]
-            cluster_props['IMBH_mass'].append(imbh_mass_msun)
+            imbh_mass_out = out['M_VMS'][0]
+            cluster_props['IMBH_mass'].append(imbh_mass_out)
             cluster_props['IMBH_final_formation_time'].append(out['minimum_disruption_time'][0])
             cluster_props['which_final_formation_time'].append(out['which_disruption_time'][0])
             cluster_props['r0_pc'].append(out['r0_pc'])
             cluster_props['rho0_msun_pc3'].append(out['rho0_msun_pc3'])
 
+            # `imbh_mass_out` may be a plain float OR an astropy Quantity
+            # (with units of Msun) depending on the `timescales` package's
+            # own version/behavior -- normalize to a plain float here for
+            # the threshold comparison below, regardless of which it is.
+            imbh_mass_msun = (imbh_mass_out.to(u.Msun).value if hasattr(imbh_mass_out, 'to')
+                               else float(imbh_mass_out))
+
             track_path = None
-            if record_dt is not None and imbh_mass_msun >= track_min_mass:
+            if record_dt is not None and not np.isnan(imbh_mass_msun) and imbh_mass_msun >= track_min_mass:
                 track_path = save_radius_track(
                     trace['track_time_gyr'], trace['track_radius_kpc'], idx, clusteridx, track_dir,
                 )
@@ -1020,6 +1208,14 @@ def main():
                          help=f"Directory to save --save-radius-tracks output into (default: "
                               f"'{TRACK_OUTPUT_DIRNAME}' next to the input CSV). Pass this same "
                               "path to analysis.py's --track-dir.")
+    parser.add_argument("--no-continue-formed-inside-rstop", action="store_true",
+                         help="Restore the OLD behavior for clusters whose drawn initial separation "
+                              "already lands inside r_stop_frac*R_vir at formation: instantly credit "
+                              "them with a zero-duration 'inspiraled' merger (total_time_gyr=0), rather "
+                              "than letting them integrate/evolve normally from there (the new default "
+                              "-- see trace_cluster_to_snapshot's allow_formation_inside_r_stop). "
+                              "r_stop itself is unaffected either way for clusters that dynamically "
+                              "friction their way down to it during the trace.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -1052,9 +1248,15 @@ def main():
         print(f"--save-radius-tracks enabled: tracks (IMBH_mass_msun >= {args.track_min_mass:.0f}) "
               f"will be saved under {track_dir}")
 
+    allow_formation_inside_r_stop = not args.no_continue_formed_inside_rstop
+    if not allow_formation_inside_r_stop:
+        print("--no-continue-formed-inside-rstop set: clusters formed inside r_stop will be treated "
+              "as instant t=0 mergers (old behavior).")
+
     output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace,
                                         record_dt=record_dt, track_dir=track_dir,
-                                        track_min_mass=args.track_min_mass)
+                                        track_min_mass=args.track_min_mass,
+                                        allow_formation_inside_r_stop=allow_formation_inside_r_stop)
     summarize_status(output_clusters)
 
     save_path = args.save_path
