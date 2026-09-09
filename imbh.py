@@ -108,8 +108,8 @@ cluster_sampler = ClusterPopulationSampler.load(CLUSTER_SAMPLER_PATH)
 
 
 #--------- Load post-processed illustris merger tree 
-def load_merger_tree_idx(df,cutoff_z = 9.9):
-    goodidx = np.where((df['delta_t_gyr']>0) & (df['formation_redshift']>=cutoff_z))[0]
+def load_merger_tree_idx(df,cutoff_z = 7):
+    goodidx = np.where((df['delta_t_gyr']>0) & (df['formation_redshift']>=cutoff_z)& (df["group_m_crit200_msun"] < 1e9))[0]
     print("There are "+str(len(goodidx))+" subhalos with nonzero merger time and formation time above z cutoff.")
     return goodidx
 
@@ -577,6 +577,8 @@ def create_timescale_model(mass, radius, Nsampling = 5):
 
 def add_time_evolution(delta_t, model):
     output = create_dynamical_model_integral(model,verbose = False, timescale_override = delta_t, merger_override = True)
+    output['rho0_msun_pc3'] = model.profiles[0].rho0.value
+    output['r0_pc'] = model.profiles[0].r0.value
     return output
 
 
@@ -614,6 +616,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
         cluster_props['which_final_formation_time']=[]
         cluster_props['initial_subhalo_mass_msun']=[]
         cluster_props['initial_subhalo_formation_redshift']=[]
+        cluster_props['rho0_msun_pc3'] =[]
+        cluster_props['r0_pc'] =[]
         for clusteridx in range(len(cluster_props['cluster_mass'])):
             m_cl = cluster_props['cluster_mass'][clusteridx]
             r0_vec = cluster_props['cluster_sep'][clusteridx]
@@ -656,6 +660,9 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
                 cluster_props['IMBH_mass'].append(np.nan)
                 cluster_props['IMBH_final_formation_time'].append(np.nan)
                 cluster_props['which_final_formation_time'].append(None)
+                cluster_props['r0_pc'].append(None)
+                cluster_props['rho0_msun_pc3'].append(None)
+
                 continue
 
             print(f"    status={trace['status']}, total_time={trace['total_time_gyr']:.4f} Gyr, "
@@ -680,6 +687,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
             cluster_props['min_roche_radius_kpc'].append(trace['min_roche_radius_kpc'])
             cluster_props['time_of_min_roche_gyr'].append(trace['time_of_min_roche_gyr'])
 
+
             out, err = run_with_timeout(
                 _run_timescale_model, TIMESCALES_CALL_TIMEOUT_S,
                 cluster_props['cluster_mass'][clusteridx],
@@ -696,7 +704,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
             cluster_props['IMBH_mass'].append(out['M_VMS'][0])
             cluster_props['IMBH_final_formation_time'].append(out['minimum_disruption_time'][0])
             cluster_props['which_final_formation_time'].append(out['which_disruption_time'][0])
-
+            cluster_props['r0_pc'].append(out['r0_pc'])
+            cluster_props['rho0_msun_pc3'].append(out['rho0_msun_pc3'])
         clusters.append(cluster_props)
 
     if failures:
@@ -796,6 +805,8 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'IMBH_mass_msun': cluster_props['IMBH_mass'][i].to('Msun').value,
                 'IMBH_final_formation_time_gyr': cluster_props['IMBH_final_formation_time'][i].to('Gyr').value,
                 'which_final_formation_time': cluster_props['which_final_formation_time'][i],
+                'rho0_msun_pc3': cluster_props['rho0_msun_pc3'][i],
+                'r0_pc': cluster_props['r0_pc'][i],
             })
 
     df = pd.DataFrame(rows)
