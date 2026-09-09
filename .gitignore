@@ -231,3 +231,4 @@ test.py
 output.txt
 plot_cluster_sampler.py
 plot_tde_rates.py
+imbh_config.py
