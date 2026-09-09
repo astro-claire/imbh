@@ -63,6 +63,21 @@ _KPCGYR_TO_KMS = (1 * u.kpc / u.Gyr).to(u.km / u.s).value
 # against any tree pathology causing an infinite loop)
 MAX_STEPS = 500
 
+# Time resolution for the optional per-cluster radius-vs-time tracks (see
+# --save-radius-tracks / trace_cluster_to_snapshot's record_dt). Matches
+# analysis.py's own TDE-rate time resolution (set_up_timebins's default
+# 1e5 yr) so the two line up directly without any re-binning.
+TRACK_TIME_RESOLUTION = 1e5 * u.yr
+# Minimum IMBH_mass_msun for a cluster's radius track to actually be saved
+# to disk. Matches analysis.py's own hardcoded "small BHs, placeholder"
+# cutoff (timescale_analysis's `if IMBH_mass_msun < 5e2`) -- clusters below
+# this never get a TDE rate computed downstream anyway, so there's no
+# reason to save (and pay the disk cost for) their track.
+TRACK_MIN_IMBH_MASS_MSUN = 500.0
+# Default subdirectory (created next to the input CSV) that per-cluster
+# radius tracks get saved into.
+TRACK_OUTPUT_DIRNAME = "radius_tracks"
+
 # Wall-clock timeout for a single cluster's orbit trace (trace_cluster_to_snapshot).
 # This is a defensive safeguard, not a fix for any specific known cause --
 # some parameter combinations (e.g. a bound orbit with an unusually short
@@ -155,7 +170,7 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
                                      mass_end, radius_end, rel_pos_total, rel_vel_total,
                                      leg_duration, concentration, bg_host, bg_offset,
                                      max_leg_duration, hubble_start, hubble_end,
-                                     escape_frac=np.inf):
+                                     escape_frac=np.inf, record_dt=None):
     """
     Subdivide a leg into shorter sub-steps rather than treating a
     potentially Gyr-long gap as a single static host/single solve_ivp call
@@ -179,15 +194,19 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
     even when there's no "next" host to interpolate toward.
 
     Returns (status, elapsed, r_vec, v_vec, n_pericenters,
-    min_roche_radius_kpc, time_at_min_roche) matching integrate_orbit's
-    signature, with elapsed being the TOTAL time actually used (less than
-    leg_duration if merged/escaped partway through a sub-step),
-    n_pericenters the TOTAL pericenter count summed across every sub-step,
-    min_roche_radius_kpc the smallest tidal radius found at ANY pericenter
-    across every sub-step (None if none occurred), and time_at_min_roche
-    the time elapsed SINCE THE START OF THIS LEG (i.e. this whole
-    _integrate_leg_with_subdivision call, NOT just the one sub-step it
-    occurred in) at which that pericenter happened.
+    min_roche_radius_kpc, time_at_min_roche, trajectory) matching
+    integrate_orbit's signature, with elapsed being the TOTAL time actually
+    used (less than leg_duration if merged/escaped partway through a
+    sub-step), n_pericenters the TOTAL pericenter count summed across every
+    sub-step, min_roche_radius_kpc the smallest tidal radius found at ANY
+    pericenter across every sub-step (None if none occurred),
+    time_at_min_roche the time elapsed SINCE THE START OF THIS LEG (i.e.
+    this whole _integrate_leg_with_subdivision call, NOT just the one
+    sub-step it occurred in) at which that pericenter happened, and
+    trajectory the (t_grid, r_grid) pair (see integrate_orbit) with t_grid
+    made LOCAL TO THIS WHOLE LEG (not just one sub-step) by shifting each
+    sub-step's own t_grid by the cumulative elapsed time of every prior
+    sub-step -- None if record_dt was not given.
     """
     n_sub = max(1, int(np.ceil((leg_duration / max_leg_duration).to(u.dimensionless_unscaled).value)))
     sub_dt = leg_duration / n_sub
@@ -195,6 +214,9 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
     total_pericenters = 0
     min_roche_radius_kpc = None
     time_at_min_roche = None
+
+    track_t_parts = [] if record_dt is not None else None
+    track_r_parts = [] if record_dt is not None else None
 
     for k in range(n_sub):
         frac = k / n_sub
@@ -209,10 +231,19 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
         # rule as intermediate legs generally.
         this_escape_frac = escape_frac if k == n_sub - 1 else np.inf
 
-        status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this = integrate_orbit(
+        status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, traj_sub = integrate_orbit(
             cluster_mass, r_vec, v_vec, host_k, t_max=sub_dt, escape_frac=this_escape_frac,
             background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_k,
+            record_dt=record_dt,
         )
+        if traj_sub is not None:
+            t_sub, r_sub = traj_sub
+            # t_sub is local to just this sub-step -- shift by the elapsed
+            # time of every PRIOR sub-step (total_elapsed's value from
+            # BEFORE this sub-step's own `elapsed` is added below) to make
+            # it local to the whole leg instead.
+            track_t_parts.append(t_sub + total_elapsed.to(u.Gyr).value)
+            track_r_parts.append(r_sub)
         total_pericenters += n_peri
         # NOTE: uses total_elapsed's value from BEFORE this sub-step's
         # `elapsed` is added below, since t_roche_this is local to just
@@ -224,18 +255,20 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
         total_elapsed += elapsed
 
         if status in ("merged", "escaped"):
-            return status, total_elapsed, r_vec, v_vec, total_pericenters, min_roche_radius_kpc, time_at_min_roche
+            traj = (np.concatenate(track_t_parts), np.concatenate(track_r_parts)) if record_dt is not None else None
+            return status, total_elapsed, r_vec, v_vec, total_pericenters, min_roche_radius_kpc, time_at_min_roche, traj
 
         r_vec = r_vec + rel_pos_total / n_sub
         v_vec = v_vec + rel_vel_total / n_sub
 
-    return "ongoing", total_elapsed, r_vec, v_vec, total_pericenters, min_roche_radius_kpc, time_at_min_roche
+    traj = (np.concatenate(track_t_parts), np.concatenate(track_r_parts)) if record_dt is not None else None
+    return "ongoing", total_elapsed, r_vec, v_vec, total_pericenters, min_roche_radius_kpc, time_at_min_roche, traj
 
 
 def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, target_age,
                                navigator, concentration=HOST_CONCENTRATION, max_steps=MAX_STEPS,
                                final_escape_frac=3.0, max_leg_duration=1.0 * u.Gyr,
-                               min_host_mass_msun=1e8, verbose=False):
+                               min_host_mass_msun=1e8, verbose=False, record_dt=None):
     """
     Follow one cluster's dynamical-friction evolution, advancing ONE
     SNAPSHOT AT A TIME along its current host's tree branch, until it
@@ -305,6 +338,15 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             mass/radius, rather than treating a potentially Gyr-long gap
             as a single static host the whole way through (see
             _integrate_leg_with_subdivision)
+        record_dt: astropy Quantity (time) or None (default). If given, also
+            build a full time series of the cluster's separation from the
+            CENTRAL/ROOT galaxy (the tree's own z=0 root's main-branch
+            position at each snapshot -- i.e. the same reference the
+            background-potential term already uses) across the ENTIRE
+            trace, sampled every record_dt (see integrate_orbit's
+            record_dt and TRACK_TIME_RESOLUTION below). Adds 'track_time_gyr'
+            and 'track_radius_kpc' to the returned dict. None (the default)
+            skips this at essentially zero extra cost.
 
     Returns a dict:
         status: 'inspiraled' | 'escaped' | 'outskirts'
@@ -342,6 +384,19 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             FORMATION (same convention as total_time_gyr) at which the
             min_roche_radius_kpc pericenter occurred. None under the same
             conditions as min_roche_radius_kpc.
+        track_time_gyr, track_radius_kpc: only present if record_dt was
+            given. Parallel np.ndarrays: time elapsed SINCE THE CLUSTER'S
+            FORMATION (same convention as total_time_gyr -- so e.g. these
+            can be directly compared against IMBH_final_formation_time_gyr)
+            and the cluster's separation (kpc) from the central/root galaxy
+            at that time. Sampled every record_dt, EXCEPT wherever a leg's
+            background potential wasn't active (see trace_cluster_to_snapshot's
+            docstring on bg_host/bg_offset) -- namely legs where the current
+            host itself IS the root's main-branch progenitor, or where the
+            main branch isn't tracked back that far -- in which case the
+            separation recorded is from the CURRENT host's own center
+            instead (the best available proxy for "the center" at that
+            point in the trace).
     """
     current_id = start_subhalo_id
     r_vec, v_vec = r0_vec, v0_vec
@@ -352,12 +407,14 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
     n_pericenters = 0
     min_roche_radius_kpc = None
     time_of_min_roche_gyr = None
+    track_time_parts = [] if record_dt is not None else None
+    track_radius_parts = [] if record_dt is not None else None
 
     def make_result(status, host_id, r, v, r_over_rvir, steps):
         final_energy_kms2, _, _, _ = _compute_specific_energy_kms2(
             r, v, mass_msun, radius_kpc, concentration, bg_host, bg_offset,
         )
-        return {
+        result = {
             'status': status,
             'total_time_gyr': (current_age - formation_age).to(u.Gyr).value,
             'final_subhalo_id': host_id,
@@ -372,6 +429,14 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             'min_roche_radius_kpc': min_roche_radius_kpc,
             'time_of_min_roche_gyr': time_of_min_roche_gyr,
         }
+        if record_dt is not None:
+            if track_time_parts:
+                result['track_time_gyr'] = np.concatenate(track_time_parts)
+                result['track_radius_kpc'] = np.concatenate(track_radius_parts)
+            else:
+                result['track_time_gyr'] = np.array([])
+                result['track_radius_kpc'] = np.array([])
+        return result
 
     for step in range(max_steps):
         mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
@@ -480,12 +545,13 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 
         age_at_leg_start = current_age  # for converting a LOCAL pericenter time (relative to
                                          # the start of THIS leg) into an absolute one, below
+        leg_traj = None
         if subdivided:
             if capped_by == 'step':
-                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this = _integrate_leg_with_subdivision(
+                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, next_mass_msun, next_radius_kpc,
                     rel_pos_full, rel_vel_full, t_leg_max, concentration, bg_host, bg_offset, max_leg_duration,
-                    hubble_start, hubble_end,
+                    hubble_start, hubble_end, record_dt=record_dt,
                 )
             else:
                 # 'output'-capped (including the true final step): no next
@@ -493,17 +559,18 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 # integrating within the SAME unchanging host, zero reframe.
                 zero_pos = np.zeros(3) * u.kpc
                 zero_vel = np.zeros(3) * u.km / u.s
-                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this = _integrate_leg_with_subdivision(
+                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, mass_msun, radius_kpc,
                     zero_pos, zero_vel, t_leg_max, concentration, bg_host, bg_offset, max_leg_duration,
-                    hubble_start, hubble_start, escape_frac=escape_frac,
+                    hubble_start, hubble_start, escape_frac=escape_frac, record_dt=record_dt,
                 )
         else:
             host = NFWHost(mass_msun * u.Msun, radius_kpc * u.kpc, concentration=concentration)
             if t_leg_max > 0 * u.Gyr:
-                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this = integrate_orbit(
+                status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = integrate_orbit(
                     cluster_mass, r_vec, v_vec, host, t_max=t_leg_max, escape_frac=escape_frac,
                     background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_start,
+                    record_dt=record_dt,
                 )
             else:
                 status, elapsed, n_peri, roche_this, t_roche_this = "ongoing", 0 * u.Gyr, 0, None, None
@@ -512,6 +579,14 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         if roche_this is not None and (min_roche_radius_kpc is None or roche_this < min_roche_radius_kpc):
             min_roche_radius_kpc = roche_this
             time_of_min_roche_gyr = (age_at_leg_start + t_roche_this - formation_age).to(u.Gyr).value
+        if leg_traj is not None:
+            # leg_traj's times are LOCAL to this leg (t=0 at age_at_leg_start)
+            # -- shift to "time since cluster formation", matching
+            # total_time_gyr's convention, so this lines up directly against
+            # IMBH_final_formation_time_gyr downstream (see analysis.py).
+            t_leg, r_leg = leg_traj
+            track_time_parts.append(t_leg + (age_at_leg_start - formation_age).to(u.Gyr).value)
+            track_radius_parts.append(r_leg)
 
         if verbose:
             r_mag_post_integrate = np.linalg.norm(r_vec.to(u.kpc).value)
@@ -588,8 +663,47 @@ def _run_timescale_model(mass, radius, delta_t):
     return add_time_evolution(delta_t, model)
 
 
+def save_radius_track(track_time_gyr, track_radius_kpc, halo_idx, cluster_idx, track_dir):
+    """
+    Save one cluster's separation-from-central-galaxy time series (see
+    trace_cluster_to_snapshot's record_dt/track_time_gyr/track_radius_kpc)
+    to its own small CSV, named so it can be uniquely matched back to its
+    row in the main per-cluster output table (see save_cluster_output's
+    'radius_track_path' column). Returns the path written.
+
+    One file per qualifying cluster (rather than one shared file) keeps
+    each file small/simple and avoids re-writing a giant combined table
+    every time a single cluster's trace changes -- with clusters at this
+    resolution numbering in the thousands-to-millions across a full run,
+    consider a more compact format (e.g. one .npz/.hdf5 per HALO rather
+    than per cluster) if the sheer file COUNT becomes a filesystem problem.
+    """
+    path = os.path.join(track_dir, f"radius_track_h{halo_idx}_c{cluster_idx}.csv")
+    track_df = pd.DataFrame({
+        'time_since_formation_gyr': track_time_gyr,
+        'separation_from_host_kpc': track_radius_kpc,
+    })
+    track_df.to_csv(path, index=False)
+    return path
+
+
 # ------- Iteration over all the subhalos
-def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
+def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
+                      record_dt=None, track_dir=None, track_min_mass=TRACK_MIN_IMBH_MASS_MSUN):
+    """
+    Parameters (new ones only -- see the rest of the module for the others):
+        record_dt: astropy Quantity (time) or None (default). Passed straight
+            through to trace_cluster_to_snapshot -- if given, every cluster's
+            orbit trace also builds a full separation-from-central-galaxy
+            time series (see that function's docstring). This alone does
+            NOT save anything to disk; it just makes the series available
+            in-memory so the mass check below can decide whether to keep it.
+        track_dir: directory to save qualifying clusters' radius tracks
+            into (one CSV per cluster). Required if record_dt is given;
+            ignored otherwise. Created by the caller (main()), not here.
+        track_min_mass: only clusters with IMBH_mass_msun >= this get their
+            track actually written to disk (see TRACK_MIN_IMBH_MASS_MSUN).
+    """
     clusters = []
     failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
     #testing mode-just do the first few
@@ -618,6 +732,11 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
         cluster_props['initial_subhalo_formation_redshift']=[]
         cluster_props['rho0_msun_pc3'] =[]
         cluster_props['r0_pc'] =[]
+        # path to this cluster's saved separation-from-central-galaxy time
+        # series (see TRACK_MIN_IMBH_MASS_MSUN), or None if it wasn't
+        # saved (below-threshold IMBH mass, or --save-radius-tracks not
+        # requested at all, or the orbit trace itself failed).
+        cluster_props['radius_track_path'] = []
         for clusteridx in range(len(cluster_props['cluster_mass'])):
             m_cl = cluster_props['cluster_mass'][clusteridx]
             r0_vec = cluster_props['cluster_sep'][clusteridx]
@@ -637,7 +756,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
             trace, trace_err = run_with_timeout(
                 trace_cluster_to_snapshot, ORBIT_TRACE_TIMEOUT_S,
                 m_cl, r0_vec, v0_vec, start_subhalo_id, target_age, navigator,
-                verbose=debug_trace,
+                verbose=debug_trace, record_dt=record_dt,
             )
             if trace_err is not None:
                 print(f"    WARNING: orbit trace failed/timed out ({trace_err}) -- "
@@ -662,6 +781,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
                 cluster_props['which_final_formation_time'].append(None)
                 cluster_props['r0_pc'].append(None)
                 cluster_props['rho0_msun_pc3'].append(None)
+                cluster_props['radius_track_path'].append(None)
 
                 continue
 
@@ -700,12 +820,21 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False):
                 cluster_props['IMBH_mass'].append(np.nan)
                 cluster_props['IMBH_final_formation_time'].append(np.nan)
                 cluster_props['which_final_formation_time'].append(None)
+                cluster_props['radius_track_path'].append(None)
                 continue
-            cluster_props['IMBH_mass'].append(out['M_VMS'][0])
+            imbh_mass_msun = out['M_VMS'][0]
+            cluster_props['IMBH_mass'].append(imbh_mass_msun)
             cluster_props['IMBH_final_formation_time'].append(out['minimum_disruption_time'][0])
             cluster_props['which_final_formation_time'].append(out['which_disruption_time'][0])
             cluster_props['r0_pc'].append(out['r0_pc'])
             cluster_props['rho0_msun_pc3'].append(out['rho0_msun_pc3'])
+
+            track_path = None
+            if record_dt is not None and imbh_mass_msun >= track_min_mass:
+                track_path = save_radius_track(
+                    trace['track_time_gyr'], trace['track_radius_kpc'], idx, clusteridx, track_dir,
+                )
+            cluster_props['radius_track_path'].append(track_path)
         clusters.append(cluster_props)
 
     if failures:
@@ -754,6 +883,11 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
           this script handles them, with no .to()/.value conversion
           anywhere) -- if the `timescales` package actually returns
           astropy Quantities for these, adjust this function accordingly.
+        - radius_track_path is None for every cluster unless
+          --save-radius-tracks was requested AND that specific cluster's
+          IMBH_mass_msun cleared track_min_mass (see iterate_subhalos) --
+          stored here as an empty string rather than NaN, since it's a
+          path/string field, not numeric.
 
     Parameters:
         output_clusters: list of per-halo dicts, as returned by iterate_subhalos.
@@ -807,6 +941,7 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'which_final_formation_time': cluster_props['which_final_formation_time'][i],
                 'rho0_msun_pc3': cluster_props['rho0_msun_pc3'][i],
                 'r0_pc': cluster_props['r0_pc'][i],
+                'radius_track_path': cluster_props['radius_track_path'][i] or '',
             })
 
     df = pd.DataFrame(rows)
@@ -865,6 +1000,26 @@ def main():
                          help="Format for --save-path (default: pickle, matching this "
                               "pipeline's existing .dat convention; use csv for a "
                               "plain-text/portable table instead)")
+    parser.add_argument("--save-radius-tracks", action="store_true",
+                         help="Also save, for every cluster whose IMBH_mass_msun ends up "
+                              f">= --track-min-mass, a full time series of its separation "
+                              "from the central/root galaxy (one CSV per qualifying cluster, "
+                              f"time resolution {TRACK_TIME_RESOLUTION.to(u.yr).value:.0e} yr -- "
+                              "see TRACK_TIME_RESOLUTION). Downstream, analysis.py uses these "
+                              "to report the TDE rate as a function of galactocentric radius, "
+                              "not just cosmic time. Off by default: this both slows the run "
+                              "(finely-sampled dense ODE output for every cluster, not just "
+                              "the ones that end up qualifying) and uses noticeably more disk "
+                              "space (one file per qualifying cluster, each up to ~1e5 rows).")
+    parser.add_argument("--track-min-mass", type=float, default=TRACK_MIN_IMBH_MASS_MSUN,
+                         help="Minimum IMBH_mass_msun for --save-radius-tracks to actually "
+                              f"write a cluster's track to disk (default: {TRACK_MIN_IMBH_MASS_MSUN:.0f} "
+                              "-- matches analysis.py's own small-BH cutoff, below which no TDE "
+                              "rate gets computed for that cluster anyway).")
+    parser.add_argument("--track-dir", default=None,
+                         help=f"Directory to save --save-radius-tracks output into (default: "
+                              f"'{TRACK_OUTPUT_DIRNAME}' next to the input CSV). Pass this same "
+                              "path to analysis.py's --track-dir.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -887,7 +1042,19 @@ def main():
     print(f"Output snapshot {args.output_snap} -> cosmic age {target_age:.4f}")
 
     goodidx = load_merger_tree_idx(df)
-    output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace)
+
+    record_dt = TRACK_TIME_RESOLUTION if args.save_radius_tracks else None
+    track_dir = args.track_dir
+    if track_dir is None:
+        track_dir = os.path.join(os.path.dirname(args.csv_path) or ".", TRACK_OUTPUT_DIRNAME)
+    if args.save_radius_tracks:
+        os.makedirs(track_dir, exist_ok=True)
+        print(f"--save-radius-tracks enabled: tracks (IMBH_mass_msun >= {args.track_min_mass:.0f}) "
+              f"will be saved under {track_dir}")
+
+    output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace,
+                                        record_dt=record_dt, track_dir=track_dir,
+                                        track_min_mass=args.track_min_mass)
     summarize_status(output_clusters)
 
     save_path = args.save_path

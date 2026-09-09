@@ -215,19 +215,56 @@ def _solve_ivp_robust(rhs_args, t_span, y0, events):
     """
     try:
         sol = solve_ivp(_rhs, t_span, y0, args=rhs_args, events=events,
-                         method="LSODA", rtol=1e-8, atol=1e-10)
+                         method="LSODA", rtol=1e-8, atol=1e-10, dense_output=True)
         if sol.success:
             return sol
     except Exception:
         pass
     return solve_ivp(_rhs, t_span, y0, args=rhs_args, events=events,
-                      method="RK45", rtol=1e-8, atol=1e-10)
+                      method="RK45", rtol=1e-8, atol=1e-10, dense_output=True)
+
+
+def _sample_trajectory(sol, t_end_gyr, record_dt_gyr, bg_offset_kpc):
+    """
+    Sample a solve_ivp solution's dense (continuous) interpolant on a fixed
+    grid spaced record_dt_gyr apart, from t=0 to t=t_end_gyr inclusive, and
+    return (t_grid, r_from_center_kpc) -- the times sampled (LOCAL to this
+    call, i.e. t=0 is this call's own start) and the separation from
+    whatever center is relevant (the background potential's center,
+    bg_offset_kpc, if one is active; otherwise the local host's own center,
+    i.e. just |r|).
+
+    Uses sol.sol(), scipy's dense/continuous output, rather than sol.t/sol.y
+    (the discrete steps the adaptive integrator actually took) -- this
+    decouples the SAVED time resolution from the integrator's own adaptive
+    step size, which is what we want (we don't want a bound, fast-oscillating
+    orbit to silently produce a far finer-grained -- or coarser -- track than
+    a slow, unbound one).
+    """
+    if t_end_gyr <= 0:
+        t_grid = np.array([0.0])
+    else:
+        n_samples = int(np.floor(t_end_gyr / record_dt_gyr)) + 1
+        t_grid = np.arange(n_samples) * record_dt_gyr
+        # always include the exact final time too, even if it doesn't fall
+        # exactly on the record_dt_gyr grid -- otherwise the very end of
+        # each leg (often where something interesting, like a merger, just
+        # happened) would be silently dropped from the track.
+        if t_grid[-1] < t_end_gyr:
+            t_grid = np.append(t_grid, t_end_gyr)
+    y_grid = sol.sol(t_grid)
+    r_grid = y_grid[:3, :]
+    if bg_offset_kpc is not None:
+        r_from_center = np.linalg.norm(r_grid - bg_offset_kpc[:, None], axis=0)
+    else:
+        r_from_center = np.linalg.norm(r_grid, axis=0)
+    return t_grid, r_from_center
 
 
 def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
                      t_max=50 * u.Gyr, r_stop_frac=0.01, escape_frac=3.0,
                      background_host=None, background_offset=None,
-                     hubble_rate=0.0 / u.Gyr):
+                     hubble_rate=0.0 / u.Gyr, record_dt=None):
     """
     Like sink_time(), but returns the full final STATE (position and
     velocity relative to the host) at whatever time the integration
@@ -257,6 +294,15 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
             for backward compatibility / non-cosmological uses of this
             function; pass the real H(z) for cosmological orbit traces,
             especially important at high redshift where H(z) is large.
+        record_dt: astropy Quantity (time) or None (default). If given,
+            also sample and return the cluster's separation from the
+            RELEVANT center (background_host's center if one is active,
+            otherwise `host`'s own center) at this time spacing, via
+            scipy's dense/continuous output -- see _sample_trajectory.
+            This is what powers the per-cluster radius-vs-time tracks
+            imbh.py optionally saves (see TRACK_TIME_RESOLUTION there).
+            None (the default) skips this entirely at essentially zero
+            cost, for callers that don't need it.
 
     Returns
     -------
@@ -291,6 +337,14 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
         an absolute cosmic age -- the caller, which knows what absolute
         time this call started at, is responsible for that conversion).
         None under the same conditions as min_roche_radius_kpc.
+    trajectory : (np.ndarray, np.ndarray) or None
+        Only computed if record_dt is given, else None. (t_grid, r_grid):
+        times LOCAL to this call (t=0 is this call's own start, in Gyr,
+        plain floats) and the corresponding separation (plain floats, kpc)
+        from background_host's center if one is active, else from `host`'s
+        own center. The caller is responsible for converting t_grid into
+        whatever absolute time convention it needs (see
+        trace_cluster_to_snapshot, which offsets by age_at_leg_start).
     """
     m_msun = m_cluster.to(u.Msun).value
     r0 = r0_vec.to(u.kpc).value
@@ -305,6 +359,7 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     t_max_gyr = t_max.to(u.Gyr).value
 
     bg_offset_kpc = background_offset.to(u.kpc).value if background_host is not None else None
+    record_dt_gyr = record_dt.to(u.Gyr).value if record_dt is not None else None
 
     # If we're ALREADY at/inside the merge radius, OR already beyond the
     # escape radius, at t=0 -- short-circuit here rather than relying on
@@ -323,10 +378,14 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     # directions from the starting point to build a finite-difference
     # Jacobian.
     r0_mag = np.linalg.norm(r0)
-    if r0_mag <= r_stop:
-        return "merged", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None
-    if r0_mag > r_escape:
-        return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None
+    if r0_mag <= r_stop or r0_mag > r_escape:
+        status = "merged" if r0_mag <= r_stop else "escaped"
+        traj = None
+        if record_dt_gyr is not None:
+            r0_from_center = (np.linalg.norm(r0 - bg_offset_kpc) if bg_offset_kpc is not None
+                               else float(r0_mag))
+            traj = (np.array([0.0]), np.array([r0_from_center]))
+        return status, 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None, traj
 
     y0 = np.concatenate([r0, v0])
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]
@@ -354,11 +413,16 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
             min_roche_radius_kpc = r_t
             time_at_min_roche = t_peri * u.Gyr
 
+    traj = None
+    if record_dt_gyr is not None:
+        bg_offset_arr = np.asarray(bg_offset_kpc) if bg_offset_kpc is not None else None
+        traj = _sample_trajectory(sol, sol.t[-1], record_dt_gyr, bg_offset_arr)
+
     if sol.t_events[0].size > 0:
-        return "merged", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche
+        return "merged", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche, traj
     if sol.t_events[1].size > 0:
-        return "escaped", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche
-    return "ongoing", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche
+        return "escaped", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche, traj
+    return "ongoing", elapsed, r_final, v_final, n_pericenters, min_roche_radius_kpc, time_at_min_roche, traj
 
 
 def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
