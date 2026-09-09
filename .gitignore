@@ -230,3 +230,4 @@ check_early_velocity.py
 test.py
 output.txt
 plot_cluster_sampler.py
+plot_tde_rates.py
