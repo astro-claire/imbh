@@ -38,16 +38,27 @@ which --tree-path therefore requires) rather than approximating everything
 with one shared reference time. Clusters missing a matched formation
 redshift can't be placed on this axis and are excluded, with a count printed.
 
+Pass --tde-contributors-csv (the tde_contributors_alpha<alpha>.csv sidecar
+file analysis.py's own run writes -- see its docstring) to additionally
+restrict to, or highlight, clusters that actually contributed at least one
+mass-loss bin to the TDE rate -- a narrower, more specific set than
+"IMBH_mass_msun>0" alone, since timescale_analysis excludes plenty of
+those too (e.g. its own 5e2 Msun floor). --restrict-to-tde-contributors
+plots ONLY that subset; --color-by tde_contributor instead highlights them
+within the full population (which is plotted by default either way).
+
 Requires: numpy, pandas, matplotlib (plus h5py/astropy, only if --tree-path
 is used -- imported lazily so plotting without it never needs them)
     pip install numpy pandas matplotlib
 
 Usage:
     python plot_radius_tracks.py <track_dir> [--cluster-csv cluster_output_ID_snapN.csv]
-                                  [--color-by status|r_over_rvir|none]
+                                  [--color-by status|r_over_rvir|tde_contributor|none]
                                   [--tree-path sublink_full_ID.hdf5]
                                   [--snap-redshift-path tng_download/snapshot_redshifts.json]
                                   [--box-size 35000]
+                                  [--tde-contributors-csv tde_contributors_alphaN.csv]
+                                  [--restrict-to-tde-contributors]
                                   [--out radius_tracks.png]
                                   [--max-clusters 500] [--max-points-per-track 200]
                                   [--yscale log|linear] [--xscale log|linear]
@@ -55,7 +66,8 @@ Usage:
 
 Example:
     python plot_radius_tracks.py cluster_tracks --cluster-csv cluster_output_467548_snap99.csv \\
-        --tree-path tng_download/sublink_full_467548.hdf5
+        --tree-path tng_download/sublink_full_467548.hdf5 \\
+        --tde-contributors-csv tde_contributors_alpha1.2.csv --restrict-to-tde-contributors
 """
 
 import argparse
@@ -91,47 +103,46 @@ def load_sparse_track(path, max_points):
     return sub["time_since_formation_gyr"].to_numpy(), sub["separation_from_host_kpc"].to_numpy()
 
 
-def load_cluster_lookup(cluster_file):
-    """Reads the main per-cluster output table (imbh.py's save_cluster_output)
-
-    and builds {basename(radius_track_path): row} for every row that actually
-    has one -- most rows won't (only clusters clearing TRACK_MIN_IMBH_MASS_MSUN
-    get a track saved at all). Matched by FILENAME rather than the full stored
-    path, so this still works if the tracks were moved to a different directory
-    since the run that made them. Supports both .csv and .dat formats.
+def load_cluster_lookup(cluster_csv):
     """
-    ext = os.path.splitext(cluster_file)[1].lower()
-
-    if ext == ".csv":
-        df = pd.read_csv(cluster_file)
-    elif ext == ".dat":
-        # Reads space- or tab-delimited files; adjust sep if your .dat file uses a specific delimiter
-        df = pd.read_pickle(cluster_file)
-    else:
-        sys.exit(
-            f"Error: Unsupported file format '{ext}' for {cluster_file}. Expected .csv or .dat."
-        )
-
+    Reads the main per-cluster output table (imbh.py's save_cluster_output)
+    and builds {basename(radius_track_path): row} for every row that
+    actually has one -- most rows won't (only clusters clearing
+    TRACK_MIN_IMBH_MASS_MSUN get a track saved at all). Matched by
+    FILENAME rather than the full stored path, so this still works if the
+    tracks were moved to a different directory since the run that made them.
+    """
+    df = pd.read_csv(cluster_csv)
     if "radius_track_path" not in df.columns:
-        sys.exit(
-            f"{cluster_file} has no 'radius_track_path' column -- was it produced by a run "
-            f"with --save-radius-tracks enabled?"
-        )
-
-    has_track = df["radius_track_path"].notna() & (
-        df["radius_track_path"] != ""
-    )
-    lookup = {
-        os.path.basename(p): row
-        for p, (_, row) in zip(
-            df.loc[has_track, "radius_track_path"],
-            df.loc[has_track].iterrows(),
-        )
-    }
-    print(
-        f"Loaded {len(df)} cluster rows from {cluster_file} ({len(lookup)} with a saved radius track)"
-    )
+        sys.exit(f"{cluster_csv} has no 'radius_track_path' column -- was it produced by a run "
+                  f"with --save-radius-tracks enabled?")
+    has_track = df["radius_track_path"].notna() & (df["radius_track_path"] != "")
+    lookup = {os.path.basename(p): row for p, (_, row) in
+              zip(df.loc[has_track, "radius_track_path"], df.loc[has_track].iterrows())}
+    print(f"Loaded {len(df)} cluster rows from {cluster_csv} ({len(lookup)} with a saved radius track)")
     return lookup
+
+
+def load_tde_contributors(path):
+    """
+    Reads the tde_contributors_alpha<alpha>.csv sidecar file analysis.py's
+    own run_clusters/main writes -- one row per cluster that actually
+    contributed at least one mass-loss bin to the TDE rate, a narrower set
+    than "IMBH_mass_msun>0" alone (timescale_analysis excludes plenty of
+    those too -- e.g. its own 5e2 Msun floor). Returns a set of basenames
+    (matching load_cluster_lookup's own basename-based join) for use with
+    --restrict-to-tde-contributors / --color-by tde_contributor.
+    """
+    df = pd.read_csv(path)
+    if "radius_track_path" not in df.columns:
+        sys.exit(f"{path} has no 'radius_track_path' column -- was it produced by analysis.py's "
+                  f"own contributing_rows output?")
+    paths = df["radius_track_path"].astype(str)
+    has_track = df["radius_track_path"].notna() & (paths != "") & (paths != "nan")
+    basenames = {os.path.basename(p) for p in paths[has_track]}
+    print(f"Loaded {len(df)} TDE-contributing cluster row(s) from {path} "
+          f"({len(basenames)} with a radius track)")
+    return basenames
 
 
 def load_host_rvir_history(tree_path, snap_redshift_path, box_size):
@@ -149,6 +160,7 @@ def load_host_rvir_history(tree_path, snap_redshift_path, box_size):
 
 
 STATUS_COLORS = {"inspiraled": "indianred", "outskirts": "steelblue"}
+TDE_CONTRIBUTOR_COLORS = {"TDE contributor": "darkorange", "not a TDE contributor": "steelblue"}
 DEFAULT_COLOR = "gray"
 
 
@@ -160,14 +172,18 @@ def main():
                          help="Path to the cluster_output_<ID>_snap<N>.csv table (imbh.py's "
                               "save_cluster_output) to join against for --color-by. Optional -- "
                               "without it, --color-by is forced to 'none'.")
-    parser.add_argument("--color-by", choices=["status", "r_over_rvir", "none"], default=None,
+    parser.add_argument("--color-by", choices=["status", "r_over_rvir", "tde_contributor", "none"], default=None,
                          help="How to color each track (default: 'status' if --cluster-csv is given, "
                               "else 'none'). 'status': inspiraled (reached the center) vs outskirts "
                               "(survived to the traced snapshot without merging), discrete legend. "
                               "'r_over_rvir': continuous colormap on final_r_over_rvir (separation "
                               "from the FINAL host at the traced snapshot, in units of that host's own "
                               "virial radius) -- 0 for inspiraled clusters, otherwise how far outside "
-                              "the eventual host's virial radius the cluster still is.")
+                              "the eventual host's virial radius the cluster still is. "
+                              "'tde_contributor': highlights clusters that actually contributed to the "
+                              "TDE rate within the full plotted population (requires "
+                              "--tde-contributors-csv; see --restrict-to-tde-contributors instead if "
+                              "you want to plot ONLY that subset).")
     parser.add_argument("--tree-path", default=None,
                          help="Path to the raw sublink_full_<ID>.hdf5 tree (same file imbh.py uses). "
                               "If given, overlays the FINAL host's own R_200(t) growth curve on the "
@@ -179,6 +195,15 @@ def main():
     parser.add_argument("--box-size", type=float, default=35000.0,
                          help="Simulation box size, comoving ckpc/h (only used with --tree-path; "
                               "default: 35000, TNG50's box, matching imbh.py's own default)")
+    parser.add_argument("--tde-contributors-csv", default=None,
+                         help="Path to the tde_contributors_alpha<alpha>.csv sidecar file analysis.py "
+                              "writes -- clusters that actually contributed at least one mass-loss bin "
+                              "to the TDE rate. Enables --restrict-to-tde-contributors and the "
+                              "--color-by tde_contributor mode; loading it alone does neither on its own.")
+    parser.add_argument("--restrict-to-tde-contributors", action="store_true",
+                         help="Plot ONLY clusters that actually contributed to the TDE rate (requires "
+                              "--tde-contributors-csv), instead of the full population. Off by default "
+                              "-- the full population is plotted unless you ask for this.")
     parser.add_argument("--out", default=None,
                          help="Output image path (default: <track_dir_basename>_radius_tracks.png)")
     parser.add_argument("--max-clusters", type=int, default=500,
@@ -216,6 +241,14 @@ def main():
         sys.exit("--tree-path requires --cluster-csv too (needed to look up each cluster's own "
                   "formation redshift, so every track can be placed correctly on the shared "
                   "absolute-cosmic-time axis --tree-path switches the plot to).")
+    if args.restrict_to_tde_contributors and args.tde_contributors_csv is None:
+        sys.exit("--restrict-to-tde-contributors requires --tde-contributors-csv")
+    if args.color_by == "tde_contributor" and args.tde_contributors_csv is None:
+        sys.exit("--color-by tde_contributor requires --tde-contributors-csv")
+
+    contributors = None
+    if args.tde_contributors_csv is not None:
+        contributors = load_tde_contributors(args.tde_contributors_csv)
 
     color_by = args.color_by
     lookup = None
@@ -223,10 +256,10 @@ def main():
         lookup = load_cluster_lookup(args.cluster_csv)
         if color_by is None:
             color_by = "status"
-    else:
-        if color_by not in (None, "none"):
-            sys.exit(f"--color-by {color_by} requires --cluster-csv")
+    elif color_by is None:
         color_by = "none"
+    if color_by in ("status", "r_over_rvir") and lookup is None:
+        sys.exit(f"--color-by {color_by} requires --cluster-csv")
 
     paths = sorted(glob.glob(os.path.join(args.track_dir, "radius_track_h*_c*.csv")))
     if not paths:
@@ -234,9 +267,17 @@ def main():
     n_total = len(paths)
     print(f"Found {n_total} radius track file(s) in {args.track_dir}")
 
-    if n_total > args.max_clusters:
+    if args.restrict_to_tde_contributors:
+        paths = [p for p in paths if os.path.basename(p) in contributors]
+        print(f"Restricted to {len(paths)} of {n_total} tracks that actively contributed to the "
+              f"TDE rate (--restrict-to-tde-contributors)")
+        if not paths:
+            sys.exit("No tracks remain after restricting to TDE contributors.")
+
+    n_available = len(paths)
+    if n_available > args.max_clusters:
         rng = np.random.default_rng(args.seed)
-        idx = rng.choice(n_total, size=args.max_clusters, replace=False)
+        idx = rng.choice(n_available, size=args.max_clusters, replace=False)
         paths = [paths[i] for i in idx]
         print(f"Randomly sampled {args.max_clusters} of them (--max-clusters; seed={args.seed})")
 
@@ -278,6 +319,7 @@ def main():
     n_unmatched = 0
     n_no_formation_z = 0
     status_counts = {}
+    tde_contributor_counts = {}
     for path in paths:
         t, r = load_sparse_track(path, args.max_points_per_track)
         if t is None:
@@ -297,6 +339,10 @@ def main():
 
         if color_by == "none":
             color = "steelblue"
+        elif color_by == "tde_contributor":
+            label = "TDE contributor" if os.path.basename(path) in contributors else "not a TDE contributor"
+            color = TDE_CONTRIBUTOR_COLORS[label]
+            tde_contributor_counts[label] = tde_contributor_counts.get(label, 0) + 1
         elif row is None:
             color = DEFAULT_COLOR
             n_unmatched += 1
@@ -320,6 +366,9 @@ def main():
             legend_handles.append(Line2D([0], [0], color=DEFAULT_COLOR, lw=2, label="no match in --cluster-csv"))
         print("Colored by status: " + ", ".join(f"{k}={v}" for k, v in status_counts.items())
               + (f", unmatched={n_unmatched}" if n_unmatched else ""))
+    elif color_by == "tde_contributor":
+        legend_handles += [Line2D([0], [0], color=c, lw=2, label=label) for label, c in TDE_CONTRIBUTOR_COLORS.items()]
+        print("Colored by TDE contribution: " + ", ".join(f"{k}={v}" for k, v in tde_contributor_counts.items()))
     elif color_by == "r_over_rvir":
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
@@ -342,7 +391,11 @@ def main():
         ax.set_yscale("log")
     if args.xscale == "log":
         ax.set_xscale("log")
-    ax.set_title(f"Cluster separation vs. time  (N = {n_plotted} of {n_total} tracks)")
+    if args.restrict_to_tde_contributors:
+        ax.set_title(f"Cluster separation vs. time  (N = {n_plotted} of {n_available} "
+                      f"TDE-contributing tracks, {n_total} total)")
+    else:
+        ax.set_title(f"Cluster separation vs. time  (N = {n_plotted} of {n_total} tracks)")
 
     if legend_handles:
         ax.legend(handles=legend_handles, loc="best", framealpha=0.9)
