@@ -24,6 +24,12 @@ from astropy.constants import G
 # ODE right-hand-side runs on plain floats in these units for speed.)
 _G = G.to(u.kpc**3 / (u.Msun * u.Gyr**2)).value      # kpc^3 / (Msun Gyr^2)
 _KMS_TO_KPCGYR = (1 * u.km / u.s).to(u.kpc / u.Gyr).value
+# The "merged"/"pinned" threshold, as a fraction of a host's own R200 --
+# shared, named constant (rather than an inlined default arg value) so
+# imbh.py's pin_to_host_center dispatch (see iterate_subhalos) can check
+# a cluster's drawn separation against EXACTLY the same threshold
+# integrate_orbit itself uses, without duplicating the magic number.
+R_STOP_FRAC = 0.01
 # When a cluster is allowed to start integrating from inside r_stop (see
 # integrate_orbit's allow_start_inside_stop), its true starting separation
 # can be (and empirically often is) essentially EXACTLY zero -- nudge it
@@ -41,9 +47,34 @@ class NFWHost:
         self.M200 = M200.to(u.Msun).value            # Msun
         self.R200 = R200.to(u.kpc).value              # kpc
         self.c = float(concentration)
-        self.rs = self.R200 / self.c                  # kpc
-        mu_c = np.log(1 + self.c) - self.c / (1 + self.c)
-        self.rho_s = self.M200 / (4 * np.pi * self.rs**3 * mu_c)   # Msun/kpc^3
+        # A DEGENERATE halo (M200<=0 and/or R200<=0) is a real, expected
+        # possibility, not just a hypothetical -- TNG's SubLink trees
+        # record Group_M_Crit200/Group_R_Crit200 as EXACTLY ZERO for a FoF
+        # group too small/poorly resolved to have a well-defined critical
+        # overdensity radius at all, and this pipeline's early, small
+        # proto-halos (the whole point of tracing star clusters in them)
+        # are exactly the regime where that's common. Naively dividing by
+        # an exactly-zero scale radius below doesn't fail cleanly (a
+        # catchable Python exception) -- it silently produces NaN via
+        # numpy's default divide-by-zero behavior (a RuntimeWarning, not
+        # an error), and NaN reaching solve_ivp's compiled LSODA core is a
+        # well-known way to crash the WHOLE PROCESS outright (this can
+        # manifest as an uncatchable segfault-like failure -- no amount of
+        # try/except protects against it, including run_with_timeout's).
+        # So: treat a degenerate halo as "no halo here" -- zero density,
+        # zero enclosed mass, zero potential everywhere, i.e. it simply
+        # contributes no force -- which is also the physically sensible
+        # interpretation of "this FoF group has no measured M200/R200" in
+        # the first place. rs is floored at a tiny positive value (not
+        # literal 0) purely so every downstream x=r/rs below stays finite;
+        # rho_s=0 is what actually makes every physical quantity correctly
+        # evaluate to zero regardless.
+        self.rs = max(self.R200, 1e-6) / self.c       # kpc
+        if self.M200 > 0 and self.R200 > 0:
+            mu_c = np.log(1 + self.c) - self.c / (1 + self.c)
+            self.rho_s = self.M200 / (4 * np.pi * self.rs**3 * mu_c)   # Msun/kpc^3
+        else:
+            self.rho_s = 0.0
 
     def mass_enclosed(self, r):
         """r in kpc -> enclosed mass in Msun."""
@@ -94,9 +125,15 @@ class NFWHost:
         at r, which a fully rigorous eccentric-orbit tidal radius would --
         but that level of precision isn't warranted for a coarse,
         pericenter-only estimate.
+
+        Returns +inf for a degenerate (zero enclosed mass) host -- correct
+        in the sense that a host exerting no gravity at all has no tidal
+        force either, so nothing is ever inside its (infinite) tidal radius.
         """
         r_safe = max(r, 1e-6)
         m_enc = self.mass_enclosed(r_safe)
+        if m_enc <= 0:
+            return np.inf
         return r_safe * (m_satellite_msun / (3.0 * m_enc)) ** (1.0 / 3.0)
 
 
@@ -105,7 +142,19 @@ def _chandrasekhar_xfactor(v, sigma):
     Returns [erf(X) - (2X/sqrt(pi)) exp(-X^2)] / v^3, where X = v/(sqrt(2) sigma),
     using a small-v series expansion to avoid a 0/0 as v -> 0 (physically,
     the drag force smoothly vanishes there, it's not a true singularity).
+
+    sigma == 0 (a degenerate/massless host -- see NFWHost's docstring) is
+    handled as the analytic X -> infinity limit directly (the bracketed
+    term -> 1, so this reduces to 1/v^3) rather than actually computing
+    X = v/0 = inf and evaluating erf(inf) - (inf)*exp(-inf): numpy resolves
+    the second term's inf*0 as NaN, not its true limiting value of 0. This
+    matters even though the CALLER's coefficient (coeff, in _rhs) is
+    already exactly zero for a degenerate host (rho=0 there) -- 0 * NaN is
+    NaN, not 0, so returning NaN here would still poison the result despite
+    the physically-correct zero-force outcome.
     """
+    if sigma <= 0:
+        return 1.0 / v**3
     X = v / (np.sqrt(2) * sigma)
     if X < 1e-3:
         return (4 / (3 * np.sqrt(np.pi))) / (2 * np.sqrt(2) * sigma**3)
@@ -113,7 +162,52 @@ def _chandrasekhar_xfactor(v, sigma):
     return xterm / v**3
 
 
-def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate):
+# Hard cap on how many times _rhs can be evaluated within a SINGLE solve_ivp
+# call (one method attempt, i.e. LSODA or RK45), enforced by _rhs itself via
+# the call_budget it's passed. This exists because of exactly the "hang/
+# extreme slowdown" _solve_ivp_robust's own docstring already flags: some
+# regions of this problem's parameter space -- most notably a cluster that's
+# ALLOWED TO KEEP INTEGRATING from very close to the softened center (see
+# imbh.py's allow_formation_inside_r_stop) -- can end up in a fast,
+# tightly-oscillating orbit whose dynamical time is far shorter than the
+# leg's own duration, requiring an enormous number of tiny steps to resolve
+# at rtol=1e-8/atol=1e-10 over the full requested span. LSODA and even its
+# RK45 fallback can both grind on that for an effectively unbounded amount
+# of wall-clock time rather than failing cleanly -- and a genuinely long,
+# expensive single scipy/Fortran call can go a long time between yielding
+# control back to Python, which is exactly when SIGALRM-based timeouts (see
+# imbh.py's run_with_timeout/ORBIT_TRACE_TIMEOUT_S) get their chance to
+# fire; a slow-but-not-infinite single call can stall well past when you'd
+# expect the outer timeout to have already caught it. A hard, deterministic
+# step-count budget bounds the worst case in wall-clock terms too (evaluating
+# _rhs is cheap -- a few simple scalar float ops -- so even this ceiling is
+# a matter of seconds, not minutes) REGARDLESS of the machine or how the
+# signal-delivery timing happens to fall.
+MAX_RHS_CALLS_PER_SOLVE = 200_000
+
+
+class _RhsStepLimitExceeded(RuntimeError):
+    """
+    Raised by _rhs (via _solve_ivp_robust's call_budget) when a single
+    solve_ivp attempt exceeds MAX_RHS_CALLS_PER_SOLVE evaluations without
+    finishing -- converts what would otherwise be an effectively unbounded
+    integration into a fast, clean, informative failure that propagates up
+    as an ordinary Python exception (caught by imbh.py's run_with_timeout,
+    same as any other trace failure -- the affected cluster gets logged and
+    skipped, the run continues).
+    """
+    pass
+
+
+def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate, call_budget):
+    call_budget[0] += 1
+    if call_budget[0] > MAX_RHS_CALLS_PER_SOLVE:
+        raise _RhsStepLimitExceeded(
+            f"_rhs exceeded {MAX_RHS_CALLS_PER_SOLVE} evaluations within one solve_ivp attempt -- "
+            f"likely a cluster stuck oscillating very close to the softened center (r_soft), needing "
+            f"far more steps to resolve at the current tolerances than is worth the wall-clock cost. "
+            f"See MAX_RHS_CALLS_PER_SOLVE's own docstring."
+        )
     r_vec = y[:3]
     v_vec = y[3:]
     r_actual = np.linalg.norm(r_vec)
@@ -165,6 +259,18 @@ def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hu
         Menc_bg = bg_host.mass_enclosed(r_bg)
         r_bg_hat = r_bg_vec / r_bg_actual if r_bg_actual > 1e-12 else np.zeros(3)
         a_total = a_total - _G * Menc_bg / r_bg**2 * r_bg_hat
+
+    # Last-resort safety net: NFWHost and _chandrasekhar_xfactor are both
+    # now guarded against the known degenerate-host (M200/R200<=0) source
+    # of NaN (see their docstrings), but NaN/Inf reaching solve_ivp's
+    # compiled LSODA core is a serious enough failure mode -- it can crash
+    # the WHOLE PROCESS outright, uncatchable by any Python try/except,
+    # including run_with_timeout's -- that it's worth guarding here too,
+    # defensively, against any OTHER not-yet-identified path that might
+    # someday produce one. Zero acceleration (this step contributes no net
+    # force) is a safe fallback in every case this guards against.
+    if not np.all(np.isfinite(a_total)):
+        a_total = np.nan_to_num(a_total, nan=0.0, posinf=0.0, neginf=0.0)
 
     return np.concatenate([v_vec, a_total])
 
@@ -220,16 +326,29 @@ def _solve_ivp_robust(rhs_args, t_span, y0, events):
     failure mode in any testing so far, at the cost of being slower for
     the (common) well-behaved case, which is why it's the fallback rather
     than the default.
+
+    Each attempt gets its own fresh MAX_RHS_CALLS_PER_SOLVE budget (see
+    that constant's docstring) -- if BOTH LSODA and RK45 exceed it (or
+    otherwise fail), raises _RhsStepLimitExceeded rather than returning,
+    so the caller gets a clean, fast failure instead of an effectively
+    unbounded hang.
     """
-    try:
-        sol = solve_ivp(_rhs, t_span, y0, args=rhs_args, events=events,
-                         method="LSODA", rtol=1e-8, atol=1e-10, dense_output=True)
-        if sol.success:
-            return sol
-    except Exception:
-        pass
-    return solve_ivp(_rhs, t_span, y0, args=rhs_args, events=events,
-                      method="RK45", rtol=1e-8, atol=1e-10, dense_output=True)
+    last_err = None
+    for method in ("LSODA", "RK45"):
+        call_budget = [0]
+        try:
+            sol = solve_ivp(_rhs, t_span, y0, args=rhs_args + (call_budget,), events=events,
+                             method=method, rtol=1e-8, atol=1e-10, dense_output=True)
+            if sol.success:
+                return sol
+            last_err = f"{method} returned sol.success=False: {sol.message}"
+        except Exception as e:
+            last_err = f"{method} raised {type(e).__name__}: {e}"
+    raise _RhsStepLimitExceeded(
+        f"_solve_ivp_robust: both LSODA and RK45 failed or exceeded "
+        f"MAX_RHS_CALLS_PER_SOLVE={MAX_RHS_CALLS_PER_SOLVE} for this leg/substep -- "
+        f"last attempt's error: {last_err}"
+    )
 
 
 def _sample_trajectory(sol, t_end_gyr, record_dt_gyr, bg_offset_kpc):
@@ -270,7 +389,7 @@ def _sample_trajectory(sol, t_end_gyr, record_dt_gyr, bg_offset_kpc):
 
 
 def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
-                     t_max=50 * u.Gyr, r_stop_frac=0.01, escape_frac=3.0,
+                     t_max=50 * u.Gyr, r_stop_frac=R_STOP_FRAC, escape_frac=3.0,
                      background_host=None, background_offset=None,
                      hubble_rate=0.0 / u.Gyr, record_dt=None,
                      allow_start_inside_stop=False):
@@ -479,7 +598,7 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
 
 
 def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
-              t_max=50 * u.Gyr, r_stop_frac=0.01, escape_frac=3.0):
+              t_max=50 * u.Gyr, r_stop_frac=R_STOP_FRAC, escape_frac=3.0):
     """
     Integrate a cluster's orbit under gravity + Chandrasekhar dynamical
     friction through a static NFWHost, starting at position r0_vec and
