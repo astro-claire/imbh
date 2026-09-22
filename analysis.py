@@ -307,8 +307,90 @@ def calc_orbital_relaxation_radius(imbh_mass, r0, rho0, alpha, rtotal, Mstar=1*u
 
     return ((numerator / denominator)**exponent).to('pc')
 
-def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun, resolution = 1e5*u.yr):
+def _load_radius_track(track_path, track_dir, cache):
+    """
+    Load one cluster's separation-from-central-galaxy time series, as saved
+    by imbh.py's --save-radius-tracks (see imbh.py's save_radius_track /
+    TRACK_MIN_IMBH_MASS_MSUN). Returns (time_since_formation_gyr,
+    separation_kpc) as plain numpy arrays -- the SAME "time since the
+    cluster's own formation" convention used by total_time_gyr /
+    IMBH_final_formation_time_gyr elsewhere in this pipeline -- or
+    (None, None) if the file can't be found/read (logged once; this is a
+    diagnostic extra, not something that should ever take down the whole
+    TDE-rate calculation).
+
+    `cache` is a plain dict the caller keeps across calls (keyed by the
+    literal path string) -- there's normally no repeat lookups within one
+    run_clusters() call (each track file belongs to exactly one cluster
+    row), so this is mostly just a way to avoid printing the same missing-
+    file warning twice, not a meaningful performance optimization.
+    """
+    if track_path in cache:
+        return cache[track_path]
+
+    path = Path(track_path)
+    if track_dir is not None and not path.is_absolute():
+        # allow passing either the exact path imbh.py wrote (already
+        # relative/absolute and directly usable) or just re-pointing at
+        # a --track-dir the tracks were moved to since -- match on filename.
+        candidate = Path(track_dir) / path.name
+        if candidate.exists():
+            path = candidate
+
+    if not path.exists():
+        print(f"    WARNING: radius track '{track_path}' not found -- skipping the "
+              f"radius-vs-time diagnostic for this cluster (its TDE rate is unaffected).")
+        cache[track_path] = (None, None)
+        return cache[track_path]
+
+    track_df = pd.read_csv(path)
+    result = (track_df['time_since_formation_gyr'].to_numpy(),
+              track_df['separation_from_host_kpc'].to_numpy())
+    cache[track_path] = result
+    return result
+
+
+def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
+                  resolution = 1e5*u.yr, track_dir=None):
+    """
+    Returns (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc,
+    n_clusters_with_tde, contributing_rows):
+
+        mean_radius_kpc: at each time bin, the AVERAGE separation from the
+            central/root galaxy across every cluster that has a TDE burst
+            going off at that same time (i.e. the same time bins
+            tde_rate_array_msunyr is nonzero because of) -- NaN wherever no
+            cluster is contributing a TDE at that time. Requires each
+            contributing cluster's df row to have a valid
+            'radius_track_path' (see imbh.py's --save-radius-tracks);
+            clusters without one simply don't contribute to this array
+            (their TDE rate is still counted in tde_rate_array_msunyr as
+            before).
+        n_clusters_with_tde: how many clusters' tracks contributed to
+            mean_radius_kpc at each time bin -- lets you judge how well
+            supported (or not) each time bin's average is.
+        contributing_rows: a list of dicts, one per cluster that actually
+            contributed at least one mass-loss bin to tde_rate_array_msunyr
+            (i.e. timescale_analysis returned a non-None t_cutoff_gyr for
+            it) -- an ACTIVELY TDE-generating cluster, as opposed to merely
+            having IMBH_mass_msun>0 (many of those still get excluded
+            inside timescale_analysis, e.g. by its own 5e2 Msun floor).
+            Each dict has 'row_index' (this cluster's position in df),
+            'radius_track_path' (straight from df, may be NaN/empty if it
+            has none), 'IMBH_mass_msun', and 'total_mass_lost_msun' (summed
+            across every mass-loss bin this cluster contributed) -- enough
+            to filter or cross-reference downstream (see
+            plot_radius_tracks.py's --tde-contributors-csv) without
+            re-running timescale_analysis a second time.
+    """
     resolution = resolution.to('yr').value
+    n_bins = len(tscale_array_yr)
+    radius_sum_kpc = np.zeros(n_bins)
+    radius_count = np.zeros(n_bins, dtype=int)
+    track_cache = {}
+    has_track_col = 'radius_track_path' in df.columns
+    contributing_rows = []
+
     for clusteridx in range(len(df)):
     # for clusteridx in range(2):
         if df['IMBH_mass_msun'][clusteridx]>0:
@@ -318,6 +400,21 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
             if t_cutoff_gyr is not None: 
                 i = int(round((t_cutoff_gyr * 1e9 - tscale_array_yr[0]) / resolution))
                 j_start = int(round((start_time.value * 1e9 - tscale_array_yr[0]) / resolution))
+
+                # ---- radius-vs-time lookup for this cluster, if it has one ----
+                track_t_gyr = track_r_kpc = None
+                if has_track_col:
+                    track_path = df['radius_track_path'][clusteridx]
+                    if isinstance(track_path, str) and track_path:
+                        track_t_gyr, track_r_kpc = _load_radius_track(track_path, track_dir, track_cache)
+
+                contributing_rows.append({
+                    'row_index': clusteridx,
+                    'radius_track_path': df['radius_track_path'][clusteridx] if has_track_col else None,
+                    'IMBH_mass_msun': df['IMBH_mass_msun'][clusteridx],
+                    'total_mass_lost_msun': float(np.sum(mass_lost_bins)),
+                })
+
                 for binidx in range(len(mass_lost_bins)):
                     t_end = min(t_cutoff_gyr, start_time.value + t_relax_bin[binidx])
                     k_end = int(round((t_end * 1e9 - tscale_array_yr[0]) / resolution))
@@ -325,7 +422,25 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                     mass = mass_lost_bins[binidx]* u.Msun
                     tde_rate_array_msunyr[j_start:k_end+1] += rate
                     mass_trelax_array_msun[k_end+1] += mass
-    return tde_rate_array_msunyr, mass_trelax_array_msun
+
+                    if track_t_gyr is not None and k_end >= j_start:
+                        # cosmic time (Gyr) of every bin in THIS burst -> time
+                        # since the CLUSTER's own formation (the track's own
+                        # convention), then linearly interpolated against the
+                        # saved orbit trace (clamped at the ends by np.interp,
+                        # which is fine: the track spans the cluster's whole
+                        # trace, so a burst time falling outside it just means
+                        # sub-bin rounding at a boundary).
+                        t_bin_cosmic_gyr = tscale_array_yr[j_start:k_end+1] / 1e9
+                        t_since_formation_gyr = t_bin_cosmic_gyr - halo_formation_time.to(u.Gyr).value
+                        r_interp_kpc = np.interp(t_since_formation_gyr, track_t_gyr, track_r_kpc)
+                        radius_sum_kpc[j_start:k_end+1] += r_interp_kpc
+                        radius_count[j_start:k_end+1] += 1
+
+    with np.errstate(invalid='ignore'):
+        mean_radius_kpc = np.where(radius_count > 0, radius_sum_kpc / np.maximum(radius_count, 1), np.nan)
+
+    return tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, radius_count, contributing_rows
 
 
 
@@ -333,18 +448,41 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input_path", help="Path to the cluster_output_<branchid>_<snapshot>.csv file")
     parser.add_argument("alpha", help="power law index of cluster profiles")
+    parser.add_argument("--track-dir", default=None,
+                         help="Directory containing the per-cluster radius_track_*.csv files "
+                              "saved by imbh.py's --save-radius-tracks (only needed if the "
+                              "'radius_track_path' column's own paths no longer resolve as-is, "
+                              "e.g. the files were moved -- matched by filename in that "
+                              "directory). If input_path has no radius_track_path column at "
+                              "all, this is ignored and the radius-vs-time diagnostic is simply "
+                              "skipped (the TDE rate itself is unaffected either way).")
     args = parser.parse_args()
     df = load_data_file(args.input_path)
     print(df.columns)
     tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun = set_up_timebins(1e5*u.yr)
-    tde_rate_array_msunyr, mass_trelax_array_msun = run_clusters(df, float(args.alpha), tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun, resolution = 1e5*u.yr)
+    tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, n_clusters_with_tde, contributing_rows = run_clusters(
+        df, float(args.alpha), tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
+        resolution=1e5*u.yr, track_dir=args.track_dir,
+    )
     output_df = pd.DataFrame({
         'time': tscale_array_yr[:-2],
         'tde_rate_array_msunyr': tde_rate_array_msunyr[:-2],
         'mass_trelax_array_msun': mass_trelax_array_msun[:-2],
+        'mean_radius_kpc': mean_radius_kpc[:-2],
+        'n_clusters_with_tde': n_clusters_with_tde[:-2],
     })
 
     output_df.to_csv(f'tde_rates_alpha{float(args.alpha)}.csv', index=False)
+
+    # Sidecar file: which clusters actually contributed at least one
+    # mass-loss bin to the TDE rate above (see run_clusters' own
+    # docstring) -- lets downstream tools (e.g. plot_radius_tracks.py's
+    # --tde-contributors-csv) restrict to actively TDE-generating clusters
+    # without re-running timescale_analysis themselves.
+    contributors_path = f'tde_contributors_alpha{float(args.alpha)}.csv'
+    pd.DataFrame(contributing_rows).to_csv(contributors_path, index=False)
+    print(f"{len(contributing_rows)} of {len(df)} clusters actively contributed to the TDE rate "
+          f"-- see {contributors_path}")
 
 if __name__ == "__main__":
     main()
