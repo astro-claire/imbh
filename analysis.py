@@ -46,7 +46,8 @@ def load_data_file(file_path):
         
     elif file_extension == '.dat':
         print(f"Processing DAT file: {path.name}")
-        return pd.read_csv(path, sep=None, engine='python')
+        return pd.read_pickle(path)
+        # return pd.read_csv(path, sep=None, engine='python')
         
     else:
         raise ValueError(f"Unsupported file type '{file_extension}'. Only .csv and .dat are allowed.")
