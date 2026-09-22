@@ -34,7 +34,7 @@ from cluster_population_sampler import ClusterPopulationSampler
 
  
 # dynamical friction orbit integration (separate module, kept alongside this script)
-from dynamical_friction import NFWHost, integrate_orbit
+from dynamical_friction import NFWHost, integrate_orbit, R_STOP_FRAC
 # raw merger-tree navigator, for following a cluster's host across mergers
 from tree_navigator import MergerTreeNavigator
 #timescales stuff
@@ -181,6 +181,171 @@ def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentra
     ke_kms2 = 0.5 * v_actual_kms ** 2
     e_total_kms2 = ke_kms2 + phi_local_kms2 + phi_bg_kms2
     return e_total_kms2, ke_kms2, phi_local_kms2, phi_bg_kms2
+
+
+def _trace_pinned_cluster(cluster_mass, start_subhalo_id, target_age, navigator,
+                           concentration=HOST_CONCENTRATION, max_steps=MAX_STEPS,
+                           record_dt=None):
+    """
+    A cheap alternative to trace_cluster_to_snapshot for a cluster whose
+    drawn initial separation already landed inside R_STOP_FRAC*R_vir at
+    formation (see iterate_subhalos' formation_inside_r_stop_mode ==
+    'pin_to_host_center'). Rather than actually integrating an orbit that
+    starts (and, empirically, tends to stay) very close to the softened
+    center -- a regime where fast, tightly-oscillating dynamics can demand
+    an enormous number of ODE solver steps to resolve at this pipeline's
+    tolerances (see dynamical_friction.MAX_RHS_CALLS_PER_SOLVE) -- this
+    ASSUMES the cluster stays pinned at (essentially) the center of
+    whichever host currently hosts it, for its entire existence, and just
+    walks forward through the tree's own host-to-host mergers (the SAME
+    step_forward/main_branch_id_at_snap machinery trace_cluster_to_snapshot
+    uses for its own host-hopping), accumulating cosmic time, with NO
+    orbital dynamics at all -- no gravity, no dynamical friction, no
+    solve_ivp call of any kind. This is a genuine MODELING SIMPLIFICATION,
+    not a numerically-verified result: a cluster born at/near a small
+    proto-halo's center is plausibly going to stay there (deep in the
+    potential well, presumably strong dynamical friction, nothing
+    obviously available to dislodge it) -- but this function doesn't check
+    that assumption by integrating, it assumes it outright. Clusters
+    returned this way get status='pinned' specifically so downstream
+    analysis can always tell them apart from clusters whose orbit was
+    actually integrated (status in ('inspiraled', 'outskirts', 'escaped')).
+
+    Fields that only make sense for an actively-integrated orbit are
+    filled in with the trivial/limiting values consistent with "pinned at
+    the softened center of the current host," not independently computed:
+    n_pericenters=0 (no oscillation is being tracked), final_bound=True,
+    final_r_over_rvir=0.0, final_energy_kms2 computed at r=r_stop, v=0
+    (the deepest-bound state available). min_roche_radius_kpc DOES still
+    get computed -- and can still meaningfully vary -- as the smallest
+    tidal radius (at r=r_stop) across every host the cluster's branch
+    passes through on its way to the target snapshot, mirroring what
+    trace_cluster_to_snapshot tracks across actual pericenters.
+
+    Returns a dict with the SAME keys as trace_cluster_to_snapshot
+    (including track_time_gyr/track_radius_kpc if record_dt is given, on
+    the same "time since formation" convention), so callers don't need to
+    special-case which function actually produced a given trace.
+    """
+    current_id = start_subhalo_id
+    _, _, start_snap = navigator.host_properties(start_subhalo_id)
+    formation_age = navigator.age_at_snap(start_snap)
+    current_age = formation_age
+    n_hops = 0
+    n_steps = 0
+    min_roche_radius_kpc = None
+    time_of_min_roche_gyr = None
+    cluster_mass_msun = cluster_mass.to(u.Msun).value
+
+    track_time_parts = [] if record_dt is not None else None
+    track_radius_parts = [] if record_dt is not None else None
+    record_dt_gyr = record_dt.to(u.Gyr).value if record_dt is not None else None
+
+    def bg_offset_at(subhalo_id, snap):
+        """Root's position relative to subhalo_id at snap, or None if
+        subhalo_id IS (on) the main branch at that snap -- see
+        trace_cluster_to_snapshot's own background-potential setup, which
+        this mirrors exactly (just without ever building an NFWHost for it,
+        since a pinned cluster feels no force from it -- only its OFFSET
+        is needed here, purely for the "distance from center" diagnostic)."""
+        main_branch_id = navigator.main_branch_id_at_snap(snap)
+        if main_branch_id is None or main_branch_id == subhalo_id:
+            return None
+        rel_pos, _ = navigator.relative_state(subhalo_id, main_branch_id)
+        return (-rel_pos).to(u.kpc).value
+
+    for step in range(max_steps):
+        n_steps = step
+        mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
+        r_stop_kpc = R_STOP_FRAC * radius_kpc
+        host = NFWHost(mass_msun * u.Msun, radius_kpc * u.kpc, concentration=concentration)
+
+        roche_this = host.tidal_radius(cluster_mass_msun, r_stop_kpc)
+        if np.isfinite(roche_this) and (min_roche_radius_kpc is None or roche_this < min_roche_radius_kpc):
+            min_roche_radius_kpc = roche_this
+            time_of_min_roche_gyr = (current_age - formation_age).to(u.Gyr).value
+
+        next_id, is_primary = navigator.step_forward(current_id)
+        if next_id is not None:
+            _, _, next_snap = navigator.host_properties(next_id)
+            leg_end_age = navigator.age_at_snap(next_snap)
+        else:
+            leg_end_age = target_age
+
+        remaining = target_age - current_age
+        if remaining <= 0 * u.Gyr:
+            break
+        leg_duration = min(leg_end_age, target_age) - current_age
+        if leg_duration < 0 * u.Gyr:
+            leg_duration = 0 * u.Gyr
+
+        if record_dt is not None and leg_duration > 0 * u.Gyr:
+            # Linearly interpolate the background offset across this leg,
+            # same "smooth across the leg, not held fixed and snapped"
+            # treatment _interpolate_bg gives an actively-orbiting
+            # cluster's background term -- but since the cluster's OWN
+            # position relative to the current host is always ~r_stop
+            # (negligible next to bg_offset's usual kpc-to-Mpc scale),
+            # "distance from root" here reduces to just the interpolated
+            # |bg_offset(t)| itself.
+            bg_start = bg_offset_at(current_id, snap)
+            bg_end = bg_offset_at(next_id, next_snap) if next_id is not None else bg_start
+            leg_duration_gyr = leg_duration.to(u.Gyr).value
+            n_samp = max(2, int(np.floor(leg_duration_gyr / record_dt_gyr)) + 1)
+            t_local = np.arange(n_samp) * record_dt_gyr
+            if t_local[-1] < leg_duration_gyr:
+                t_local = np.append(t_local, leg_duration_gyr)
+            frac = t_local / leg_duration_gyr if leg_duration_gyr > 0 else np.zeros_like(t_local)
+            if bg_start is not None and bg_end is not None:
+                bg_t = bg_start[:, None] + (bg_end[:, None] - bg_start[:, None]) * frac
+                r_vals = np.linalg.norm(bg_t, axis=0)
+            elif bg_start is not None:
+                r_vals = np.linalg.norm(bg_start) * (1 - frac)
+            elif bg_end is not None:
+                r_vals = np.linalg.norm(bg_end) * frac
+            else:
+                r_vals = np.full_like(t_local, r_stop_kpc)
+            track_time_parts.append(t_local + (current_age - formation_age).to(u.Gyr).value)
+            track_radius_parts.append(r_vals)
+
+        current_age = current_age + leg_duration
+        if next_id is None or current_age >= target_age:
+            break
+        if not is_primary:
+            n_hops += 1
+        current_id = next_id
+
+    final_mass_msun, final_radius_kpc, _ = navigator.host_properties(current_id)
+    r_stop_final = R_STOP_FRAC * final_radius_kpc
+    final_r_vec = np.array([r_stop_final, 0.0, 0.0]) * u.kpc
+    final_v_vec = np.zeros(3) * u.km / u.s
+    final_energy_kms2, _, _, _ = _compute_specific_energy_kms2(
+        final_r_vec, final_v_vec, final_mass_msun, final_radius_kpc, concentration,
+    )
+
+    result = {
+        'status': 'pinned',
+        'total_time_gyr': (current_age - formation_age).to(u.Gyr).value,
+        'final_subhalo_id': current_id,
+        'final_r_vec': final_r_vec,
+        'final_v_vec': final_v_vec,
+        'final_r_over_rvir': 0.0,
+        'n_hops': n_hops,
+        'n_steps': n_steps,
+        'n_pericenters': 0,
+        'final_energy_kms2': final_energy_kms2,
+        'final_bound': True,
+        'min_roche_radius_kpc': min_roche_radius_kpc,
+        'time_of_min_roche_gyr': time_of_min_roche_gyr,
+    }
+    if record_dt is not None:
+        if track_time_parts:
+            result['track_time_gyr'] = np.concatenate(track_time_parts)
+            result['track_radius_kpc'] = np.concatenate(track_radius_parts)
+        else:
+            result['track_time_gyr'] = np.array([])
+            result['track_radius_kpc'] = np.array([])
+    return result
 
 
 # -------- Follow a single cluster across host mergers, to a target snapshot
@@ -867,7 +1032,7 @@ def save_radius_track(track_time_gyr, track_radius_kpc, halo_idx, cluster_idx, t
 # ------- Iteration over all the subhalos
 def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                       record_dt=None, track_dir=None, track_min_mass=TRACK_MIN_IMBH_MASS_MSUN,
-                      allow_formation_inside_r_stop=True):
+                      formation_inside_r_stop_mode='pin_to_host_center'):
     """
     Parameters (new ones only -- see the rest of the module for the others):
         record_dt: astropy Quantity (time) or None (default). Passed straight
@@ -881,9 +1046,41 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
             ignored otherwise. Created by the caller (main()), not here.
         track_min_mass: only clusters with IMBH_mass_msun >= this get their
             track actually written to disk (see TRACK_MIN_IMBH_MASS_MSUN).
-        allow_formation_inside_r_stop: passed straight through to
-            trace_cluster_to_snapshot -- see its docstring.
+        formation_inside_r_stop_mode: how to handle a cluster whose drawn
+            initial separation already lands inside R_STOP_FRAC*R_vir of
+            its formation host -- i.e. one that never actually needs to
+            dynamically-friction its way to the center. One of:
+              - 'pin_to_host_center' (default): skip orbit integration
+                ENTIRELY for these clusters -- assume they stay pinned at
+                (essentially) the center of whichever host currently hosts
+                them for their whole existence, and just walk the tree's
+                own mergers to accumulate time and the background-distance
+                track (see _trace_pinned_cluster). Cheap, has no ODE
+                failure modes, and is the recommended default -- but it's
+                a modeling ASSUMPTION, not a numerically verified result.
+              - 'integrate': actually integrate the orbit from there (see
+                trace_cluster_to_snapshot's allow_formation_inside_r_stop),
+                which can be MUCH slower and occasionally hit
+                dynamical_friction.MAX_RHS_CALLS_PER_SOLVE for a cluster
+                that ends up oscillating very close to the softened
+                center -- logged as a trace_failed cluster if it does, not
+                a fatal error, but lost from the output either way.
+              - 'instant_merge': the original/legacy behavior -- credit
+                the cluster with a ZERO-duration "merger" immediately
+                (total_time_gyr=0). NOT recommended: this effectively
+                excludes these clusters from any downstream IMBH/TDE
+                calculation entirely (analysis.py's timescale_analysis
+                requires IMBH_final_formation_time_gyr < total_time_gyr),
+                even though physically an already-central cluster likely
+                had the MOST time of any cluster in the sample to evolve.
+        Every cluster whose drawn separation does NOT land inside
+        R_STOP_FRAC*R_vir at formation is entirely unaffected by this
+        setting -- it always gets a normal, fully-integrated orbit trace
+        via trace_cluster_to_snapshot regardless of the mode chosen here.
     """
+    if formation_inside_r_stop_mode not in ('pin_to_host_center', 'integrate', 'instant_merge'):
+        raise ValueError(f"formation_inside_r_stop_mode must be one of 'pin_to_host_center', "
+                          f"'integrate', 'instant_merge' -- got {formation_inside_r_stop_mode!r}")
     clusters = []
     failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
     #testing mode-just do the first few
@@ -933,12 +1130,29 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                       f"r0_vec={r0_vec.to(u.kpc).value} kpc, "
                       f"v0_vec={v0_vec.to(u.km/u.s).value} km/s", flush=True)
 
-            trace, trace_err = run_with_timeout(
-                trace_cluster_to_snapshot, ORBIT_TRACE_TIMEOUT_S,
-                m_cl, r0_vec, v0_vec, start_subhalo_id, target_age, navigator,
-                verbose=debug_trace, record_dt=record_dt,
-                allow_formation_inside_r_stop=allow_formation_inside_r_stop,
-            )
+            # Decide, BEFORE doing any orbit work, whether this cluster's
+            # drawn initial separation already lands inside R_STOP_FRAC*R_vir
+            # of its formation host -- and if formation_inside_r_stop_mode
+            # says to, dispatch to the cheap tree-walk-only trace instead of
+            # ever calling trace_cluster_to_snapshot (and therefore never
+            # touching solve_ivp) for it at all. Every OTHER cluster is
+            # completely unaffected -- same call as always.
+            r0_mag_kpc = np.linalg.norm(r0_vec.to(u.kpc).value)
+            _, formation_radius_kpc, _ = navigator.host_properties(start_subhalo_id)
+            born_inside_r_stop = r0_mag_kpc <= R_STOP_FRAC * formation_radius_kpc
+
+            if formation_inside_r_stop_mode == 'pin_to_host_center' and born_inside_r_stop:
+                trace, trace_err = run_with_timeout(
+                    _trace_pinned_cluster, ORBIT_TRACE_TIMEOUT_S,
+                    m_cl, start_subhalo_id, target_age, navigator, record_dt=record_dt,
+                )
+            else:
+                trace, trace_err = run_with_timeout(
+                    trace_cluster_to_snapshot, ORBIT_TRACE_TIMEOUT_S,
+                    m_cl, r0_vec, v0_vec, start_subhalo_id, target_age, navigator,
+                    verbose=debug_trace, record_dt=record_dt,
+                    allow_formation_inside_r_stop=(formation_inside_r_stop_mode == 'integrate'),
+                )
             if trace_err is not None:
                 print(f"    WARNING: orbit trace failed/timed out ({trace_err}) -- "
                       f"logging and skipping this cluster.")
@@ -1034,6 +1248,24 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
     return clusters
 
 
+def _quantity_or_float_value(x, unit):
+    """
+    Returns a plain float for x, whether x is an astropy Quantity (calls
+    .to(unit).value) or already a plain float/np.nan/None. Needed because
+    IMBH_mass/IMBH_final_formation_time can legitimately be EITHER: a bare
+    np.nan placeholder from a failed trace or timescales call (see
+    iterate_subhalos), OR a plain float if the `timescales` package itself
+    returns one rather than a Quantity for a given install/version (see
+    iterate_subhalos' own normalization for the IMBH-mass threshold check,
+    which hits this exact ambiguity) -- calling .to() unconditionally
+    crashes on either of those with AttributeError: 'float' object has no
+    attribute 'to'.
+    """
+    if x is None:
+        return np.nan
+    return x.to(unit).value if hasattr(x, 'to') else float(x)
+
+
 def save_cluster_output(output_clusters, path, file_format="pickle"):
     """
     Flatten output_clusters (a list of per-halo dicts, each holding
@@ -1066,11 +1298,12 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
           an otherwise-successful trace that never had a pericenter at
           all (e.g. merged/escaped before completing one) -- NaN there
           doesn't necessarily mean the trace itself failed.
-        - IMBH_mass and IMBH_final_formation_time are stored as-is,
-          assumed to already be plain floats (matching how the rest of
-          this script handles them, with no .to()/.value conversion
-          anywhere) -- if the `timescales` package actually returns
-          astropy Quantities for these, adjust this function accordingly.
+        - IMBH_mass and IMBH_final_formation_time are converted via
+          _quantity_or_float_value, which handles BOTH an astropy Quantity
+          (the normal case) and a bare float/np.nan (a failed trace or
+          timescales call -- see iterate_subhalos -- or a `timescales`
+          package version/install that itself returns a plain float rather
+          than a Quantity) without raising.
         - radius_track_path is None for every cluster unless
           --save-radius-tracks was requested AND that specific cluster's
           IMBH_mass_msun cleared track_min_mass (see iterate_subhalos) --
@@ -1124,8 +1357,9 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'final_bound': final_bound if final_bound is not None else np.nan,
                 'min_roche_radius_kpc': min_roche_radius_kpc if min_roche_radius_kpc is not None else np.nan,
                 'time_of_min_roche_gyr': time_of_min_roche_gyr if time_of_min_roche_gyr is not None else np.nan,
-                'IMBH_mass_msun': cluster_props['IMBH_mass'][i].to('Msun').value,
-                'IMBH_final_formation_time_gyr': cluster_props['IMBH_final_formation_time'][i].to('Gyr').value,
+                'IMBH_mass_msun': _quantity_or_float_value(cluster_props['IMBH_mass'][i], u.Msun),
+                'IMBH_final_formation_time_gyr': _quantity_or_float_value(
+                    cluster_props['IMBH_final_formation_time'][i], u.Gyr),
                 'which_final_formation_time': cluster_props['which_final_formation_time'][i],
                 'rho0_msun_pc3': cluster_props['rho0_msun_pc3'][i],
                 'r0_pc': cluster_props['r0_pc'][i],
@@ -1208,14 +1442,19 @@ def main():
                          help=f"Directory to save --save-radius-tracks output into (default: "
                               f"'{TRACK_OUTPUT_DIRNAME}' next to the input CSV). Pass this same "
                               "path to analysis.py's --track-dir.")
-    parser.add_argument("--no-continue-formed-inside-rstop", action="store_true",
-                         help="Restore the OLD behavior for clusters whose drawn initial separation "
-                              "already lands inside r_stop_frac*R_vir at formation: instantly credit "
-                              "them with a zero-duration 'inspiraled' merger (total_time_gyr=0), rather "
-                              "than letting them integrate/evolve normally from there (the new default "
-                              "-- see trace_cluster_to_snapshot's allow_formation_inside_r_stop). "
-                              "r_stop itself is unaffected either way for clusters that dynamically "
-                              "friction their way down to it during the trace.")
+    parser.add_argument("--formed-inside-rstop-mode", choices=["pin_to_host_center", "integrate", "instant_merge"],
+                         default="pin_to_host_center",
+                         help="How to handle a cluster whose drawn initial separation already lands "
+                              "inside R_STOP_FRAC*R_vir of its formation host (default: "
+                              "pin_to_host_center -- skip orbit integration entirely for these clusters, "
+                              "assuming they stay at the center of whichever host currently hosts them; "
+                              "cheap and has no ODE failure modes, but is a modeling assumption. "
+                              "'integrate' actually integrates the orbit from there, which can be slow "
+                              "or occasionally hit the step-count safety valve for a cluster that ends up "
+                              "oscillating very close to the softened center. 'instant_merge' is the "
+                              "original/legacy behavior -- NOT recommended, since it effectively excludes "
+                              "these clusters from any downstream IMBH/TDE calculation entirely. See "
+                              "iterate_subhalos' own docstring for the full explanation of each.)")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -1248,15 +1487,12 @@ def main():
         print(f"--save-radius-tracks enabled: tracks (IMBH_mass_msun >= {args.track_min_mass:.0f}) "
               f"will be saved under {track_dir}")
 
-    allow_formation_inside_r_stop = not args.no_continue_formed_inside_rstop
-    if not allow_formation_inside_r_stop:
-        print("--no-continue-formed-inside-rstop set: clusters formed inside r_stop will be treated "
-              "as instant t=0 mergers (old behavior).")
+    print(f"formation_inside_r_stop_mode = {args.formed_inside_rstop_mode!r}")
 
     output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace,
                                         record_dt=record_dt, track_dir=track_dir,
                                         track_min_mass=args.track_min_mass,
-                                        allow_formation_inside_r_stop=allow_formation_inside_r_stop)
+                                        formation_inside_r_stop_mode=args.formed_inside_rstop_mode)
     summarize_status(output_clusters)
 
     save_path = args.save_path
