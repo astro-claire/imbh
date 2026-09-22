@@ -98,6 +98,24 @@ class MergerTreeNavigator:
         """
         return self._main_branch_by_snap.get(snap)
 
+    def main_branch_growth_history(self):
+        """
+        The root's OWN growth history: (ages_gyr, r200_kpc) as plain numpy
+        arrays, one entry per snapshot the main branch (see
+        main_branch_id_at_snap) is tracked at, sorted by increasing cosmic
+        age -- i.e. how big (R_200, physical kpc) whatever this tree's
+        root eventually becomes actually WAS at each point in its own
+        history. This is the exact same reference
+        trace_cluster_to_snapshot's background potential uses; useful on
+        its own too, e.g. as a "does this cluster's separation ever drop
+        inside its eventual host's own virial radius" reference curve when
+        plotting a cluster's orbit against cosmic time.
+        """
+        snaps = sorted(self._main_branch_by_snap.keys())
+        ages_gyr = np.array([self.age_at_snap(s).to(u.Gyr).value for s in snaps])
+        r200_kpc = np.array([self.host_properties(self._main_branch_by_snap[s])[1] for s in snaps])
+        return ages_gyr, r200_kpc
+
     # ------------------------------------------------------------------
     def _row(self, subhalo_id):
         try:
