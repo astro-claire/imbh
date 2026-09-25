@@ -320,10 +320,18 @@ def _load_radius_track(track_path, track_dir, cache):
     TDE-rate calculation).
 
     `cache` is a plain dict the caller keeps across calls (keyed by the
-    literal path string) -- there's normally no repeat lookups within one
-    run_clusters() call (each track file belongs to exactly one cluster
-    row), so this is mostly just a way to avoid printing the same missing-
-    file warning twice, not a meaningful performance optimization.
+    literal path string), but ONLY ever holds the (None, None) "missing"
+    sentinel -- purely to avoid printing the same missing-file warning
+    twice. A SUCCESSFUL load is deliberately never cached: each track file
+    belongs to exactly one cluster row (there's no repeat lookup to serve),
+    so caching it would only mean permanently retaining that cluster's full
+    array (up to ~1e5 rows) in memory for the rest of the run for no
+    benefit. With potentially thousands of distinct tracks across a full
+    run, that adds up to a genuine, unbounded memory cost -- caching every
+    successful read here was a real bug (retaining ~2 MB/track x thousands
+    of clusters, all for the run's remaining lifetime), not a hypothetical
+    one; caching only the tiny "missing" sentinel keeps the warning-dedup
+    benefit without it.
     """
     if track_path in cache:
         return cache[track_path]
@@ -344,10 +352,9 @@ def _load_radius_track(track_path, track_dir, cache):
         return cache[track_path]
 
     track_df = pd.read_csv(path)
-    result = (track_df['time_since_formation_gyr'].to_numpy(),
-              track_df['separation_from_host_kpc'].to_numpy())
-    cache[track_path] = result
-    return result
+    return (track_df['time_since_formation_gyr'].to_numpy(),
+            track_df['separation_from_host_kpc'].to_numpy())
+
 
 
 def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
