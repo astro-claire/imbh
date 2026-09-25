@@ -233,3 +233,4 @@ plot_cluster_sampler.py
 plot_tde_rates.py
 imbh_config.py
 cluster_tracks/*
+run_analysis.sh
