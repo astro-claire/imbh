@@ -423,7 +423,7 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                 })
 
                 for binidx in range(len(mass_lost_bins)):
-                    t_end = min(t_cutoff_gyr, start_time.value + t_relax_bin[binidx])
+                    t_end =  start_time.value+min(t_cutoff_gyr,  t_relax_bin[binidx])
                     k_end = int(round((t_end * 1e9 - tscale_array_yr[0]) / resolution))
                     rate = mass_lost_bins[binidx] / t_relax_bin[binidx] * u.Msun / u.Gyr
                     mass = mass_lost_bins[binidx]* u.Msun
