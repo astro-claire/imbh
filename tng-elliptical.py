@@ -1,9 +1,14 @@
 """
-Find a prototypical elliptical galaxy in TNG50-1 (full physics), match it to its
-dark-matter-only counterpart halo in TNG50-1-Dark, and download the merger tree
-for that ONE halo only (no full-catalog / full-tree downloads).
+Find the N (default 5) most dispersion-dominated elliptical galaxies in TNG50-1
+(full physics), match each to its dark-matter-only counterpart halo in
+TNG50-1-Dark, and download the merger trees for those halos only (no
+full-catalog / full-simulation tree downloads).
 
-Requires: requests, h5py, numpy
+Morphology is measured directly from each candidate's stellar particle cutout
+(kappa_rot and the circularity distribution), because the TNG API does not
+expose the stellar circularity supplementary catalog for TNG50-1 subhalos.
+
+Requires: requests, h5py, numpy (>= 1.20)
     pip install requests h5py numpy
 
 You need a free TNG API key: register at https://www.tng-project.org/users/register/
@@ -15,6 +20,7 @@ import json
 import requests
 import h5py
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 # ----------------------------------------------------------------------
 # CONFIG
@@ -45,11 +51,21 @@ HEADERS = {"API-Key": API_KEY}
 
 SIM_BARYONIC = "TNG50-1"
 SIM_DARK = "TNG50-1-Dark"
-SNAP_Z0 = 99  # z=0
+SNAP_Z0 = 99  # z=0 (scale factor a = 1, so comoving == physical)
 LITTLE_H = 0.6774  # TNG's H0/100
+
+# Morphology measurement settings
+APERTURE_KPC = 30.0       # stars within this 3D radius (physical kpc) are used
+JCIRC_WINDOW = 101        # number of energy-neighbours used to estimate j_circ(E)
+KAPPA_ROT_ELLIPTICAL = 0.5  # kappa_rot below this ~ dispersion-dominated
 
 OUT_DIR = "tng_download"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# Stellar particle cutouts are large (up to ~100 MB each), so they go to
+# scratch instead of OUT_DIR. Override with --cutout-dir or the
+# TNG_CUTOUT_DIR environment variable.
+CUTOUT_DIR = os.environ.get("TNG_CUTOUT_DIR", "/u/scratch/c/clairewi/tng_cutouts")
 
 
 def api_get(path, params=None):
@@ -73,27 +89,135 @@ def api_download(path, out_path, params=None):
             f"'{content_type}'. This usually means the URL/endpoint is wrong. "
             f"First bytes: {next(r.iter_content(chunk_size=200))!r}"
         )
-    with open(out_path, "wb") as f:
+    tmp_path = out_path + ".part"
+    with open(tmp_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1 << 20):
             f.write(chunk)
+    os.replace(tmp_path, out_path)  # only keep complete downloads
     print(f"  downloaded {out_path}")
     return out_path
 
 
 # ----------------------------------------------------------------------
+# STEP 1a -- stellar kinematic morphology from a particle cutout
+# ----------------------------------------------------------------------
+def download_star_cutout(sub_id, snap=SNAP_Z0):
+    """Download the stellar particles of ONE subhalo (only the fields we need)."""
+    os.makedirs(CUTOUT_DIR, exist_ok=True)
+    path = os.path.join(CUTOUT_DIR, f"cutout_stars_{SIM_BARYONIC}_{snap}_{sub_id}.hdf5")
+    api_download(
+        f"{SIM_BARYONIC}/snapshots/{snap}/subhalos/{sub_id}/cutout.hdf5",
+        path,
+        params={"stars": "Coordinates,Velocities,Masses,Potential,GFM_StellarFormationTime"},
+    )
+    return path
+
+
+def kinematic_morphology(pos_ckpc_h, vel_kms, mass, potential, center_ckpc_h,
+                         box_size_ckpc_h, h=LITTLE_H, aperture_kpc=APERTURE_KPC,
+                         window=JCIRC_WINDOW):
+    """
+    Kinematic morphology of a stellar system at z=0 (a=1).
+
+    Inputs are raw snapshot units: positions in ckpc/h, velocities in km/s,
+    potential in (km/s)^2. Stars within `aperture_kpc` of `center_ckpc_h` are used.
+
+    Returns dict with:
+      kappa_rot      -- Sales+2012: fraction of kinetic energy in ordered rotation
+                        about the net angular momentum axis. Low => elliptical.
+      f_circ07       -- mass fraction with circularity eps = j_z / j_circ(E) > 0.7
+                        (same quantity as CircAbove07Frac). Low => elliptical.
+      spheroid_frac  -- 2 x mass fraction with eps < 0 (counter-rotating
+                        stars mirrored), a standard bulge/spheroid mass fraction.
+      n_stars        -- number of stars used.
+    """
+    # periodic wrap, then to physical kpc (a = 1 at z = 0)
+    dx = (pos_ckpc_h - center_ckpc_h + box_size_ckpc_h / 2.0) % box_size_ckpc_h \
+        - box_size_ckpc_h / 2.0
+    x = dx / h
+    r = np.linalg.norm(x, axis=1)
+    sel = r < aperture_kpc
+    x, v, m, phi = x[sel], vel_kms[sel], mass[sel], potential[sel]
+    if len(m) < 100:
+        raise RuntimeError(f"Only {len(m)} stars inside {aperture_kpc} kpc.")
+
+    # stellar bulk velocity (not the subhalo velocity, which includes DM)
+    v = v - (m[:, None] * v).sum(axis=0) / m.sum()
+
+    # specific angular momentum and rotation axis
+    J = np.cross(x, v)
+    L = (m[:, None] * J).sum(axis=0)
+    zhat = L / np.linalg.norm(L)
+    jz = J @ zhat
+
+    # kappa_rot (Sales et al. 2012)
+    z = x @ zhat
+    R = np.sqrt(np.maximum((x ** 2).sum(axis=1) - z ** 2, 0.0))
+    ok = R > 0
+    kin_rot = (m[ok] * (jz[ok] / R[ok]) ** 2).sum()
+    kin_tot = (m * (v ** 2).sum(axis=1)).sum()
+    kappa_rot = kin_rot / kin_tot
+
+    # circularity eps = jz / j_circ(E). j_circ(E) is estimated as the maximum
+    # |j| among stars of similar binding energy (circular orbits maximise j at
+    # fixed E), made monotonic in E.
+    E = 0.5 * (v ** 2).sum(axis=1) + phi
+    order = np.argsort(E)
+    jmag_sorted = np.linalg.norm(J, axis=1)[order]
+    window = min(window, len(jmag_sorted) | 1)  # odd, not larger than N
+    half = window // 2
+    padded = np.pad(jmag_sorted, half, mode="edge")
+    jcirc_sorted = sliding_window_view(padded, window).max(axis=1)
+    jcirc_sorted = np.maximum.accumulate(jcirc_sorted)
+    jcirc = np.empty_like(jcirc_sorted)
+    jcirc[order] = jcirc_sorted
+    eps = jz / np.where(jcirc > 0, jcirc, np.inf)
+
+    mtot = m.sum()
+    return {
+        "kappa_rot": float(kappa_rot),
+        "f_circ07": float(m[eps > 0.7].sum() / mtot),
+        "spheroid_frac": float(min(2.0 * m[eps < 0].sum() / mtot, 1.0)),
+        "n_stars": int(len(m)),
+    }
+
+
+def measure_subhalo_morphology(sub, box_size_ckpc_h):
+    """Download one subhalo's stellar cutout and compute its kinematic morphology."""
+    path = download_star_cutout(sub["id"])
+    with h5py.File(path, "r") as f:
+        if "PartType4" not in f:
+            raise RuntimeError(f"Cutout for subhalo {sub['id']} has no star particles.")
+        s = f["PartType4"]
+        pos = s["Coordinates"][()].astype(np.float64)
+        vel = s["Velocities"][()].astype(np.float64)
+        mass = s["Masses"][()].astype(np.float64)
+        pot = s["Potential"][()].astype(np.float64)
+        tform = s["GFM_StellarFormationTime"][()]
+
+    real_stars = tform > 0  # drop wind-phase cells, which share PartType4
+    center = np.array([sub["pos_x"], sub["pos_y"], sub["pos_z"]], dtype=np.float64)
+    return kinematic_morphology(
+        pos[real_stars], vel[real_stars], mass[real_stars], pot[real_stars],
+        center, box_size_ckpc_h,
+    )
+
+
+# ----------------------------------------------------------------------
 # STEP 1 -- find a prototypical elliptical in TNG50-1 at z=0
 # ----------------------------------------------------------------------
-# "Prototypical elliptical" here = massive, quenched (low sSFR), and
-# kinematically hot / dispersion-supported (using the stellar circularity
-# supplementary catalog field 'CircAbove07Frac', the fraction of stellar mass
-# on near-circular orbits -- LOW values mean spheroidal/dispersion-dominated).
-#
-# Adjust these thresholds to taste.
+# "Prototypical elliptical" here = massive, quenched (low SFR), central, and
+# kinematically hot / dispersion-supported. The last criterion is measured
+# from each candidate's star particles (see kinematic_morphology), and the
+# candidates are ranked from lowest to highest kappa_rot.
 def find_prototypical_elliptical(mass_min_msun=1e11, mass_max_msun=None):
     """
-    Search TNG50-1 at z=0 for a prototypical elliptical with total stellar
+    Search TNG50-1 at z=0 for elliptical candidates with total stellar
     mass in [mass_min_msun, mass_max_msun] (mass_max_msun=None means no
     upper bound).
+
+    Returns a list of (subhalo_id, mass_stars_msun, sfr, morph_dict) tuples,
+    sorted from most to least dispersion-dominated (ascending kappa_rot).
     """
     lo_str = f"{mass_min_msun:.3e}"
     hi_str = f"{mass_max_msun:.3e}" if mass_max_msun is not None else "no upper bound"
@@ -121,43 +245,55 @@ def find_prototypical_elliptical(mass_min_msun=1e11, mass_max_msun=None):
             "No candidates found in that mass range -- widen mass_min_msun/mass_max_msun."
         )
 
-    # Refine using stellar circularity (morphology) for each candidate, since
-    # this field isn't queryable directly through the simple search endpoint.
-    # NOTE: the lightweight search-results endpoint only returns id/mass_log_msun/url,
-    # not mass_stars -- so we fetch the per-subhalo detail endpoint for every
-    # candidate anyway, and read the (reliable) stellar mass from there.
-    best = None
-    chosen_mass_msun = {}
+    box_size = api_get(SIM_BARYONIC)["boxsize"]  # ckpc/h
+
+    print(f"Measuring stellar kinematics for {len(candidates)} candidates "
+          f"(downloads one star cutout per candidate into {CUTOUT_DIR}; "
+          f"the most massive can be ~100 MB)...")
+    rows = []
     for cand in candidates:
         sub_id = cand["id"]
+        # the search endpoint only returns id/mass_log_msun/url, so fetch the detail
         sub = api_get(f"{SIM_BARYONIC}/snapshots/{SNAP_Z0}/subhalos/{sub_id}/")
         mass_stars_msun = sub["mass_stars"] * 1e10 / LITTLE_H
-        chosen_mass_msun[sub_id] = mass_stars_msun
-
-        supp = sub.get("supplementary_data", {}) or {}
-        circ = supp.get("stellar_circs", {}) or {}
-        circ_frac = circ.get("CircAbove07Frac")  # fraction of stars on circular (disky) orbits
-
+        try:
+            morph = measure_subhalo_morphology(sub, box_size)
+        except Exception as e:  # keep going if one cutout fails
+            print(f"  subhalo {sub_id}: morphology failed ({e}); skipping")
+            continue
+        rows.append((sub_id, mass_stars_msun, sub.get("sfr", float("nan")), morph))
         print(f"  subhalo {sub_id}: M_star={mass_stars_msun:.3e} Msun, "
               f"SFR={sub.get('sfr', float('nan')):.3f}, "
-              f"CircAbove07Frac={'n/a' if circ_frac is None else f'{circ_frac:.3f}'}")
+              f"kappa_rot={morph['kappa_rot']:.3f}, "
+              f"f(eps>0.7)={morph['f_circ07']:.3f}, "
+              f"spheroid_frac={morph['spheroid_frac']:.3f}, "
+              f"N_star={morph['n_stars']}")
 
-        if circ_frac is None:
-            continue
-        # low circ_frac => spheroidal / elliptical-like
-        if best is None or circ_frac < best[1]:
-            best = (sub_id, circ_frac)
+    if not rows:
+        raise RuntimeError("Could not measure morphology for any candidate.")
 
-    if best is None:
-        print("  circularity catalog not resolvable via API for these candidates; "
-              "falling back to the single most massive quenched central.")
-        chosen_id = candidates[0]["id"]
-    else:
-        chosen_id = best[0]
+    # rank from most dispersion-dominated (lowest kappa_rot) to least
+    rows.sort(key=lambda r: r[3]["kappa_rot"])
 
-    print(f"-> Selected TNG50-1 subhalo ID {chosen_id} "
-          f"(M_star = {chosen_mass_msun[chosen_id]:.3e} Msun) as the prototypical elliptical.")
-    return chosen_id
+    n_ell = sum(r[3]["kappa_rot"] < KAPPA_ROT_ELLIPTICAL for r in rows)
+    print(f"  {n_ell}/{len(rows)} candidates have kappa_rot < {KAPPA_ROT_ELLIPTICAL} "
+          f"(dispersion-dominated).")
+
+    # save the full ranked table so the selection is reproducible / citable
+    table_path = os.path.join(OUT_DIR, "elliptical_candidates_ranked.json")
+    with open(table_path, "w") as f:
+        json.dump([{"subhalo_id": int(sid), "mass_stars_msun": float(ms),
+                    "sfr_msun_yr": float(sfr), **morph}
+                   for sid, ms, sfr, morph in rows], f, indent=2)
+    print(f"  saved ranked candidate table to {table_path}")
+
+    print("  Ranking by kappa_rot (lowest = most elliptical):")
+    for rank, (sid, ms, _, morph) in enumerate(rows, start=1):
+        flag = "" if morph["kappa_rot"] < KAPPA_ROT_ELLIPTICAL else "  (rotation-supported!)"
+        print(f"    #{rank}: subhalo {sid}, M_star={ms:.3e} Msun, "
+              f"kappa_rot={morph['kappa_rot']:.3f}, f(eps>0.7)={morph['f_circ07']:.3f}{flag}")
+
+    return rows
 
 
 # ----------------------------------------------------------------------
@@ -315,8 +451,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Find a prototypical elliptical in TNG50-1, match it to TNG50-1-Dark, "
-                    "and download its merger tree."
+        description="Find the N most dispersion-dominated ellipticals in TNG50-1, match "
+                    "them to TNG50-1-Dark, and download their merger trees."
     )
     parser.add_argument(
         "--mass-min", type=float, default=1e11,
@@ -326,33 +462,75 @@ if __name__ == "__main__":
         "--mass-max", type=float, default=None,
         help="Maximum total stellar mass in Msun (default: no upper bound)",
     )
+    parser.add_argument(
+        "--cutout-dir", default=CUTOUT_DIR,
+        help=f"Directory for the stellar particle cutouts (default: {CUTOUT_DIR})",
+    )
+    parser.add_argument(
+        "--n-select", type=int, default=5,
+        help="Number of best (lowest kappa_rot) candidates to download merger trees for "
+             "(default: 5)",
+    )
     args = parser.parse_args()
+    if args.n_select < 1:
+        raise SystemExit("--n-select must be at least 1.")
+    CUTOUT_DIR = args.cutout_dir  # module-level global, read by download_star_cutout
+    print(f"Stellar cutouts will be saved in: {os.path.abspath(CUTOUT_DIR)}")
 
     if args.mass_max is not None and args.mass_max <= args.mass_min:
         raise SystemExit(f"--mass-max ({args.mass_max:.3e}) must be greater than "
                           f"--mass-min ({args.mass_min:.3e}).")
 
-    elliptical_id = find_prototypical_elliptical(
+    ranked = find_prototypical_elliptical(
         mass_min_msun=args.mass_min, mass_max_msun=args.mass_max,
     )
-    dark_id = match_to_dark(elliptical_id)
-    mpb_path, full_path = download_merger_tree(dark_id, full_tree=True)
-    summarize_mpb(mpb_path)
+
+    # Walk down the kappa_rot ranking and keep the best N candidates that have
+    # a counterpart in TNG50-1-Dark (a candidate without a bijective match is
+    # skipped and the next-ranked one is used instead).
+    selected = []  # list of dicts, one per downloaded galaxy
+    for sub_id, mass_stars, sfr, morph in ranked:
+        if len(selected) == args.n_select:
+            break
+        try:
+            dark_id = match_to_dark(sub_id)
+        except RuntimeError as e:
+            print(f"  skipping subhalo {sub_id}: {e}")
+            continue
+        selected.append({"subhalo_id": int(sub_id), "dark_subhalo_id": int(dark_id),
+                         "mass_stars_msun": float(mass_stars), **morph})
+
+    if len(selected) < args.n_select:
+        print(f"  WARNING: only {len(selected)} of the requested {args.n_select} "
+              f"candidates could be matched to {SIM_DARK}.")
+    n_rot = sum(s["kappa_rot"] >= KAPPA_ROT_ELLIPTICAL for s in selected)
+    if n_rot:
+        print(f"  WARNING: {n_rot} of the selected galaxies have kappa_rot >= "
+              f"{KAPPA_ROT_ELLIPTICAL}, i.e. they are not clearly ellipticals. "
+              f"Consider widening the mass range or lowering --n-select.")
+
     save_snapshot_redshifts()
 
     # BoxSize for TNG50 is 35000 ckpc/h (35 Mpc/h); fetch it from the API
     # instead of hardcoding, in case you point this at a different box.
-    sim_meta = api_get(SIM_DARK)
-    box_size = sim_meta["boxsize"]  # ckpc/h
+    box_size = api_get(SIM_DARK)["boxsize"]  # ckpc/h
 
-    kinematics = relative_progenitor_kinematics(full_path, box_size_ckpc_h=box_size)
-    example_snap = max(kinematics.keys())
-    print(f"\nProgenitors at snapshot {example_snap} (relative to central):")
-    for entry in kinematics[example_snap]:
-        tag = "CENTRAL" if entry["is_central"] else "progenitor"
-        print(f"  [{tag}] id={entry['subhalo_id']}, "
-              f"mass={entry['mass_msun']:.3e} Msun, "
-              f"pos_rel={entry['pos_rel_kpc']} kpc, "
-              f"vel_rel={entry['vel_rel_kms']} km/s")
+    for rank, s in enumerate(selected, start=1):
+        print(f"\n=== Galaxy {rank}/{len(selected)}: TNG50-1 subhalo {s['subhalo_id']} "
+              f"-> {SIM_DARK} subhalo {s['dark_subhalo_id']} "
+              f"(kappa_rot = {s['kappa_rot']:.3f}) ===")
+        mpb_path, full_path = download_merger_tree(s["dark_subhalo_id"], full_tree=True)
+        s["mpb_path"], s["full_tree_path"] = mpb_path, full_path
+        summarize_mpb(mpb_path)
 
-    print("\nDone. Files are in:", os.path.abspath(OUT_DIR))
+        kinematics = relative_progenitor_kinematics(full_path, box_size_ckpc_h=box_size)
+        n_prog = sum(len(v) for v in kinematics.values())
+        print(f"  full tree: {n_prog} subhalo entries over {len(kinematics)} snapshots")
+
+    # record of which galaxies were selected and where their trees are
+    sel_path = os.path.join(OUT_DIR, "selected_ellipticals.json")
+    with open(sel_path, "w") as f:
+        json.dump(selected, f, indent=2)
+    print(f"\nSaved the selected galaxies to {sel_path}")
+
+    print("Done. Files are in:", os.path.abspath(OUT_DIR))
