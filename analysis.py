@@ -398,11 +398,19 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
     track_cache = {}
     has_track_col = 'radius_track_path' in df.columns
     contributing_rows = []
+    # Per-cluster formation redshift drawn by imbh.py (--formation-time-draw);
+    # older outputs only have the snapshot-quantized subhalo value.
+    if 'cluster_formation_redshift' in df.columns:
+        formation_z_col = 'cluster_formation_redshift'
+    else:
+        formation_z_col = 'initial_subhalo_formation_redshift'
+        print("NOTE: no cluster_formation_redshift column (older imbh.py output) -- using the "
+              "snapshot-quantized initial_subhalo_formation_redshift instead.")
 
     for clusteridx in range(len(df)):
     # for clusteridx in range(2):
         if df['IMBH_mass_msun'][clusteridx]>0:
-            halo_formation_time = cosmo.age(df['initial_subhalo_formation_redshift'][clusteridx])
+            halo_formation_time = cosmo.age(df[formation_z_col][clusteridx])
             start_time = halo_formation_time+ (df['IMBH_final_formation_time_gyr'][clusteridx]*u.Gyr)
             mass_lost_bins,t_relax_bin, t_cutoff_gyr = timescale_analysis(df, clusteridx, alpha)
             if t_cutoff_gyr is not None: 

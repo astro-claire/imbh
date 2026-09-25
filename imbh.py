@@ -41,7 +41,7 @@ from tree_navigator import MergerTreeNavigator
 from timescales import TimescaleEnsemble
 from timescales.data import build_single_system_grid
 from timescales.analysis.modelv2 import create_dynamical_model_integral
-from astropy.cosmology import FlatLambdaCDM
+from astropy.cosmology import FlatLambdaCDM, z_at_value
 #FIXME hard coded -- cosmology for the IMBH/high-res-cluster-simulation
 # model itself (NOT the TNG merger tree -- see tree_navigator.TNG_COSMO
 # for that; these are two different simulations, don't conflate them)
@@ -152,6 +152,37 @@ def draw_clusters(subhalo_mass, subhalo_radius):
     return cluster_sampler.draw_clusters(subhalo_mass, subhalo_radius)
 
 
+def draw_formation_age(navigator, start_snap, rng, mode="uniform"):
+    """
+    Cosmic age (astropy Quantity, Gyr) at which one cluster forms, and the
+    matching redshift (TNG cosmology, i.e. navigator.cosmo).
+
+    A subhalo whose first appearance in the tree is snapshot n actually
+    formed at some unknown time between snapshots n-1 and n. With
+    mode='snapshot' every cluster forms exactly at snapshot n (the old
+    behavior -- this quantizes all formation times onto the ~12 snapshots
+    with z >= 7, so TDE bursts from every halo line up). With
+    mode='uniform' (default) the formation age is drawn uniformly in cosmic
+    time between snapshot n-1 and snapshot n, independently per cluster.
+
+    Falls back to the snapshot age if snapshot n-1 isn't available (n=0).
+    """
+    t_snap = navigator.age_at_snap(start_snap)
+    z_snap = float(navigator._snap_to_redshift[start_snap])
+    if mode == "snapshot":
+        return t_snap, z_snap
+    try:
+        t_prev = navigator.age_at_snap(start_snap - 1)
+        z_prev = float(navigator._snap_to_redshift[start_snap - 1])
+    except KeyError:
+        return t_snap, z_snap
+    t_prev_gyr = t_prev.to(u.Gyr).value
+    t_snap_gyr = t_snap.to(u.Gyr).value
+    age = rng.uniform(t_prev_gyr, t_snap_gyr) * u.Gyr
+    z = float(z_at_value(navigator.cosmo.age, age, zmin=z_snap * 0.999, zmax=z_prev * 1.001).value)
+    return age, z
+
+
 def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentration,
                                    bg_host=None, bg_offset=None):
     """
@@ -185,7 +216,7 @@ def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentra
 
 def _trace_pinned_cluster(cluster_mass, start_subhalo_id, target_age, navigator,
                            concentration=HOST_CONCENTRATION, max_steps=MAX_STEPS,
-                           record_dt=None):
+                           record_dt=None, formation_age=None):
     """
     A cheap alternative to trace_cluster_to_snapshot for a cluster whose
     drawn initial separation already landed inside R_STOP_FRAC*R_vir at
@@ -229,7 +260,11 @@ def _trace_pinned_cluster(cluster_mass, start_subhalo_id, target_age, navigator,
     """
     current_id = start_subhalo_id
     _, _, start_snap = navigator.host_properties(start_subhalo_id)
-    formation_age = navigator.age_at_snap(start_snap)
+    if formation_age is None:
+        # default: cluster forms exactly at its host's first snapshot.
+        # iterate_subhalos normally passes a drawn age instead (see
+        # draw_formation_age) so clusters aren't all snapped to snapshots.
+        formation_age = navigator.age_at_snap(start_snap)
     current_age = formation_age
     n_hops = 0
     n_steps = 0
@@ -529,7 +564,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                                navigator, concentration=HOST_CONCENTRATION, max_steps=MAX_STEPS,
                                final_escape_frac=3.0, max_leg_duration=1.0 * u.Gyr,
                                min_host_mass_msun=1e8, verbose=False, record_dt=None,
-                               allow_formation_inside_r_stop=True):
+                               allow_formation_inside_r_stop=True, formation_age=None):
     """
     Follow one cluster's dynamical-friction evolution, advancing ONE
     SNAPSHOT AT A TIME along its current host's tree branch, until it
@@ -675,7 +710,11 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
     current_id = start_subhalo_id
     r_vec, v_vec = r0_vec, v0_vec
     _, _, start_snap = navigator.host_properties(start_subhalo_id)
-    formation_age = navigator.age_at_snap(start_snap)
+    if formation_age is None:
+        # default: cluster forms exactly at its host's first snapshot.
+        # iterate_subhalos normally passes a drawn age instead (see
+        # draw_formation_age) so clusters aren't all snapped to snapshots.
+        formation_age = navigator.age_at_snap(start_snap)
     current_age = formation_age
     n_hops = 0
     n_pericenters = 0
@@ -1032,9 +1071,16 @@ def save_radius_track(track_time_gyr, track_radius_kpc, halo_idx, cluster_idx, t
 # ------- Iteration over all the subhalos
 def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                       record_dt=None, track_dir=None, track_min_mass=TRACK_MIN_IMBH_MASS_MSUN,
-                      formation_inside_r_stop_mode='pin_to_host_center'):
+                      formation_inside_r_stop_mode='pin_to_host_center',
+                      formation_time_mode='uniform', rng=None):
     """
     Parameters (new ones only -- see the rest of the module for the others):
+        formation_time_mode: 'uniform' (default) or 'snapshot' -- how each
+            cluster's formation time is chosen (see draw_formation_age).
+            Drawn once per cluster; the orbit trace, total_time_gyr and
+            everything downstream all start from that drawn time.
+        rng: numpy Generator used for the formation-time draw (a fresh
+            unseeded one if None).
         record_dt: astropy Quantity (time) or None (default). Passed straight
             through to trace_cluster_to_snapshot -- if given, every cluster's
             orbit trace also builds a full separation-from-central-galaxy
@@ -1081,6 +1127,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
     if formation_inside_r_stop_mode not in ('pin_to_host_center', 'integrate', 'instant_merge'):
         raise ValueError(f"formation_inside_r_stop_mode must be one of 'pin_to_host_center', "
                           f"'integrate', 'instant_merge' -- got {formation_inside_r_stop_mode!r}")
+    if rng is None:
+        rng = np.random.default_rng()
     clusters = []
     failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
     #testing mode-just do the first few
@@ -1107,6 +1155,10 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
         cluster_props['which_final_formation_time']=[]
         cluster_props['initial_subhalo_mass_msun']=[]
         cluster_props['initial_subhalo_formation_redshift']=[]
+        # per-cluster formation time actually used (see draw_formation_age);
+        # initial_subhalo_formation_redshift above stays the snapshot value
+        cluster_props['cluster_formation_redshift'] = []
+        cluster_props['cluster_formation_age_gyr'] = []
         cluster_props['rho0_msun_pc3'] =[]
         cluster_props['r0_pc'] =[]
         # path to this cluster's saved separation-from-central-galaxy time
@@ -1118,6 +1170,11 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
             m_cl = cluster_props['cluster_mass'][clusteridx]
             r0_vec = cluster_props['cluster_sep'][clusteridx]
             v0_vec = cluster_props['cluster_vel'][clusteridx]
+
+            formation_age, formation_z = draw_formation_age(
+                navigator, navigator.snap_of(start_subhalo_id), rng, mode=formation_time_mode)
+            cluster_props['cluster_formation_redshift'].append(formation_z)
+            cluster_props['cluster_formation_age_gyr'].append(formation_age.to(u.Gyr).value)
 
             if debug_trace:
                 # TEMPORARY diagnostic: print identifying info + exact initial
@@ -1145,6 +1202,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                 trace, trace_err = run_with_timeout(
                     _trace_pinned_cluster, ORBIT_TRACE_TIMEOUT_S,
                     m_cl, start_subhalo_id, target_age, navigator, record_dt=record_dt,
+                    formation_age=formation_age,
                 )
             else:
                 trace, trace_err = run_with_timeout(
@@ -1152,6 +1210,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                     m_cl, r0_vec, v0_vec, start_subhalo_id, target_age, navigator,
                     verbose=debug_trace, record_dt=record_dt,
                     allow_formation_inside_r_stop=(formation_inside_r_stop_mode == 'integrate'),
+                    formation_age=formation_age,
                 )
             if trace_err is not None:
                 print(f"    WARNING: orbit trace failed/timed out ({trace_err}) -- "
@@ -1215,6 +1274,8 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                 cluster_props['IMBH_mass'].append(np.nan)
                 cluster_props['IMBH_final_formation_time'].append(np.nan)
                 cluster_props['which_final_formation_time'].append(None)
+                cluster_props['r0_pc'].append(None)
+                cluster_props['rho0_msun_pc3'].append(None)
                 cluster_props['radius_track_path'].append(None)
                 continue
             imbh_mass_out = out['M_VMS'][0]
@@ -1348,6 +1409,8 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'initial_subhalo_id': cluster_props['initial_subhalo_id'][i],
                 'initial_subhalo_mass_msun': cluster_props['initial_subhalo_mass_msun'][i],
                 'initial_subhalo_formation_redshift': cluster_props['initial_subhalo_formation_redshift'][i],
+                'cluster_formation_redshift': cluster_props['cluster_formation_redshift'][i],
+                'cluster_formation_age_gyr': cluster_props['cluster_formation_age_gyr'][i],
                 'final_subhalo_id': final_id if final_id is not None else np.nan,
                 'final_r_over_rvir': cluster_props['final_r_over_rvir'][i],
                 'n_hops': n_hops if n_hops is not None else np.nan,
@@ -1455,6 +1518,15 @@ def main():
                               "original/legacy behavior -- NOT recommended, since it effectively excludes "
                               "these clusters from any downstream IMBH/TDE calculation entirely. See "
                               "iterate_subhalos' own docstring for the full explanation of each.)")
+    parser.add_argument("--formation-time-draw", choices=["uniform", "snapshot"], default="uniform",
+                         help="How each cluster's formation time is set (default: uniform -- drawn "
+                              "uniformly in cosmic time between the previous snapshot and its host "
+                              "subhalo's first snapshot, so formation times aren't quantized onto "
+                              "snapshots. 'snapshot' restores the old behavior: every cluster forms "
+                              "exactly at its host's first snapshot.)")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Random seed for the formation-time draw (default: random; the seed "
+                              "used is printed so a run can be reproduced).")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -1488,11 +1560,15 @@ def main():
               f"will be saved under {track_dir}")
 
     print(f"formation_inside_r_stop_mode = {args.formed_inside_rstop_mode!r}")
+    seed = args.seed if args.seed is not None else int(np.random.SeedSequence().entropy % (2**32))
+    rng = np.random.default_rng(seed)
+    print(f"formation_time_draw = {args.formation_time_draw!r}, seed = {seed}")
 
     output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace,
                                         record_dt=record_dt, track_dir=track_dir,
                                         track_min_mass=args.track_min_mass,
-                                        formation_inside_r_stop_mode=args.formed_inside_rstop_mode)
+                                        formation_inside_r_stop_mode=args.formed_inside_rstop_mode,
+                                        formation_time_mode=args.formation_time_draw, rng=rng)
     summarize_status(output_clusters)
 
     save_path = args.save_path
