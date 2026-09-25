@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from astropy.constants import G
 from pathlib import Path
+import re
 import sys
 import os
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -451,6 +452,17 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
 
 
 
+def infer_subhalo_id(input_path):
+    """
+    Pull the subhalo/branch ID out of an imbh.py output filename of the
+    form cluster_output_<subhaloid>_<snap>.{csv,dat} (e.g.
+    cluster_output_467548_99.dat or cluster_output_467548_snap99.csv).
+    Returns the ID as a string, or None if the name doesn't match.
+    """
+    m = re.match(r"cluster_output_(\d+)_", Path(input_path).name)
+    return m.group(1) if m else None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input_path", help="Path to the cluster_output_<branchid>_<snapshot>.csv file")
@@ -463,7 +475,21 @@ def main():
                               "directory). If input_path has no radius_track_path column at "
                               "all, this is ignored and the radius-vs-time diagnostic is simply "
                               "skipped (the TDE rate itself is unaffected either way).")
+    parser.add_argument("--subhalo-id", default=None,
+                         help="Subhalo ID to tag the output files with. If omitted, it is "
+                              "read from input_path's name (cluster_output_<subhaloid>_<snap>.*).")
+    parser.add_argument("--output-dir", default=".",
+                         help="Directory to write the tde_rates/tde_contributors CSVs to "
+                              "(default: current directory).")
     args = parser.parse_args()
+
+    subhalo_id = args.subhalo_id or infer_subhalo_id(args.input_path)
+    if subhalo_id is None:
+        parser.error(f"could not infer the subhalo ID from '{args.input_path}'; "
+                     "pass --subhalo-id explicitly.")
+    os.makedirs(args.output_dir, exist_ok=True)
+    tag = f"{subhalo_id}_alpha{float(args.alpha)}"
+    print(f"Subhalo {subhalo_id}, alpha = {float(args.alpha)}")
     df = load_data_file(args.input_path)
     print(df.columns)
     tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun = set_up_timebins(1e5*u.yr)
@@ -479,14 +505,16 @@ def main():
         'n_clusters_with_tde': n_clusters_with_tde[:-2],
     })
 
-    output_df.to_csv(f'tde_rates_alpha{float(args.alpha)}.csv', index=False)
+    rates_path = os.path.join(args.output_dir, f'tde_rates_{tag}.csv')
+    output_df.to_csv(rates_path, index=False)
+    print(f"TDE rates written to {rates_path}")
 
     # Sidecar file: which clusters actually contributed at least one
     # mass-loss bin to the TDE rate above (see run_clusters' own
     # docstring) -- lets downstream tools (e.g. plot_radius_tracks.py's
     # --tde-contributors-csv) restrict to actively TDE-generating clusters
     # without re-running timescale_analysis themselves.
-    contributors_path = f'tde_contributors_alpha{float(args.alpha)}.csv'
+    contributors_path = os.path.join(args.output_dir, f'tde_contributors_{tag}.csv')
     pd.DataFrame(contributing_rows).to_csv(contributors_path, index=False)
     print(f"{len(contributing_rows)} of {len(df)} clusters actively contributed to the TDE rate "
           f"-- see {contributors_path}")
