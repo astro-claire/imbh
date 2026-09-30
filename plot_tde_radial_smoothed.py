@@ -2,6 +2,8 @@
 Radial distribution of TDEs about the central galaxy, averaged over the halos
 in each of a few halo-mass bins.
 
+Separation from host galaxy. 
+
 "Radius" here is each TDE-producing cluster's separation from the central
 galaxy (the tree's main-branch/root position -- the same quantity
 plot_radius_tracks.py plots). A cluster's own size is << that separation, so
