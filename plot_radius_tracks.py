@@ -79,6 +79,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from pathlib import Path
 
 
 def load_sparse_track(path, max_points):
@@ -112,7 +113,20 @@ def load_cluster_lookup(cluster_csv):
     FILENAME rather than the full stored path, so this still works if the
     tracks were moved to a different directory since the run that made them.
     """
-    df = pd.read_csv(cluster_csv)
+    path = Path(cluster_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"The file '{file_path}' does not exist.")
+    file_extension = path.suffix.lower()
+    def get_file(path, file_extension):
+        if file_extension == '.csv':
+            print(f"Processing CSV file: {path.name}")
+            return pd.read_csv(path)
+            
+        elif file_extension == '.dat':
+            print(f"Processing DAT file: {path.name}")
+            return pd.read_pickle(path)
+
+    df = get_file(path, file_extension)
     if "radius_track_path" not in df.columns:
         sys.exit(f"{cluster_csv} has no 'radius_track_path' column -- was it produced by a run "
                   f"with --save-radius-tracks enabled?")
