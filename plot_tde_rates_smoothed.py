@@ -55,6 +55,18 @@ EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"
 
 Z_MAX = 20  # left edge of the plot
 
+# 20 pt for all text: axis labels, tick labels, legend and title
+FONT_SIZE = 20
+plt.rcParams.update({
+    'font.size': FONT_SIZE,
+    'axes.labelsize': FONT_SIZE,
+    'axes.titlesize': FONT_SIZE,
+    'xtick.labelsize': FONT_SIZE,
+    'ytick.labelsize': FONT_SIZE,
+    'legend.fontsize': FONT_SIZE,
+    'legend.title_fontsize': FONT_SIZE,
+})
+
 
 def load_rates(data_dir, halo_ids, alpha):
     """
