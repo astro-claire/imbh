@@ -31,6 +31,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from astropy.constants import G
 from cluster_population_sampler import ClusterPopulationSampler
+from observational_cluster_sampler import (ObservationalClusterSampler, N_RELATIONS,
+                                           MASS_FUNCTIONS, RADIUS_RELATIONS)
 
  
 # dynamical friction orbit integration (separate module, kept alongside this script)
@@ -137,7 +139,49 @@ def run_with_timeout(func, timeout_s, *args, **kwargs):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-cluster_sampler = ClusterPopulationSampler.load(CLUSTER_SAMPLER_PATH)
+# Which cluster sampler draw_clusters() uses. Set by configure_cluster_sampler(),
+# which main() calls according to --cluster-sampler. Left as None until then;
+# draw_clusters() falls back to the simulation-calibrated sampler (the default
+# mode, same as before this switch existed) if nothing configured it -- e.g.
+# when another script imports imbh and calls draw_clusters() directly.
+cluster_sampler = None
+CLUSTER_SAMPLER_MODES = ("simulation", "observational")
+
+
+def configure_cluster_sampler(mode="simulation", rng=None, **obs_kwargs):
+    """
+    Select the cluster sampler that draw_clusters() uses.
+
+        mode='simulation' (default): ClusterPopulationSampler loaded from
+            CLUSTER_SAMPLER_PATH -- clusters bootstrapped from the high-res
+            cosmological simulation's cluster catalog.
+        mode='observational': ObservationalClusterSampler -- clusters drawn
+            from empirical N_GC-M_halo, cluster mass function and
+            mass-radius relations (see observational_cluster_sampler.py).
+            obs_kwargs are passed straight to its constructor (n_relation,
+            mass_function, radius_relation, phase_space, n_boost, ...).
+            host_concentration is set to HOST_CONCENTRATION so the drawn
+            velocities are consistent with the orbit integration's NFW host.
+            If phase_space='simulation', CLUSTER_SAMPLER_PATH is also loaded
+            to supply the positions/velocities.
+
+    rng seeds the observational sampler (the simulation sampler keeps its
+    own unseeded generator, unchanged from before).
+    """
+    global cluster_sampler
+    if mode == "simulation":
+        cluster_sampler = ClusterPopulationSampler.load(CLUSTER_SAMPLER_PATH)
+    elif mode == "observational":
+        phase_space_sampler = None
+        if obs_kwargs.get("phase_space", "analytic") == "simulation":
+            phase_space_sampler = ClusterPopulationSampler.load(CLUSTER_SAMPLER_PATH)
+        cluster_sampler = ObservationalClusterSampler(
+            host_concentration=HOST_CONCENTRATION, phase_space_sampler=phase_space_sampler,
+            rng=rng, **obs_kwargs,
+        )
+    else:
+        raise ValueError(f"cluster sampler mode must be one of {CLUSTER_SAMPLER_MODES}, got {mode!r}")
+    return cluster_sampler
 
 
 #--------- Load post-processed illustris merger tree 
@@ -147,8 +191,11 @@ def load_merger_tree_idx(df,cutoff_z = 7):
     return goodidx
 
 
-# -------- Attach AREPO clusters to the primordial halos
+# -------- Attach clusters to the primordial halos (AREPO-calibrated by
+# default, or observational relations -- see configure_cluster_sampler)
 def draw_clusters(subhalo_mass, subhalo_radius):
+    if cluster_sampler is None:
+        configure_cluster_sampler("simulation")
     return cluster_sampler.draw_clusters(subhalo_mass, subhalo_radius)
 
 
@@ -1525,8 +1572,43 @@ def main():
                               "snapshots. 'snapshot' restores the old behavior: every cluster forms "
                               "exactly at its host's first snapshot.)")
     parser.add_argument("--seed", type=int, default=None,
-                         help="Random seed for the formation-time draw (default: random; the seed "
-                              "used is printed so a run can be reproduced).")
+                         help="Random seed for the formation-time draw and (with "
+                              "--cluster-sampler observational) the cluster draws (default: random; "
+                              "the seed used is printed so a run can be reproduced).")
+    parser.add_argument("--cluster-sampler", choices=CLUSTER_SAMPLER_MODES, default="simulation",
+                         help="Where each halo's clusters come from (default: simulation -- "
+                              "bootstrapped from the high-res cosmological simulation via "
+                              "CLUSTER_SAMPLER_PATH). 'observational' instead draws them from "
+                              "empirical relations (N_GC-M_halo, cluster mass function, cluster "
+                              "mass-radius) -- see observational_cluster_sampler.py and the "
+                              "--obs-* options below, which are ignored in simulation mode.")
+    parser.add_argument("--obs-n-relation", choices=sorted(N_RELATIONS), default="bf20",
+                         help="Observational mode: cluster number vs halo mass relation "
+                              "(default: bf20 = Burkert & Forbes 2020 z=0, one GC per 5e9 Msun; "
+                              "bf20_seed = their inferred high-z seed rate, one per 5e8 Msun; "
+                              "harris17_number / harris17_mass = Harris+2017 eta_N / eta_M).")
+    parser.add_argument("--obs-mass-function", choices=sorted(MASS_FUNCTIONS), default="gclf",
+                         help="Observational mode: cluster mass function (default: gclf = z=0 GC "
+                              "log-normal, peak 2.2e5 Msun, 0.5 dex; icmf = M^-2 Schechter initial "
+                              "cluster mass function, M_c=1e6 Msun, 1e4-1e8 Msun).")
+    parser.add_argument("--obs-radius-relation", choices=sorted(RADIUS_RELATIONS), default="brown_gnedin21",
+                         help="Observational mode: cluster mass-radius relation (default: "
+                              "brown_gnedin21 = LEGUS young massive clusters; marks_kroupa12 = "
+                              "embedded-cluster birth radii; const_surface_density = Sigma_e=1e5 "
+                              "Msun/pc^2, Cosmic-Gems motivated).")
+    parser.add_argument("--obs-phase-space", choices=["analytic", "simulation"], default="analytic",
+                         help="Observational mode: initial positions/velocities (default: analytic = "
+                              "Sersic n=4 GC-system profile with R_e=0.03 R200 plus isotropic bound "
+                              "NFW velocities; simulation = bootstrap them from CLUSTER_SAMPLER_PATH "
+                              "so only number/mass/radius differ from the default mode).")
+    parser.add_argument("--obs-n-boost", type=float, default=1.0,
+                         help="Observational mode: multiply the expected number of clusters per halo "
+                              "(e.g. to turn a surviving-GC relation into an initial population; "
+                              "default 1).")
+    parser.add_argument("--obs-n-scatter-dex", type=float, default=None,
+                         help="Observational mode: log-normal scatter on the expected number before "
+                              "the Poisson draw (default: the chosen relation's own value -- 0 for "
+                              "bf20/bf20_seed, 0.26/0.28 dex for harris17_number/harris17_mass).")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -1564,6 +1646,25 @@ def main():
     rng = np.random.default_rng(seed)
     print(f"formation_time_draw = {args.formation_time_draw!r}, seed = {seed}")
 
+    print(f"cluster_sampler = {args.cluster_sampler!r}")
+    if args.cluster_sampler == "observational":
+        sampler = configure_cluster_sampler(
+            "observational",
+            # independent stream from the formation-time rng, same seed
+            rng=np.random.default_rng([seed, 1]),
+            n_relation=args.obs_n_relation,
+            mass_function=args.obs_mass_function,
+            radius_relation=args.obs_radius_relation,
+            phase_space=args.obs_phase_space,
+            n_boost=args.obs_n_boost,
+            n_scatter_dex=args.obs_n_scatter_dex,
+        )
+        print(sampler.describe())
+        n_expected = sampler.expected_number(df['group_m_crit200_msun'].to_numpy()[goodidx]).sum()
+        print(f"Expected number of clusters over the {len(goodidx)} selected halos: {n_expected:.1f}")
+    else:
+        configure_cluster_sampler("simulation")
+
     output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace,
                                         record_dt=record_dt, track_dir=track_dir,
                                         track_min_mass=args.track_min_mass,
@@ -1576,8 +1677,10 @@ def main():
         base = os.path.basename(args.csv_path)
         tree_id = base.replace("subhalo_formation_", "").replace(".csv", "")
         ext = "dat" if args.save_format == "pickle" else "csv"
+        # tag observational-mode runs so they never overwrite a default-mode output
+        mode_tag = "_obs" if args.cluster_sampler == "observational" else ""
         save_path = os.path.join(os.path.dirname(args.csv_path) or ".",
-                                  f"cluster_output_{tree_id}_snap{args.output_snap}.{ext}")
+                                  f"cluster_output_{tree_id}_snap{args.output_snap}{mode_tag}.{ext}")
         print(f"--save-path not given, using: {save_path}")
     save_cluster_output(output_clusters, save_path, file_format=args.save_format)
 
