@@ -32,6 +32,15 @@ from astropy.cosmology import z_at_value
 # for that; these are two different simulations, don't conflate them)
 cosmo = FlatLambdaCDM(71,0.27,Ob0=0.044, Tcmb0=2.726 *u.K)
 
+# Default log-spaced grid (kpc) for the TDE-rate-weighted histogram of each
+# contributing cluster's separation from the central galaxy (see
+# run_clusters' radial_hist / plot_tde_radial_smoothed.py). Separations
+# outside the grid are clipped into the first/last bin (and counted, see
+# run_clusters' radial_clipped_msun).
+RADIAL_R_MIN_KPC = 1e-2
+RADIAL_R_MAX_KPC = 1e3
+RADIAL_N_BINS = 50
+
 def load_data_file(file_path):
     """
     Checks the file extension and loads a .csv or .dat file into a Pandas DataFrame.
@@ -359,10 +368,30 @@ def _load_radius_track(track_path, track_dir, cache):
 
 
 def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
-                  resolution = 1e5*u.yr, track_dir=None):
+                  resolution = 1e5*u.yr, track_dir=None, radial_edges_kpc=None):
     """
     Returns (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc,
-    n_clusters_with_tde, contributing_rows):
+    n_clusters_with_tde, contributing_rows, radial):
+
+        radial: dict with the TDE rate resolved by separation from the
+            central galaxy, on the same time grid as tde_rate_array_msunyr:
+              'edges_kpc'   (n_r+1,) log-spaced bin edges (radial_edges_kpc,
+                            default RADIAL_R_MIN/MAX_KPC, RADIAL_N_BINS)
+              'hist_msunyr' (n_t, n_r) TDE rate [Msun/yr] in each time bin
+                            from clusters whose separation fell in each
+                            radial bin (float32). Every cluster contributes
+                            to exactly ONE radial bin per time bin -- the
+                            cluster's own size is << its separation.
+              'inspiraled_msunyr' (n_t,) rate from clusters whose burst
+                            continues AFTER their orbit trace ended in an
+                            inspiral (status == 'inspiraled'): they sit at
+                            the center, so they're kept out of hist rather
+                            than pinned at the trace's last (stop) radius.
+              'no_track_msunyr' (n_t,) rate from contributing clusters with
+                            no radius track (so hist + inspiraled + no_track
+                            == tde_rate_array_msunyr).
+              'clipped_msun' mass (rate x dt) that fell outside edges_kpc
+                            and was clipped into the first/last bin.
 
         mean_radius_kpc: at each time bin, the AVERAGE separation from the
             central/root galaxy across every cluster that has a TDE burst
@@ -398,6 +427,17 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
     track_cache = {}
     has_track_col = 'radius_track_path' in df.columns
     contributing_rows = []
+
+    if radial_edges_kpc is None:
+        radial_edges_kpc = np.logspace(np.log10(RADIAL_R_MIN_KPC), np.log10(RADIAL_R_MAX_KPC),
+                                       RADIAL_N_BINS + 1)
+    radial_edges_kpc = np.asarray(radial_edges_kpc, dtype=float)
+    n_rbins = len(radial_edges_kpc) - 1
+    radial_hist = np.zeros((n_bins, n_rbins), dtype=np.float32)
+    radial_inspiraled = np.zeros(n_bins)
+    radial_no_track = np.zeros(n_bins)
+    radial_clipped_msun = 0.0
+    has_status_col = 'status' in df.columns
     # Per-cluster formation redshift drawn by imbh.py (--formation-time-draw);
     # older outputs only have the snapshot-quantized subhalo value.
     if 'cluster_formation_redshift' in df.columns:
@@ -438,6 +478,10 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                     mass = mass_lost_bins[binidx]* u.Msun
                     tde_rate_array_msunyr[j_start:k_end+1] += rate
                     mass_trelax_array_msun[k_end+1] += mass
+                    rate_msunyr = float(mass_lost_bins[binidx] / t_relax_bin[binidx]) / 1e9
+
+                    if track_t_gyr is None and k_end >= j_start:
+                        radial_no_track[j_start:k_end+1] += rate_msunyr
 
                     if track_t_gyr is not None and k_end >= j_start:
                         # cosmic time (Gyr) of every bin in THIS burst -> time
@@ -453,10 +497,34 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                         radius_sum_kpc[j_start:k_end+1] += r_interp_kpc
                         radius_count[j_start:k_end+1] += 1
 
+                        # ---- rate-weighted separation histogram ----
+                        # Past the end of an inspiraled cluster's trace, np.interp
+                        # would hold the stop radius; the cluster is at the center.
+                        tbins = np.arange(j_start, k_end + 1)
+                        in_track = np.ones(len(tbins), dtype=bool)
+                        if (has_status_col and df['status'][clusteridx] == 'inspiraled'
+                                and len(track_t_gyr)):
+                            in_track = t_since_formation_gyr <= track_t_gyr[-1]
+                            radial_inspiraled[tbins[~in_track]] += rate_msunyr
+                        r_in = r_interp_kpc[in_track]
+                        ridx = np.searchsorted(radial_edges_kpc, r_in, side='right') - 1
+                        n_out = np.count_nonzero((ridx < 0) | (ridx >= n_rbins))
+                        radial_clipped_msun += n_out * rate_msunyr * resolution
+                        ridx = np.clip(ridx, 0, n_rbins - 1)
+                        np.add.at(radial_hist, (tbins[in_track], ridx), rate_msunyr)
+
     with np.errstate(invalid='ignore'):
         mean_radius_kpc = np.where(radius_count > 0, radius_sum_kpc / np.maximum(radius_count, 1), np.nan)
 
-    return tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, radius_count, contributing_rows
+    radial = {
+        'edges_kpc': radial_edges_kpc,
+        'hist_msunyr': radial_hist,
+        'inspiraled_msunyr': radial_inspiraled,
+        'no_track_msunyr': radial_no_track,
+        'clipped_msun': radial_clipped_msun,
+    }
+    return (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, radius_count,
+            contributing_rows, radial)
 
 
 
@@ -486,6 +554,14 @@ def main():
     parser.add_argument("--subhalo-id", default=None,
                          help="Subhalo ID to tag the output files with. If omitted, it is "
                               "read from input_path's name (cluster_output_<subhaloid>_<snap>.*).")
+    parser.add_argument("--r-min-kpc", type=float, default=RADIAL_R_MIN_KPC,
+                         help="Inner edge of the log-spaced separation grid for the radial TDE "
+                              f"histogram (default: {RADIAL_R_MIN_KPC}).")
+    parser.add_argument("--r-max-kpc", type=float, default=RADIAL_R_MAX_KPC,
+                         help=f"Outer edge of that grid (default: {RADIAL_R_MAX_KPC}).")
+    parser.add_argument("--n-rbins", type=int, default=RADIAL_N_BINS,
+                         help=f"Number of log-spaced separation bins (default: {RADIAL_N_BINS}). "
+                              "Use a fine grid here; plot_tde_radial_smoothed.py can rebin/smooth.")
     parser.add_argument("--output-dir", default=".",
                          help="Directory to write the tde_rates/tde_contributors CSVs to "
                               "(default: current directory).")
@@ -501,9 +577,11 @@ def main():
     df = load_data_file(args.input_path)
     print(df.columns)
     tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun = set_up_timebins(1e5*u.yr)
-    tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, n_clusters_with_tde, contributing_rows = run_clusters(
+    radial_edges_kpc = np.logspace(np.log10(args.r_min_kpc), np.log10(args.r_max_kpc), args.n_rbins + 1)
+    (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, n_clusters_with_tde,
+     contributing_rows, radial) = run_clusters(
         df, float(args.alpha), tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
-        resolution=1e5*u.yr, track_dir=args.track_dir,
+        resolution=1e5*u.yr, track_dir=args.track_dir, radial_edges_kpc=radial_edges_kpc,
     )
     output_df = pd.DataFrame({
         'time': tscale_array_yr[:-2],
@@ -516,6 +594,29 @@ def main():
     rates_path = os.path.join(args.output_dir, f'tde_rates_{tag}.csv')
     output_df.to_csv(rates_path, index=False)
     print(f"TDE rates written to {rates_path}")
+
+    # Rate-weighted histogram of separation from the central galaxy, on the
+    # same time grid (see run_clusters' `radial`). Mostly zeros, so a
+    # compressed .npz is small; read it with plot_tde_radial_smoothed.py.
+    radial_path = os.path.join(args.output_dir, f'tde_radial_{tag}.npz')
+    np.savez_compressed(
+        radial_path,
+        time_yr=tscale_array_yr[:-2],
+        edges_kpc=radial['edges_kpc'],
+        hist_msunyr=radial['hist_msunyr'][:-2],
+        inspiraled_msunyr=radial['inspiraled_msunyr'][:-2],
+        no_track_msunyr=radial['no_track_msunyr'][:-2],
+        clipped_msun=radial['clipped_msun'],
+        subhalo_id=subhalo_id, alpha=float(args.alpha),
+    )
+    dt_yr = 1e5
+    tot = float(np.sum(tde_rate_array_msunyr.to(u.Msun / u.yr).value)) * dt_yr
+    parts = {k: float(np.sum(radial[k])) * dt_yr for k in ('hist_msunyr', 'inspiraled_msunyr', 'no_track_msunyr')}
+    print(f"Radial TDE histogram written to {radial_path}: of {tot:.3g} Msun lost, "
+          f"{parts['hist_msunyr']:.3g} placed by separation, {parts['inspiraled_msunyr']:.3g} after "
+          f"inspiral (at center), {parts['no_track_msunyr']:.3g} with no radius track; "
+          f"{radial['clipped_msun']:.3g} clipped into the edge bins of "
+          f"[{args.r_min_kpc:g}, {args.r_max_kpc:g}] kpc.")
 
     # Sidecar file: which clusters actually contributed at least one
     # mass-loss bin to the TDE rate above (see run_clusters' own
