@@ -1,20 +1,28 @@
 """
-Average the TDE rates of several halos and plot a single smoothed curve with
-a shaded band showing the halo-to-halo spread.
+Average the TDE rates of several halos in each of a few halo-mass bins and plot
+one smoothed curve per bin, each with a shaded band showing the halo-to-halo
+spread within that bin.
 
 Reads the per-halo outputs of analysis.py:
 
     <data-dir>/tde_rates_<subhaloid>_alpha<alpha>.csv
 
-Steps:
+Steps (done separately for each mass bin):
   1. Each halo's rate is smoothed in cosmic time with a kernel of width
      --smooth-myr (default 50 Myr). The default top-hat (boxcar) kernel
      conserves the total mass lost: the integral of rate over time is the
      same before and after smoothing (apart from edge effects).
-  2. At each time, the mean over halos is the central curve, and the band
-     is either the full min-max range of the halos (default), the 16-84th
-     percentiles, or mean +/- 1 standard deviation.
-  3. Plotted against redshift and also written to a CSV.
+  2. At each time, the mean over the bin's halos is the central curve, and the
+     band is either the full min-max range of those halos (default), the
+     16-84th percentiles, or mean +/- 1 standard deviation.
+  3. All bins are plotted together against redshift, and each bin is also
+     written to its own CSV.
+
+Mass bins default to the three in DEFAULT_MASS_BINS below. Override them with
+one --bin per bin, giving a label and the subhalo IDs:
+
+    --bin "gt1e11" 685512 697044 588075 467548 665702 \
+    --bin "1e10-1e11" 801308 753345 8 745415 826784
 
 Example:
     python plot_tde_rates_smoothed.py --data-dir /u/scratch/c/clairewi/imbh-output
@@ -32,19 +40,28 @@ from scipy.ndimage import uniform_filter1d, gaussian_filter1d
 
 cosmo = FlatLambdaCDM(71, 0.27, Ob0=0.044, Tcmb0=2.726 * u.K)
 
-# TNG50-1-Dark subhalo IDs of the 5 selected ellipticals
-# (from tng_download/selected_ellipticals.json)
-DEFAULT_HALO_IDS = ["685512", "697044", "588075", "467548", "665702"]
+# TNG50-1-Dark subhalo IDs, grouped by halo mass.
+# Each entry: (short tag for file names, legend label, color, subhalo IDs)
+DEFAULT_MASS_BINS = [
+    ("gt1e11", r"$>10^{11}\,M_\odot$", "#0072B2",
+     ["685512", "697044", "588075", "467548", "665702"]),
+    ("1e10-1e11", r"$10^{10}$–$10^{11}\,M_\odot$", "#D55E00",
+     ["801308", "753345", "8", "745415", "826784"]),
+    ("1e9-1e10", r"$10^{9}$–$10^{10}\,M_\odot$", "#009E73",
+     ["1235585", "1117358", "1136724", "1044309", "939095"]),
+]
+# Colors for bins given on the command line (Okabe-Ito, colorblind-safe)
+EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
 
 Z_MAX = 20  # left edge of the plot
-LINE_COLOR = "#0072B2"
 
 
 def load_rates(data_dir, halo_ids, alpha):
     """
     Returns (time_yr, rates, used_ids): rates has shape (n_halos, n_times).
     All halos from analysis.py share the same time grid; if one doesn't,
-    it's interpolated onto the first halo's grid.
+    it's interpolated onto the first halo's grid. Returns None if none of the
+    halos' files exist.
     """
     time_yr, rates, used_ids = None, [], []
     for halo_id in halo_ids:
@@ -63,7 +80,7 @@ def load_rates(data_dir, halo_ids, alpha):
         rates.append(r)
         used_ids.append(halo_id)
     if not rates:
-        raise SystemExit("No tde_rates files found -- check --data-dir and --alpha.")
+        return None
     return time_yr, np.vstack(rates), used_ids
 
 
@@ -76,6 +93,17 @@ def smooth(rates, dt_yr, smooth_myr, kernel):
     # gaussian: treat smooth_myr as the FWHM
     sigma_bins = width_bins / (2 * np.sqrt(2 * np.log(2)))
     return gaussian_filter1d(rates, sigma=sigma_bins, axis=1, mode="constant", cval=0.0)
+
+
+def band(smoothed, mean, kind):
+    """Lower and upper edges of the shaded band, plus a description of it."""
+    if kind == "minmax":
+        return smoothed.min(axis=0), smoothed.max(axis=0), "halo-to-halo range"
+    if kind == "percentile":
+        lo, hi = np.percentile(smoothed, [16, 84], axis=0)
+        return lo, hi, "16–84th percentile"
+    std = smoothed.std(axis=0)
+    return np.clip(mean - std, 0, None), mean + std, r"mean $\pm1\sigma$"
 
 
 def age_to_redshift(t_yr):
@@ -92,8 +120,9 @@ def main():
                         help="Directory holding the tde_rates_<ID>_alpha<alpha>.csv files.")
     parser.add_argument("--alpha", type=float, default=1.2,
                         help="Power-law index the rates were computed with (default: 1.2).")
-    parser.add_argument("--halo-ids", nargs="+", default=DEFAULT_HALO_IDS,
-                        help="Subhalo IDs to include (default: the 5 selected ellipticals).")
+    parser.add_argument("--bin", nargs="+", action="append", metavar=("LABEL", "ID"),
+                        help="A mass bin: a label followed by its subhalo IDs. Repeat for "
+                             "each bin. Default: the three bins in DEFAULT_MASS_BINS.")
     parser.add_argument("--smooth-myr", type=float, default=50.0,
                         help="Smoothing width in Myr (default: 50). For --kernel gaussian "
                              "this is the FWHM.")
@@ -105,63 +134,80 @@ def main():
     parser.add_argument("--logy", action="store_true", help="Log-scale y axis.")
     parser.add_argument("--output", default=None,
                         help="Output image path (default: "
-                             "tde_rate_smoothed_alpha<alpha>_<smooth>Myr.png).")
+                             "tde_rate_smoothed_massbins_alpha<alpha>_<smooth>Myr.png).")
     parser.add_argument("--no-show", action="store_true",
                         help="Don't open an interactive window (e.g. on a cluster node).")
     args = parser.parse_args()
 
-    time_yr, rates, used_ids = load_rates(args.data_dir, args.halo_ids, args.alpha)
-    dt_yr = np.median(np.diff(time_yr))
-    print(f"Loaded {len(used_ids)} halos, {len(time_yr)} time bins of {dt_yr/1e6:.3g} Myr")
-
-    smoothed = smooth(rates, dt_yr, args.smooth_myr, args.kernel)
-    mean = smoothed.mean(axis=0)
-    if args.band == "minmax":
-        lo, hi = smoothed.min(axis=0), smoothed.max(axis=0)
-        band_label = f"range of {len(used_ids)} halos"
-    elif args.band == "percentile":
-        lo, hi = np.percentile(smoothed, [16, 84], axis=0)
-        band_label = "16–84th percentile"
+    if args.bin:
+        mass_bins = []
+        for i, entry in enumerate(args.bin):
+            if len(entry) < 2:
+                parser.error("--bin needs a label followed by at least one subhalo ID")
+            label, ids = entry[0], entry[1:]
+            tag = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
+            mass_bins.append((tag, label, EXTRA_COLORS[i % len(EXTRA_COLORS)], ids))
     else:
-        std = smoothed.std(axis=0)
-        lo, hi = np.clip(mean - std, 0, None), mean + std
-        band_label = r"mean $\pm1\sigma$"
-
-    # The smoothed curves vary on ~smooth_myr scales, so plotting every
-    # 1e5-yr bin is overkill: keep ~20 points per smoothing width.
-    step = max(1, int(args.smooth_myr * 1e6 / dt_yr / 20))
-    sl = slice(None, None, step)
-    z = age_to_redshift(time_yr[sl])
+        mass_bins = DEFAULT_MASS_BINS
 
     tag = f"alpha{args.alpha}_{args.smooth_myr:g}Myr"
-    csv_path = f"tde_rate_smoothed_{tag}.csv"
-    pd.DataFrame({
-        'time_yr': time_yr[sl], 'redshift': z,
-        'mean_rate_msunyr': mean[sl], 'band_lo_msunyr': lo[sl], 'band_hi_msunyr': hi[sl],
-        **{f'rate_{h}_msunyr': smoothed[i][sl] for i, h in enumerate(used_ids)},
-    }).to_csv(csv_path, index=False)
-    print(f"Saved {csv_path}")
-
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.fill_between(z, lo[sl], hi[sl], color=LINE_COLOR, alpha=0.25, lw=0, label=band_label)
-    ax.plot(z, mean[sl], color=LINE_COLOR, lw=2, label=f"mean of {len(used_ids)} halos")
+    band_desc = None
+    all_hi = []  # (z, hi) per bin, for setting log y-limits
+
+    for bin_tag, label, color, halo_ids in mass_bins:
+        print(f"\n[{bin_tag}]")
+        loaded = load_rates(args.data_dir, halo_ids, args.alpha)
+        if loaded is None:
+            print(f"WARNING: no tde_rates files found for bin {bin_tag}; skipping it")
+            continue
+        time_yr, rates, used_ids = loaded
+        dt_yr = np.median(np.diff(time_yr))
+        print(f"Loaded {len(used_ids)} halos, {len(time_yr)} time bins of {dt_yr/1e6:.3g} Myr")
+
+        smoothed = smooth(rates, dt_yr, args.smooth_myr, args.kernel)
+        mean = smoothed.mean(axis=0)
+        lo, hi, band_desc = band(smoothed, mean, args.band)
+
+        # The smoothed curves vary on ~smooth_myr scales, so plotting every
+        # 1e5-yr bin is overkill: keep ~20 points per smoothing width.
+        step = max(1, int(args.smooth_myr * 1e6 / dt_yr / 20))
+        sl = slice(None, None, step)
+        z = age_to_redshift(time_yr[sl])
+
+        csv_path = f"tde_rate_smoothed_{bin_tag}_{tag}.csv"
+        pd.DataFrame({
+            'time_yr': time_yr[sl], 'redshift': z,
+            'mean_rate_msunyr': mean[sl], 'band_lo_msunyr': lo[sl], 'band_hi_msunyr': hi[sl],
+            **{f'rate_{h}_msunyr': smoothed[i][sl] for i, h in enumerate(used_ids)},
+        }).to_csv(csv_path, index=False)
+        print(f"Saved {csv_path}")
+
+        ax.fill_between(z, lo[sl], hi[sl], color=color, alpha=0.2, lw=0)
+        ax.plot(z, mean[sl], color=color, lw=2, label=f"{label} (mean of {len(used_ids)})")
+        all_hi.append((z, hi[sl]))
+
+    if not all_hi:
+        raise SystemExit("No tde_rates files found for any bin -- check --data-dir and --alpha.")
+
     ax.set_xlabel('Redshift')
     ax.set_ylabel(r'TDE Rate ($M_\odot$/yr)')
     ax.set_xlim([Z_MAX, 0])  # redshift decreases left-to-right: time flows forward
     if args.logy:
         ax.set_yscale('log')
-        positive = hi[sl][(z <= Z_MAX) & (hi[sl] > 0)]
+        positive = np.concatenate([h[(z <= Z_MAX) & (h > 0)] for z, h in all_hi])
         if positive.size:
             ax.set_ylim(bottom=max(positive.max() * 1e-4, positive.min()))
     else:
         ax.set_ylim(bottom=0)
-    ax.set_title(rf'$\alpha = {args.alpha}$, {args.smooth_myr:g} Myr {args.kernel} smoothing')
-    ax.legend(frameon=False)
+    ax.set_title(rf'$\alpha = {args.alpha}$, {args.smooth_myr:g} Myr {args.kernel} smoothing'
+                 f'\n(shaded: {band_desc})', fontsize=11)
+    ax.legend(frameon=False, title="Halo mass")
     plt.tight_layout()
 
-    output = args.output or f"tde_rate_smoothed_{tag}.png"
+    output = args.output or f"tde_rate_smoothed_massbins_{tag}.png"
     plt.savefig(output, dpi=200)
-    print(f"Saved {output}")
+    print(f"\nSaved {output}")
     if not args.no_show:
         plt.show()
 
