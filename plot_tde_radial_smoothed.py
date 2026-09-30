@@ -68,6 +68,18 @@ DEFAULT_MASS_BINS = [
 EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
 Z_MAX = 20
 
+# Base font size (pt) for every label, tick and legend; titles/labels scale from it.
+FONT_SIZE = 15
+plt.rcParams.update({
+    "font.size": FONT_SIZE,
+    "axes.titlesize": FONT_SIZE + 1,
+    "axes.labelsize": FONT_SIZE + 1,
+    "xtick.labelsize": FONT_SIZE - 1,
+    "ytick.labelsize": FONT_SIZE - 1,
+    "legend.fontsize": FONT_SIZE,
+    "legend.title_fontsize": FONT_SIZE - 1,
+})
+
 
 def age_to_redshift(t_yr):
     z_grid = np.concatenate([[0.0], np.logspace(-4, np.log10(1000), 4000)])
@@ -220,7 +232,7 @@ def main():
 
     ncol = min(len(windows), 3)
     nrow = int(np.ceil(len(windows) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.8 * nrow),
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.4 * ncol, 4.6 * nrow),
                              sharex=True, sharey=True, squeeze=False)
     axes_flat = axes.ravel()
     rows, ymax, ypos = [], 0.0, []
@@ -228,7 +240,6 @@ def main():
     for w, (z_hi, z_lo) in enumerate(windows):
         ax = axes_flat[w]
         t_lo, t_hi = redshift_to_age_yr(z_hi), redshift_to_age_yr(z_lo)
-        notes = []
         for tag, label, color, (time_yr, e, halos) in loaded:
             if not np.allclose(e, edges0):
                 raise SystemExit(f"bin {tag}: separation grid differs from the first bin's")
@@ -243,25 +254,18 @@ def main():
                     label=f"{label} ({prof.shape[0]})" if w == 0 else None)
             ymax = max(ymax, hi.max())
             ypos.append(hi[hi > 0])
-            if np.isfinite(fc).any():
-                notes.append((color, np.nanmean(fc)))
             for k in range(len(centers)):
                 rows.append({"bin": tag, "z_hi": z_hi, "z_lo": z_lo, "r_kpc": centers[k],
                              "mean": mean[k], "band_lo": lo[k], "band_hi": hi[k],
                              "n_halos": prof.shape[0],
                              "center_frac_mean": np.nanmean(fc) if np.isfinite(fc).any() else np.nan})
-        ax.set_title(rf"${z_lo:g} < z < {z_hi:g}$", fontsize=11)
+        ax.set_title(rf"${z_lo:g} < z < {z_hi:g}$")
         ax.set_xscale("log")
         ax.grid(True, which="major", color="0.9", lw=0.6)
         ax.set_axisbelow(True)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
-        if notes:
-            ax.text(0.03, 0.97, "at center:", transform=ax.transAxes, va="top", fontsize=8, color="0.35")
-            for i, (c, f) in enumerate(notes):
-                ax.text(0.03, 0.97 - 0.07 * (i + 1), f"{f:.0%}", transform=ax.transAxes,
-                        va="top", fontsize=8, color=c)
-        else:
+        if not ax.lines:
             ax.text(0.5, 0.5, "no TDEs", transform=ax.transAxes, ha="center", color="0.5")
     for ax in axes_flat[len(windows):]:
         ax.set_visible(False)
@@ -280,7 +284,7 @@ def main():
         axes_flat[0].set_ylim(max(pos.max() * 1e-4, pos.min()), pos.max() * 2)
     else:
         axes_flat[0].set_ylim(0, ymax * 1.05 if ymax > 0 else 1)
-    top = 0.84 if nrow == 1 else 0.91
+    top = 0.80 if nrow == 1 else 0.89
     fig.tight_layout(rect=(0, 0, 1, top))
     fig.legend(frameon=False, loc="lower center", ncol=len(loaded), bbox_to_anchor=(0.5, top),
                title=(rf"Halo mass (N halos)   ·   $\alpha={args.alpha}$, {args.smooth_dex:g} dex "
@@ -294,7 +298,7 @@ def main():
     print(f"\nSaved {out} and {csv}")
 
     if args.evolution:
-        fig2, ax2 = plt.subplots(figsize=(8, 5))
+        fig2, ax2 = plt.subplots(figsize=(9, 6))
         for tag, label, color, (time_yr, e, halos) in loaded:
             dt = np.median(np.diff(time_yr))
             k = max(1, int(round(args.smooth_myr * 1e6 / dt / 10)))  # coarse step = smooth/10
@@ -319,7 +323,7 @@ def main():
         ax2.set_xlabel("Redshift")
         ax2.set_ylabel("TDE-weighted separation from central [kpc]")
         ax2.set_title(f"median (line) and 16–84th percentile (shaded) of the bin-mean distribution; "
-                      f"{args.smooth_myr:g} Myr smoothing", fontsize=9, color="0.3")
+                      f"{args.smooth_myr:g} Myr smoothing", fontsize=FONT_SIZE - 3, color="0.3")
         ax2.grid(True, color="0.9", lw=0.6)
         for s in ("top", "right"):
             ax2.spines[s].set_visible(False)
