@@ -151,7 +151,7 @@ def main():
         mass_bins = DEFAULT_MASS_BINS
 
     tag = f"alpha{args.alpha}_{args.smooth_myr:g}Myr"
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 7))
     band_desc = None
     all_hi = []  # (z, hi) per bin, for setting log y-limits
 
@@ -184,14 +184,16 @@ def main():
         print(f"Saved {csv_path}")
 
         ax.fill_between(z, lo[sl], hi[sl], color=color, alpha=0.2, lw=0)
-        ax.plot(z, mean[sl], color=color, lw=2, label=f"{label} (mean of {len(used_ids)})")
+        # ax.plot(z, mean[sl], color=color, lw=2, label=f"{label} (mean of {len(used_ids)})")
+        ax.plot(z, mean[sl], color=color, lw=2, label=f"{label}")
         all_hi.append((z, hi[sl]))
 
     if not all_hi:
         raise SystemExit("No tde_rates files found for any bin -- check --data-dir and --alpha.")
 
-    ax.set_xlabel('Redshift')
-    ax.set_ylabel(r'TDE Rate ($M_\odot$/yr)')
+    ax.set_xlabel('Redshift', fontsize=20)
+    ax.set_ylabel(r'TDE Rate ($M_\odot$/yr)', fontsize=20)
+    ax.tick_params(axis='both', which='major', labelsize=20)
     ax.set_xlim([Z_MAX, 0])  # redshift decreases left-to-right: time flows forward
     if args.logy:
         ax.set_yscale('log')
@@ -201,8 +203,8 @@ def main():
     else:
         ax.set_ylim(bottom=0)
     ax.set_title(rf'$\alpha = {args.alpha}$, {args.smooth_myr:g} Myr {args.kernel} smoothing'
-                 f'\n(shaded: {band_desc})', fontsize=11)
-    ax.legend(frameon=False, title="Halo mass")
+                 f'\n(shaded: {band_desc})', fontsize=16)
+    ax.legend(frameon=False, title="Halo mass", fontsize=16, loc = "upper right")
     plt.tight_layout()
 
     output = args.output or f"tde_rate_smoothed_massbins_{tag}.png"
