@@ -17,8 +17,9 @@ reading and plotting every single 1e5-yr-resolution point.
 
 Pass --cluster-csv (the cluster_output_<ID>_snap<N>.csv table imbh.py's
 save_cluster_output writes) to color each track by its cluster's fate --
-either whether it actually reached the center ('status': inspiraled vs
-outskirts, --color-by status, the default once --cluster-csv is given) or
+either its final status ('status': inspiraled, outskirts, escaped or pinned
+-- each its own color, smaller groups drawn on top with boosted alpha, see
+--no-boost-rare; --color-by status, the default once --cluster-csv is given) or
 how far it still is from its FINAL host's own virial radius at the traced
 snapshot ('final_r_over_rvir', --color-by r_over_rvir). This is what lets
 you tell apart clusters that are still just falling in for the first time
@@ -173,9 +174,26 @@ def load_host_rvir_history(tree_path, snap_redshift_path, box_size):
     return navigator, ages_gyr, r200_kpc
 
 
-STATUS_COLORS = {"inspiraled": "indianred", "outskirts": "steelblue"}
+# Every status imbh.py can write: 'inspiraled', 'outskirts', 'escaped' (beyond
+# 3 R200 of the z=0 host at the last snapshot), 'pinned' (born inside r_stop,
+# assumed to stay at its host's center -- see imbh._trace_pinned_cluster).
+STATUS_COLORS = {"inspiraled": "indianred", "outskirts": "steelblue",
+                 "escaped": "#E69F00", "pinned": "#009E73"}
+# Fallback colors for any status not listed above (never silently gray).
+EXTRA_STATUS_COLORS = ["#CC79A7", "#56B4E9", "#8C564B", "#7F7F7F"]
 TDE_CONTRIBUTOR_COLORS = {"TDE contributor": "darkorange", "not a TDE contributor": "steelblue"}
 DEFAULT_COLOR = "gray"
+# Cap on the per-group alpha after the rare-group boost (see --no-boost-rare).
+MAX_GROUP_ALPHA = 0.9
+
+
+def status_color(status, assigned):
+    """Color for a status: STATUS_COLORS, else a stable fallback color per unknown status."""
+    if status in STATUS_COLORS:
+        return STATUS_COLORS[status]
+    if status not in assigned:
+        assigned[status] = EXTRA_STATUS_COLORS[len(assigned) % len(EXTRA_STATUS_COLORS)]
+    return assigned[status]
 
 
 def main():
@@ -239,6 +257,13 @@ def main():
                          help="Per-line transparency (default: 0.15) -- with many overlapping tracks, "
                               "low alpha is what actually makes the DENSITY of trajectories visible, "
                               "rather than a solid mass of overlapping opaque lines.")
+    parser.add_argument("--no-boost-rare", action="store_true",
+                         help="For --color-by status / tde_contributor, tracks are drawn one group at a "
+                              "time, largest group first (so smaller groups sit on top), and each "
+                              "group's alpha is raised by sqrt(N_largest / N_group), capped at "
+                              f"{MAX_GROUP_ALPHA}, so a handful of e.g. inspiraled tracks isn't buried "
+                              "under hundreds of outskirts ones. This flag keeps the draw order but "
+                              "uses --alpha for every group.")
     parser.add_argument("--r-over-rvir-cap", type=float, default=None,
                          help="Clip final_r_over_rvir at this value for the --color-by r_over_rvir "
                               "colormap (default: the 98th percentile of the plotted clusters' own "
@@ -334,6 +359,12 @@ def main():
     n_no_formation_z = 0
     status_counts = {}
     tde_contributor_counts = {}
+    extra_status_colors = {}
+    # Categorical modes (status / tde_contributor) collect tracks per group
+    # first and draw them group by group afterwards (see --no-boost-rare);
+    # group -> list of (t, r), and group -> color.
+    groups, group_colors = {}, {}
+    categorical = color_by in ("status", "tde_contributor")
     for path in paths:
         t, r = load_sparse_track(path, args.max_points_per_track)
         if t is None:
@@ -351,37 +382,61 @@ def main():
                 continue
             t = t + navigator.cosmo.age(z_form).to(u.Gyr).value
 
+        group = None
         if color_by == "none":
             color = "steelblue"
         elif color_by == "tde_contributor":
             label = "TDE contributor" if os.path.basename(path) in contributors else "not a TDE contributor"
             color = TDE_CONTRIBUTOR_COLORS[label]
             tde_contributor_counts[label] = tde_contributor_counts.get(label, 0) + 1
+            group = label
         elif row is None:
             color = DEFAULT_COLOR
             n_unmatched += 1
+            group = "no match in --cluster-csv"
         elif color_by == "status":
-            color = STATUS_COLORS.get(row["status"], DEFAULT_COLOR)
-            status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+            status = str(row["status"])
+            color = status_color(status, extra_status_colors)
+            status_counts[status] = status_counts.get(status, 0) + 1
+            group = status
         else:  # r_over_rvir
             val = row.get("final_r_over_rvir", np.nan)
             color = cmap(norm(np.clip(val, 0, norm.vmax))) if np.isfinite(val) else DEFAULT_COLOR
 
-        ax.plot(t, r, color=color, alpha=args.alpha, linewidth=0.8)
+        if categorical:
+            groups.setdefault(group, []).append((t, r))
+            group_colors[group] = color
+        else:
+            ax.plot(t, r, color=color, alpha=args.alpha, linewidth=0.8)
         n_plotted += 1
 
     if n_plotted == 0:
         sys.exit("No usable track files -- nothing to plot.")
 
+    # Draw categorical groups largest-first so smaller groups end up on top,
+    # boosting the alpha of smaller groups (unless --no-boost-rare) so a few
+    # tracks of a rare fate stay visible under many of a common one.
     legend_handles = []
+    if categorical:
+        order = sorted(groups, key=lambda g: len(groups[g]), reverse=True)
+        n_largest = len(groups[order[0]])
+        for z, g in enumerate(order):
+            n_g = len(groups[g])
+            a = args.alpha if args.no_boost_rare else min(MAX_GROUP_ALPHA,
+                                                          args.alpha * np.sqrt(n_largest / n_g))
+            a = max(a, args.alpha)
+            for t, r in groups[g]:
+                ax.plot(t, r, color=group_colors[g], alpha=a, linewidth=0.8, zorder=2 + z)
+        # legend: fixed status order first, then anything else, each with its count
+        known = list(STATUS_COLORS) + list(TDE_CONTRIBUTOR_COLORS)
+        for g in sorted(groups, key=lambda g: (known.index(g) if g in known else len(known), g)):
+            legend_handles.append(Line2D([0], [0], color=group_colors[g], lw=2,
+                                         label=f"{g} ({len(groups[g])})"))
+
     if color_by == "status":
-        legend_handles += [Line2D([0], [0], color=c, lw=2, label=label) for label, c in STATUS_COLORS.items()]
-        if n_unmatched:
-            legend_handles.append(Line2D([0], [0], color=DEFAULT_COLOR, lw=2, label="no match in --cluster-csv"))
         print("Colored by status: " + ", ".join(f"{k}={v}" for k, v in status_counts.items())
               + (f", unmatched={n_unmatched}" if n_unmatched else ""))
     elif color_by == "tde_contributor":
-        legend_handles += [Line2D([0], [0], color=c, lw=2, label=label) for label, c in TDE_CONTRIBUTOR_COLORS.items()]
         print("Colored by TDE contribution: " + ", ".join(f"{k}={v}" for k, v in tde_contributor_counts.items()))
     elif color_by == "r_over_rvir":
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
