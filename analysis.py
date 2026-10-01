@@ -392,6 +392,15 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                             == tde_rate_array_msunyr).
               'clipped_msun' mass (rate x dt) that fell outside edges_kpc
                             and was clipped into the first/last bin.
+              'hist_escaped_msunyr', 'no_track_escaped_msunyr',
+              'clipped_escaped_msun': the same three quantities restricted
+                            to clusters with status == 'escaped' (already
+                            included in the totals above -- subtract them to
+                            exclude escaped clusters; see plot_tde_*_smoothed.py
+                            --escaped). Escaped clusters never inspiral, so
+                            they have no 'inspiraled' share.
+              'rate_escaped_msunyr' (n_t,) the escaped clusters' share of
+                            tde_rate_array_msunyr.
 
         mean_radius_kpc: at each time bin, the AVERAGE separation from the
             central/root galaxy across every cluster that has a TDE burst
@@ -438,6 +447,16 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
     radial_no_track = np.zeros(n_bins)
     radial_clipped_msun = 0.0
     has_status_col = 'status' in df.columns
+    # escaped clusters' share of every output above (status == 'escaped': beyond
+    # 3 R200 of the z=0 host at the last snapshot, see imbh.py), so the plotting
+    # scripts can exclude them or show them alone
+    rate_escaped = np.zeros(n_bins)
+    radial_hist_escaped = np.zeros((n_bins, n_rbins), dtype=np.float32)
+    radial_no_track_escaped = np.zeros(n_bins)
+    radial_clipped_escaped_msun = 0.0
+    if not has_status_col:
+        print("NOTE: no 'status' column -- escaped clusters can't be identified; their "
+              "share of the outputs will be zero.")
     # Per-cluster formation redshift drawn by imbh.py (--formation-time-draw);
     # older outputs only have the snapshot-quantized subhalo value.
     if 'cluster_formation_redshift' in df.columns:
@@ -464,8 +483,11 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                     if isinstance(track_path, str) and track_path:
                         track_t_gyr, track_r_kpc = _load_radius_track(track_path, track_dir, track_cache)
 
+                is_escaped = has_status_col and df['status'][clusteridx] == 'escaped'
+
                 contributing_rows.append({
                     'row_index': clusteridx,
+                    'status': df['status'][clusteridx] if has_status_col else None,
                     'radius_track_path': df['radius_track_path'][clusteridx] if has_track_col else None,
                     'IMBH_mass_msun': df['IMBH_mass_msun'][clusteridx],
                     'total_mass_lost_msun': float(np.sum(mass_lost_bins)),
@@ -479,9 +501,13 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                     tde_rate_array_msunyr[j_start:k_end+1] += rate
                     mass_trelax_array_msun[k_end+1] += mass
                     rate_msunyr = float(mass_lost_bins[binidx] / t_relax_bin[binidx]) / 1e9
+                    if is_escaped:
+                        rate_escaped[j_start:k_end+1] += rate_msunyr
 
                     if track_t_gyr is None and k_end >= j_start:
                         radial_no_track[j_start:k_end+1] += rate_msunyr
+                        if is_escaped:
+                            radial_no_track_escaped[j_start:k_end+1] += rate_msunyr
 
                     if track_t_gyr is not None and k_end >= j_start:
                         # cosmic time (Gyr) of every bin in THIS burst -> time
@@ -512,6 +538,9 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                         radial_clipped_msun += n_out * rate_msunyr * resolution
                         ridx = np.clip(ridx, 0, n_rbins - 1)
                         np.add.at(radial_hist, (tbins[in_track], ridx), rate_msunyr)
+                        if is_escaped:
+                            radial_clipped_escaped_msun += n_out * rate_msunyr * resolution
+                            np.add.at(radial_hist_escaped, (tbins[in_track], ridx), rate_msunyr)
 
     with np.errstate(invalid='ignore'):
         mean_radius_kpc = np.where(radius_count > 0, radius_sum_kpc / np.maximum(radius_count, 1), np.nan)
@@ -522,6 +551,10 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
         'inspiraled_msunyr': radial_inspiraled,
         'no_track_msunyr': radial_no_track,
         'clipped_msun': radial_clipped_msun,
+        'hist_escaped_msunyr': radial_hist_escaped,
+        'no_track_escaped_msunyr': radial_no_track_escaped,
+        'clipped_escaped_msun': radial_clipped_escaped_msun,
+        'rate_escaped_msunyr': rate_escaped,
     }
     return (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc, radius_count,
             contributing_rows, radial)
@@ -589,6 +622,8 @@ def main():
         'mass_trelax_array_msun': mass_trelax_array_msun[:-2],
         'mean_radius_kpc': mean_radius_kpc[:-2],
         'n_clusters_with_tde': n_clusters_with_tde[:-2],
+        # escaped clusters' share of tde_rate_array_msunyr (already included in it)
+        'tde_rate_escaped_msunyr': radial['rate_escaped_msunyr'][:-2],
     })
 
     rates_path = os.path.join(args.output_dir, f'tde_rates_{tag}.csv')
@@ -607,6 +642,9 @@ def main():
         inspiraled_msunyr=radial['inspiraled_msunyr'][:-2],
         no_track_msunyr=radial['no_track_msunyr'][:-2],
         clipped_msun=radial['clipped_msun'],
+        hist_escaped_msunyr=radial['hist_escaped_msunyr'][:-2],
+        no_track_escaped_msunyr=radial['no_track_escaped_msunyr'][:-2],
+        clipped_escaped_msun=radial['clipped_escaped_msun'],
         subhalo_id=subhalo_id, alpha=float(args.alpha),
     )
     dt_yr = 1e5
@@ -617,6 +655,9 @@ def main():
           f"inspiral (at center), {parts['no_track_msunyr']:.3g} with no radius track; "
           f"{radial['clipped_msun']:.3g} clipped into the edge bins of "
           f"[{args.r_min_kpc:g}, {args.r_max_kpc:g}] kpc.")
+    esc = float(np.sum(radial['rate_escaped_msunyr'])) * dt_yr
+    print(f"Of that, {esc:.3g} Msun ({esc / tot:.1%}) came from escaped clusters." if tot > 0
+          else "No mass lost.")
 
     # Sidecar file: which clusters actually contributed at least one
     # mass-loss bin to the TDE rate above (see run_clusters' own

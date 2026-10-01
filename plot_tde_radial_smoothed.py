@@ -43,6 +43,9 @@ Mass bins default to DEFAULT_MASS_BINS; override with one --bin per bin:
     # different redshift windows, shape only, plus the median-vs-z figure
     python plot_tde_radial_smoothed.py --z-windows 20,12,9,7,0 --normalize --evolution
 
+    # without escaped clusters, or only them (-> *_noescaped.png / *_escapedonly.png)
+    python plot_tde_radial_smoothed.py --escaped exclude
+
 Observational runs: pass the same flags as submit_halos.pl / submit_analysis.pl.
 --data-dir stays the base output directory; the run's analysis<suffix>/ folder
 is found automatically and every output file name gets the same suffix, so the
@@ -56,7 +59,8 @@ default-mode plots are never overwritten:
 import argparse
 import os
 
-from run_naming import add_run_args, run_suffix, analysis_dir, run_description
+from run_naming import (add_run_args, run_suffix, analysis_dir, run_description,
+                        add_escaped_arg, escaped_suffix, escaped_description)
 
 import numpy as np
 import pandas as pd
@@ -103,8 +107,36 @@ def redshift_to_age_yr(z):
     return cosmo.age(z).to(u.yr).value
 
 
-def load_bin(data_dir, halo_ids, alpha):
-    """Returns (time_yr, edges_kpc, halos) with halos = list of (id, npz dict), or None."""
+def select_escaped(d, escaped, path):
+    """
+    Restrict one halo's npz dict to the --escaped selection, in place:
+    'exclude' subtracts the escaped clusters' share, 'only' keeps just it.
+    Escaped clusters never inspiral, so their 'at center' share is zero.
+    """
+    if escaped == "include":
+        return d
+    need = ("hist_escaped_msunyr", "no_track_escaped_msunyr", "clipped_escaped_msun")
+    if any(k not in d for k in need):
+        raise SystemExit(f"{path} has no escaped-cluster arrays -- re-run analysis.py (with the "
+                         f"escaped split) to use --escaped {escaped}.")
+    if escaped == "exclude":
+        # clip: float32 round-off in total - escaped can leave tiny negatives
+        d["hist_msunyr"] = np.clip(d["hist_msunyr"].astype(float) - d["hist_escaped_msunyr"], 0.0, None)
+        d["no_track_msunyr"] = np.clip(d["no_track_msunyr"] - d["no_track_escaped_msunyr"], 0.0, None)
+        d["clipped_msun"] = max(float(d["clipped_msun"]) - float(d["clipped_escaped_msun"]), 0.0)
+    else:  # only
+        d["hist_msunyr"] = d["hist_escaped_msunyr"].astype(float)
+        d["no_track_msunyr"] = d["no_track_escaped_msunyr"]
+        d["inspiraled_msunyr"] = np.zeros_like(d["inspiraled_msunyr"])
+        d["clipped_msun"] = float(d["clipped_escaped_msun"])
+    return d
+
+
+def load_bin(data_dir, halo_ids, alpha, escaped="include"):
+    """
+    Returns (time_yr, edges_kpc, halos) with halos = list of (id, npz dict), or None.
+    escaped: 'include' / 'exclude' / 'only' -- see --escaped and select_escaped.
+    """
     time_yr = edges = None
     halos = []
     for hid in halo_ids:
@@ -112,7 +144,7 @@ def load_bin(data_dir, halo_ids, alpha):
         if not os.path.exists(path):
             print(f"  WARNING: {path} not found, skipping halo {hid}")
             continue
-        d = dict(np.load(path))
+        d = select_escaped(dict(np.load(path)), escaped, path)
         if edges is None:
             time_yr, edges = d["time_yr"], d["edges_kpc"]
         else:
@@ -212,6 +244,7 @@ def main():
     p.add_argument("--output", default=None)
     p.add_argument("--no-show", action="store_true")
     add_run_args(p)
+    add_escaped_arg(p)
     args = p.parse_args()
 
     suffix = run_suffix(args)
@@ -219,6 +252,10 @@ def main():
     run_desc = run_description(args)
     print(f"Reading analysis outputs from {data_dir}"
           + (f"  [{run_desc}]" if run_desc else "  [default mode]"))
+    # run + escaped-selection text for the titles ('' if neither applies)
+    run_desc = "; ".join(x for x in (run_desc, escaped_description(args)) if x)
+    if args.escaped != "include":
+        print(f"Escaped clusters: {args.escaped}")
 
     if args.bin:
         mass_bins = []
@@ -238,7 +275,7 @@ def main():
     loaded = []
     for tag, label, color, ids in mass_bins:
         print(f"\n[{tag}]")
-        res = load_bin(data_dir, ids, args.alpha)
+        res = load_bin(data_dir, ids, args.alpha, args.escaped)
         if res is None:
             print(f"  WARNING: no files for bin {tag}; skipping it")
             continue
@@ -308,13 +345,16 @@ def main():
     else:
         axes_flat[0].set_ylim(0, ymax * 1.05 if ymax > 0 else 1)
     top = 0.80 if nrow == 1 else 0.89
+    if run_desc:
+        # one more legend-title line above the panels (run / escaped selection)
+        top -= 0.08 if nrow == 1 else 0.045
     fig.tight_layout(rect=(0, 0, 1, top))
     fig.legend(frameon=False, loc="lower center", ncol=len(loaded), bbox_to_anchor=(0.5, top),
                title=(rf"Halo mass (N halos)   ·   $\alpha={args.alpha}$, {args.smooth_dex:g} dex "
                       f"smoothing, shaded: {BAND_DESC[args.band]}"
                       + (f"\n{run_desc}" if run_desc else "")))
 
-    tagstr = f"alpha{args.alpha}" + ("_norm" if args.normalize else "") + suffix
+    tagstr = f"alpha{args.alpha}" + ("_norm" if args.normalize else "") + suffix + escaped_suffix(args)
     out = args.output or f"tde_radial_massbins_{tagstr}.png"
     fig.savefig(out, dpi=200)
     csv = os.path.splitext(out)[0] + ".csv"

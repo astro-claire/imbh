@@ -27,6 +27,8 @@ one --bin per bin, giving a label and the subhalo IDs:
 Example:
     python plot_tde_rates_smoothed.py --data-dir /u/scratch/c/clairewi/imbh-output
     python plot_tde_rates_smoothed.py --smooth-myr 100 --band percentile --logy
+    python plot_tde_rates_smoothed.py --escaped exclude   # drop escaped clusters (-> *_noescaped.png)
+    python plot_tde_rates_smoothed.py --escaped only      # escaped clusters alone (-> *_escapedonly.png)
 
 Observational runs: pass the same flags as submit_halos.pl / submit_analysis.pl.
 --data-dir stays the base output directory; the run's analysis<suffix>/ folder
@@ -40,7 +42,8 @@ default-mode plots are never overwritten:
 import argparse
 import os
 
-from run_naming import add_run_args, run_suffix, analysis_dir, run_description
+from run_naming import (add_run_args, run_suffix, analysis_dir, run_description,
+                        add_escaped_arg, escaped_suffix, escaped_description)
 
 import numpy as np
 import pandas as pd
@@ -79,12 +82,15 @@ plt.rcParams.update({
 })
 
 
-def load_rates(data_dir, halo_ids, alpha):
+def load_rates(data_dir, halo_ids, alpha, escaped="include"):
     """
     Returns (time_yr, rates, used_ids): rates has shape (n_halos, n_times).
     All halos from analysis.py share the same time grid; if one doesn't,
     it's interpolated onto the first halo's grid. Returns None if none of the
     halos' files exist.
+
+    escaped: 'include' (total rate), 'exclude' (total minus the escaped
+    clusters' share) or 'only' (just the escaped share) -- see --escaped.
     """
     time_yr, rates, used_ids = None, [], []
     for halo_id in halo_ids:
@@ -95,6 +101,13 @@ def load_rates(data_dir, halo_ids, alpha):
         df = pd.read_csv(path)
         t = df['time'].to_numpy(dtype=float)
         r = df['tde_rate_array_msunyr'].to_numpy(dtype=float)
+        if escaped != "include":
+            if 'tde_rate_escaped_msunyr' not in df.columns:
+                raise SystemExit(f"{path} has no tde_rate_escaped_msunyr column -- re-run "
+                                 f"analysis.py (with the escaped split) to use --escaped {escaped}.")
+            r_esc = df['tde_rate_escaped_msunyr'].to_numpy(dtype=float)
+            # clip: float round-off in total - escaped can leave tiny negatives
+            r = np.clip(r - r_esc, 0.0, None) if escaped == "exclude" else r_esc
         if time_yr is None:
             time_yr = t
         elif len(t) != len(time_yr) or not np.allclose(t, time_yr):
@@ -164,6 +177,7 @@ def main():
     parser.add_argument("--no-show", action="store_true",
                         help="Don't open an interactive window (e.g. on a cluster node).")
     add_run_args(parser)
+    add_escaped_arg(parser)
     args = parser.parse_args()
 
     suffix = run_suffix(args)
@@ -171,6 +185,10 @@ def main():
     run_desc = run_description(args)
     print(f"Reading analysis outputs from {data_dir}"
           + (f"  [{run_desc}]" if run_desc else "  [default mode]"))
+    # run + escaped-selection text for the title ('' if neither applies)
+    run_desc = "; ".join(x for x in (run_desc, escaped_description(args)) if x)
+    if args.escaped != "include":
+        print(f"Escaped clusters: {args.escaped}")
 
     if args.bin:
         mass_bins = []
@@ -183,14 +201,14 @@ def main():
     else:
         mass_bins = DEFAULT_MASS_BINS
 
-    tag = f"alpha{args.alpha}_{args.smooth_myr:g}Myr{suffix}"
+    tag = f"alpha{args.alpha}_{args.smooth_myr:g}Myr{suffix}{escaped_suffix(args)}"
     fig, ax = plt.subplots(figsize=(8, 7))
     band_desc = None
     all_hi = []  # (z, hi) per bin, for setting log y-limits
 
     for bin_tag, label, color, halo_ids in mass_bins:
         print(f"\n[{bin_tag}]")
-        loaded = load_rates(data_dir, halo_ids, args.alpha)
+        loaded = load_rates(data_dir, halo_ids, args.alpha, args.escaped)
         if loaded is None:
             print(f"WARNING: no tde_rates files found for bin {bin_tag}; skipping it")
             continue

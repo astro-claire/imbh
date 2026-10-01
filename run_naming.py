@@ -12,6 +12,9 @@ analysis.py outputs and tag their own figures/CSVs with it:
                 _host<host-mass-model>_boost<n-boost>][_<label>]
 
 KEEP IN SYNC with the naming block in submit_halos.pl and submit_analysis.pl.
+
+Also holds the plot-only --escaped selection (add_escaped_arg), whose suffix
+(_noescaped / _escapedonly) is appended to the plotting scripts' output names.
 """
 import os
 import re
@@ -68,6 +71,32 @@ def analysis_dir(data_dir, suffix):
         return sub
     print(f"NOTE: {sub} not found; looking for the analysis files in {data_dir} instead")
     return data_dir
+
+
+ESCAPED_MODES = ["include", "exclude", "only"]
+
+
+def add_escaped_arg(parser):
+    """--escaped include|exclude|only (needs analysis.py outputs that carry the escaped share)."""
+    parser.add_argument(
+        "--escaped", choices=ESCAPED_MODES, default="include",
+        help="Clusters with status 'escaped' (beyond 3 R200 of the z=0 host at the last "
+             "snapshot): include them (default), exclude them, or plot only them. "
+             "exclude/only need analysis.py outputs written after the escaped split was "
+             "added (tde_rate_escaped_msunyr / hist_escaped_msunyr); re-run analysis.py "
+             "if they're missing.")
+    return parser
+
+
+def escaped_suffix(args):
+    """File-name suffix for the --escaped selection ('' for include)."""
+    return {"include": "", "exclude": "_noescaped", "only": "_escapedonly"}[args.escaped]
+
+
+def escaped_description(args):
+    """Title text for the --escaped selection ('' for include)."""
+    return {"include": "", "exclude": "escaped clusters excluded",
+            "only": "escaped clusters only"}[args.escaped]
 
 
 def run_description(args):
