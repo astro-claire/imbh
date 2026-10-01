@@ -27,9 +27,20 @@ one --bin per bin, giving a label and the subhalo IDs:
 Example:
     python plot_tde_rates_smoothed.py --data-dir /u/scratch/c/clairewi/imbh-output
     python plot_tde_rates_smoothed.py --smooth-myr 100 --band percentile --logy
+
+Observational runs: pass the same flags as submit_halos.pl / submit_analysis.pl.
+--data-dir stays the base output directory; the run's analysis<suffix>/ folder
+is found automatically and every output file name gets the same suffix, so the
+default-mode plots are never overwritten:
+
+    python plot_tde_rates_smoothed.py --data-dir /u/scratch/c/clairewi/imbh-output \\
+        --mode observational --n-relation bf20_seed
+    -> tde_rate_smoothed_massbins_alpha1.2_50Myr_obs_bf20_seed_gclf_brown_gnedin21_analytic_hostown_boost1.0.png
 """
 import argparse
 import os
+
+from run_naming import add_run_args, run_suffix, analysis_dir, run_description
 
 import numpy as np
 import pandas as pd
@@ -129,7 +140,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-dir", default=".",
-                        help="Directory holding the tde_rates_<ID>_alpha<alpha>.csv files.")
+                        help="Base output directory. Default-mode runs: holds the "
+                             "tde_rates_<ID>_alpha<alpha>.csv files. Observational/labelled "
+                             "runs: their files are read from <data-dir>/analysis<suffix>/ "
+                             "(see the run selection flags).")
     parser.add_argument("--alpha", type=float, default=1.2,
                         help="Power-law index the rates were computed with (default: 1.2).")
     parser.add_argument("--bin", nargs="+", action="append", metavar=("LABEL", "ID"),
@@ -146,10 +160,17 @@ def main():
     parser.add_argument("--logy", action="store_true", help="Log-scale y axis.")
     parser.add_argument("--output", default=None,
                         help="Output image path (default: "
-                             "tde_rate_smoothed_massbins_alpha<alpha>_<smooth>Myr.png).")
+                             "tde_rate_smoothed_massbins_alpha<alpha>_<smooth>Myr<suffix>.png).")
     parser.add_argument("--no-show", action="store_true",
                         help="Don't open an interactive window (e.g. on a cluster node).")
+    add_run_args(parser)
     args = parser.parse_args()
+
+    suffix = run_suffix(args)
+    data_dir = analysis_dir(args.data_dir, suffix)
+    run_desc = run_description(args)
+    print(f"Reading analysis outputs from {data_dir}"
+          + (f"  [{run_desc}]" if run_desc else "  [default mode]"))
 
     if args.bin:
         mass_bins = []
@@ -162,14 +183,14 @@ def main():
     else:
         mass_bins = DEFAULT_MASS_BINS
 
-    tag = f"alpha{args.alpha}_{args.smooth_myr:g}Myr"
+    tag = f"alpha{args.alpha}_{args.smooth_myr:g}Myr{suffix}"
     fig, ax = plt.subplots(figsize=(8, 7))
     band_desc = None
     all_hi = []  # (z, hi) per bin, for setting log y-limits
 
     for bin_tag, label, color, halo_ids in mass_bins:
         print(f"\n[{bin_tag}]")
-        loaded = load_rates(args.data_dir, halo_ids, args.alpha)
+        loaded = load_rates(data_dir, halo_ids, args.alpha)
         if loaded is None:
             print(f"WARNING: no tde_rates files found for bin {bin_tag}; skipping it")
             continue
@@ -201,7 +222,8 @@ def main():
         all_hi.append((z, hi[sl]))
 
     if not all_hi:
-        raise SystemExit("No tde_rates files found for any bin -- check --data-dir and --alpha.")
+        raise SystemExit(f"No tde_rates files found for any bin in {data_dir} -- check "
+                         "--data-dir, --alpha and the run selection flags.")
 
     ax.set_xlabel('Redshift', fontsize=20)
     ax.set_ylabel(r'TDE Rate ($M_\odot$/yr)', fontsize=20)
@@ -215,7 +237,8 @@ def main():
     else:
         ax.set_ylim(bottom=0)
     ax.set_title(rf'$\alpha = {args.alpha}$, {args.smooth_myr:g} Myr {args.kernel} smoothing'
-                 f'\n(shaded: {band_desc})', fontsize=16)
+                 f'\n(shaded: {band_desc})'
+                 + (f'\n{run_desc}' if run_desc else ''), fontsize=16 if not run_desc else 13)
     ax.legend(frameon=False, title="Halo mass", fontsize=16, loc = "upper right")
     plt.tight_layout()
 

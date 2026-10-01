@@ -42,9 +42,21 @@ Mass bins default to DEFAULT_MASS_BINS; override with one --bin per bin:
 
     # different redshift windows, shape only, plus the median-vs-z figure
     python plot_tde_radial_smoothed.py --z-windows 20,12,9,7,0 --normalize --evolution
+
+Observational runs: pass the same flags as submit_halos.pl / submit_analysis.pl.
+--data-dir stays the base output directory; the run's analysis<suffix>/ folder
+is found automatically and every output file name gets the same suffix, so the
+default-mode plots are never overwritten:
+
+    python plot_tde_radial_smoothed.py --data-dir /u/scratch/c/clairewi/imbh-output --evolution \\
+        --mode observational --n-relation bf20_seed
+    -> tde_radial_massbins_alpha1.2_obs_bf20_seed_gclf_brown_gnedin21_analytic_hostown_boost1.0.png
+       (+ .csv and _vs_z.png)
 """
 import argparse
 import os
+
+from run_naming import add_run_args, run_suffix, analysis_dir, run_description
 
 import numpy as np
 import pandas as pd
@@ -173,7 +185,11 @@ def window_profiles(time_yr, halos, n_r, rebin, t_lo, t_hi, sigma_bins, dlog, no
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", default=".", help="Directory with tde_radial_<ID>_alpha<alpha>.npz files.")
+    p.add_argument("--data-dir", default=".",
+                   help="Base output directory. Default-mode runs: holds the "
+                        "tde_radial_<ID>_alpha<alpha>.npz files. Observational/labelled runs: "
+                        "their files are read from <data-dir>/analysis<suffix>/ (see the run "
+                        "selection flags).")
     p.add_argument("--alpha", type=float, default=1.2)
     p.add_argument("--bin", nargs="+", action="append", metavar=("LABEL", "ID"),
                    help="A mass bin: label then subhalo IDs. Repeat per bin.")
@@ -195,7 +211,14 @@ def main():
                    help="Time smoothing (boxcar, Myr) for --evolution (default: 50).")
     p.add_argument("--output", default=None)
     p.add_argument("--no-show", action="store_true")
+    add_run_args(p)
     args = p.parse_args()
+
+    suffix = run_suffix(args)
+    data_dir = analysis_dir(args.data_dir, suffix)
+    run_desc = run_description(args)
+    print(f"Reading analysis outputs from {data_dir}"
+          + (f"  [{run_desc}]" if run_desc else "  [default mode]"))
 
     if args.bin:
         mass_bins = []
@@ -215,14 +238,14 @@ def main():
     loaded = []
     for tag, label, color, ids in mass_bins:
         print(f"\n[{tag}]")
-        res = load_bin(args.data_dir, ids, args.alpha)
+        res = load_bin(data_dir, ids, args.alpha)
         if res is None:
             print(f"  WARNING: no files for bin {tag}; skipping it")
             continue
         loaded.append((tag, label, color, res))
     if not loaded:
-        raise SystemExit("No tde_radial files found -- check --data-dir / --alpha, and that "
-                         "analysis.py was re-run with the radial output.")
+        raise SystemExit(f"No tde_radial files found in {data_dir} -- check --data-dir / --alpha / "
+                         "the run selection flags, and that analysis.py was re-run with the radial output.")
 
     edges0 = loaded[0][3][1]
     edges, n_r = coarsen(edges0, args.rebin)
@@ -288,9 +311,10 @@ def main():
     fig.tight_layout(rect=(0, 0, 1, top))
     fig.legend(frameon=False, loc="lower center", ncol=len(loaded), bbox_to_anchor=(0.5, top),
                title=(rf"Halo mass (N halos)   ·   $\alpha={args.alpha}$, {args.smooth_dex:g} dex "
-                      f"smoothing, shaded: {BAND_DESC[args.band]}"))
+                      f"smoothing, shaded: {BAND_DESC[args.band]}"
+                      + (f"\n{run_desc}" if run_desc else "")))
 
-    tagstr = f"alpha{args.alpha}" + ("_norm" if args.normalize else "")
+    tagstr = f"alpha{args.alpha}" + ("_norm" if args.normalize else "") + suffix
     out = args.output or f"tde_radial_massbins_{tagstr}.png"
     fig.savefig(out, dpi=200)
     csv = os.path.splitext(out)[0] + ".csv"
@@ -323,7 +347,8 @@ def main():
         ax2.set_xlabel("Redshift")
         ax2.set_ylabel("TDE-weighted separation from central [kpc]")
         ax2.set_title(f"median (line) and 16–84th percentile (shaded) of the bin-mean distribution; "
-                      f"{args.smooth_myr:g} Myr smoothing", fontsize=FONT_SIZE - 3, color="0.3")
+                      f"{args.smooth_myr:g} Myr smoothing" + (f"\n{run_desc}" if run_desc else ""),
+                      fontsize=FONT_SIZE - 3, color="0.3")
         ax2.grid(True, color="0.9", lw=0.6)
         for s in ("top", "right"):
             ax2.spines[s].set_visible(False)
