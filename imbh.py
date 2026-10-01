@@ -691,15 +691,20 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
     confine it. This is skipped when the current host is already ON the
     main branch (to avoid double-counting the same structure).
 
-    Each leg ALSO applies HUBBLE DRAG: in an expanding universe, a peculiar
-    velocity decays as v~1/a purely from cosmic expansion, with no force
-    needed (dv/dt = -H(t)*v for the relative velocity). This matters a lot
-    at high redshift, where H(z) is large -- without it, a large peculiar
-    velocity correctly recorded in the tree at high-z (real halos genuinely
-    have large physical peculiar velocities that early, simply because the
-    universe was so much more compact then) never decays the way it
-    physically should as the universe expands, and just persists,
-    essentially undamped, for the rest of cosmic time.
+    HUBBLE DRAG (dv/dt = -H(t)*v on the relative velocity) is currently
+    DISABLED -- commented out in dynamical_friction._rhs. It had been added
+    to damp large high-z relative velocities that actually came from a unit
+    bug (SubhaloVel divided by a in tree_navigator.relative_state). H(z) is
+    still computed and passed through each leg, so uncommenting that one
+    line in _rhs restores it.
+
+    ESCAPE AT THE OUTPUT SNAPSHOT: if the trace reaches target_age while the
+    current host has no further descendant (i.e. the output snapshot is the
+    tree's last snapshot and the host is the z=0 root), the final
+    separation is checked against final_escape_frac * R200 of that host --
+    beyond it the cluster is reported as 'escaped' (with its actual
+    final_r_over_rvir), otherwise 'outskirts'. When the output snapshot is
+    earlier than the tree's end, no escape check is applied, as before.
 
     Parameters:
         cluster_mass: astropy Quantity (mass)
@@ -893,6 +898,15 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         if remaining <= 0 * u.Gyr:
             r_over_rvir = (float(np.linalg.norm(r_vec.to(u.kpc).value)) / radius_kpc
                            if radius_kpc > 0 else np.nan)
+            # Reached the output time. If this host is the END of the tree
+            # (no descendant -- the output snapshot is the last snapshot and
+            # this is the z=0 root), apply the escape check here: the
+            # escape event inside integrate_orbit only exists on a leg that
+            # starts at the final host, and that leg is never integrated
+            # when target_age is exactly the last snapshot's age.
+            at_tree_end = navigator.step_forward(current_id)[0] is None
+            if at_tree_end and np.isfinite(r_over_rvir) and r_over_rvir > final_escape_frac:
+                return make_result('escaped', current_id, r_vec, v_vec, r_over_rvir, step)
             return make_result('outskirts', current_id, r_vec, v_vec, r_over_rvir, step)
 
         next_id, is_primary = navigator.step_forward(current_id)

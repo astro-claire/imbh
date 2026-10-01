@@ -245,7 +245,13 @@ def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hu
     # correctly imparted at high-z (from the tree's own recorded kinematics)
     # never decays the way it physically should as the universe expands,
     # and just persists for the rest of cosmic time.
-    a_total = a_total - hubble_rate * v_vec
+    #
+    # DISABLED: this was introduced to damp large high-z relative velocities
+    # that turned out to come from a unit bug (tree_navigator.relative_state
+    # divided SubhaloVel, already physical km/s, by a). Inside a bound host a
+    # -H*v drag isn't physical, so it's switched off; hubble_rate is still
+    # passed all the way through, so uncommenting this one line restores it.
+    # a_total = a_total - hubble_rate * v_vec
 
     # Optional BACKGROUND potential: gravity only (no dynamical friction --
     # DF is a local-density effect and should be dominated by whatever the
@@ -430,11 +436,9 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
             (i.e. in the SAME coordinate frame as r0_vec). Required if
             background_host is given.
         hubble_rate: astropy Quantity (1/Gyr) -- H(z) at this leg's cosmic
-            time, applied as a -H(t)*v drag on the RELATIVE velocity (see
-            _rhs's docstring comment). Defaults to 0 (no expansion damping)
-            for backward compatibility / non-cosmological uses of this
-            function; pass the real H(z) for cosmological orbit traces,
-            especially important at high redshift where H(z) is large.
+            time. CURRENTLY UNUSED: the -H(t)*v drag it fed is commented out
+            in _rhs (see the comment there); kept in the signature so the
+            drag can be switched back on by uncommenting one line.
         record_dt: astropy Quantity (time) or None (default). If given,
             also sample and return the cluster's separation from the
             RELEVANT center (background_host's center if one is active,
