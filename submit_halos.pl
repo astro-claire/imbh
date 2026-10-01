@@ -117,7 +117,8 @@ module load python
 cd __MODEL_DIR__ || { echo "ERROR: cannot cd to __MODEL_DIR__"; exit 1; }
 source __VENV__
 
-CSV=subhalo_formation___ID__.csv
+ID=__ID__
+CSV=subhalo_formation_${ID}.csv
 if [ ! -f "$CSV" ]; then
     echo "ERROR: $CSV not found in __MODEL_DIR__"
     exit 1
