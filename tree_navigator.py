@@ -328,8 +328,13 @@ class MergerTreeNavigator:
         # row we're actively tracking at the moment of the merge)
         rel_pos_kpc = delta_comoving * a_old / LITTLE_H
 
-        vel_old_phys = self.data["SubhaloVel"][i_old] / a_old
-        vel_new_phys = self.data["SubhaloVel"][i_new] / a_new
+        # SubhaloVel is ALREADY the physical peculiar velocity in km/s ("No
+        # unit conversion is needed" -- TNG data specifications). Only
+        # GroupVel (km/s/a) needs the 1/a factor. An earlier version divided
+        # SubhaloVel by a here too, inflating every relative velocity (and
+        # hence every reframe kick in trace_cluster_to_snapshot) by (1+z).
+        vel_old_phys = self.data["SubhaloVel"][i_old]
+        vel_new_phys = self.data["SubhaloVel"][i_new]
         rel_vel_kms = vel_old_phys - vel_new_phys
 
         return rel_pos_kpc * u.kpc, rel_vel_kms * u.km / u.s
