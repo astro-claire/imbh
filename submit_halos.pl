@@ -38,7 +38,7 @@ my %opt = (
     # (from tng_download/selected_ellipticals.json); earlier sets:
     #   "685512 697044 588075 467548 665702"
     #   "801308 753345 8 745415 826784"
-    'halos'           => '1235585 1117358 1136724 1044309 939095',
+    'halos'           => '1235585 1117358 1136724 1044309 939095 801308 753345 8 745415 826784 685512 697044 588075 467548 665702',
     'mode'            => 'default',          # default | observational
     'host-mass-model' => 'own',              # own | group
     'label'           => '',
