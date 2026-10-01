@@ -69,7 +69,7 @@ EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"
 Z_MAX = 20
 
 # Base font size (pt) for every label, tick and legend; titles/labels scale from it.
-FONT_SIZE = 15
+FONT_SIZE = 20
 plt.rcParams.update({
     "font.size": FONT_SIZE,
     "axes.titlesize": FONT_SIZE + 1,
