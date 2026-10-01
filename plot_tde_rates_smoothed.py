@@ -257,7 +257,7 @@ def main():
     ax.set_title(rf'$\alpha = {args.alpha}$, {args.smooth_myr:g} Myr {args.kernel} smoothing'
                  f'\n(shaded: {band_desc})'
                  + (f'\n{run_desc}' if run_desc else ''), fontsize=16 if not run_desc else 13)
-    ax.legend(frameon=False, title="Halo mass", fontsize=16, loc = "upper right")
+    ax.legend(frameon=False, title="Stellar mass at z=0", fontsize=20, loc = "upper right")
     plt.tight_layout()
 
     output = args.output or f"tde_rate_smoothed_massbins_{tag}.png"
