@@ -49,9 +49,11 @@ CAVEATS worth keeping in mind when interpreting results:
   * Surviving != initial. Dissolution/tidal destruction means more (and
     more low-mass) clusters formed than survive; n_boost multiplies the
     expected number to account for this if desired (default 1).
-  * TNG's Group_M_Crit200 is used as the halo mass; the observational fits
-    use M_vir. At z>7 (Omega_m(z)~1) the two definitions differ by only a
-    few percent, well below the relations' own uncertainty.
+  * The halo mass imbh.py passes is MergerTreeNavigator.host_properties():
+    Group_M_Crit200 for centrals, and (default host_mass_model='own') a
+    satellite's own SubhaloMass. The observational fits use M_vir; at z>7
+    (Omega_m(z)~1) M200c and M_vir differ by only a few percent, well below
+    the relations' own uncertainty.
   * None of these relations has explicit redshift dependence.
 
 Requires: numpy, astropy (and cluster_population_sampler only if
@@ -410,7 +412,8 @@ class ObservationalClusterSampler:
     def draw_clusters(self, subhalo_mass, subhalo_radius):
         """
         subhalo_mass (Msun) and subhalo_radius (kpc) as plain floats --
-        imbh.py passes group_m_crit200_msun / group_r_crit200_kpc. Returns
+        imbh.py passes MergerTreeNavigator.host_properties() of the branch's
+        formation subhalo (see the module docstring's caveats). Returns
         the same dict of Quantities as ClusterPopulationSampler.draw_clusters.
         Halos with a degenerate (<=0) mass or radius get no clusters.
         """

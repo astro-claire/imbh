@@ -38,7 +38,7 @@ from observational_cluster_sampler import (ObservationalClusterSampler, N_RELATI
 # dynamical friction orbit integration (separate module, kept alongside this script)
 from dynamical_friction import NFWHost, integrate_orbit, R_STOP_FRAC
 # raw merger-tree navigator, for following a cluster's host across mergers
-from tree_navigator import MergerTreeNavigator
+from tree_navigator import MergerTreeNavigator, HOST_MASS_MODELS
 #timescales stuff
 from timescales import TimescaleEnsemble
 from timescales.data import build_single_system_grid
@@ -185,9 +185,26 @@ def configure_cluster_sampler(mode="simulation", rng=None, **obs_kwargs):
 
 
 #--------- Load post-processed illustris merger tree 
-def load_merger_tree_idx(df,cutoff_z = 7):
-    goodidx = np.where((df['delta_t_gyr']>0) & (df['formation_redshift']>=cutoff_z)& (df["group_m_crit200_msun"] < 1e9))[0]
-    print("There are "+str(len(goodidx))+" subhalos with nonzero merger time and formation time above z cutoff.")
+def load_merger_tree_idx(df, cutoff_z=7, apply_resolution_cuts=True):
+    """
+    Indices of the subhalo branches that get clusters.
+
+    apply_resolution_cuts=True (simulation cluster sampler): keep only
+    branches with delta_t_gyr > 0, formation_redshift >= cutoff_z and
+    group_m_crit200_msun < 1e9 -- the halos the high-resolution cluster
+    simulation actually resolves.
+
+    apply_resolution_cuts=False (observational cluster sampler): the
+    observational relations aren't tied to that simulation's redshift/mass
+    range, so the only cut is delta_t_gyr > 0.
+    """
+    if apply_resolution_cuts:
+        goodidx = np.where((df['delta_t_gyr']>0) & (df['formation_redshift']>=cutoff_z)& (df["group_m_crit200_msun"] < 1e9))[0]
+        print("There are "+str(len(goodidx))+" subhalos with nonzero merger time and formation time above z cutoff.")
+    else:
+        goodidx = np.where(df['delta_t_gyr'] > 0)[0]
+        print(f"There are {len(goodidx)} subhalos with nonzero merger time "
+              f"(no redshift or mass cut applied).")
     return goodidx
 
 
@@ -231,7 +248,7 @@ def draw_formation_age(navigator, start_snap, rng, mode="uniform"):
 
 
 def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentration,
-                                   bg_host=None, bg_offset=None):
+                                   bg_host=None, bg_offset=None, extra_bgs=None):
     """
     Total specific orbital energy (KE + potential), in (km/s)^2, for the
     given position/velocity relative to a host built fresh here from
@@ -256,6 +273,11 @@ def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentra
         phi_bg_kms2 = bg_host.potential(r_bg_kpc) * _KPCGYR_TO_KMS ** 2
     else:
         phi_bg_kms2 = 0.0
+    # extra backgrounds (e.g. a satellite host's own FoF group) are folded
+    # into the background term: list of (NFWHost, offset Quantity) or None
+    for x_host, x_offset in (extra_bgs or ()):
+        r_x_kpc = np.linalg.norm((r_vec - x_offset).to(u.kpc).value)
+        phi_bg_kms2 += x_host.potential(r_x_kpc) * _KPCGYR_TO_KMS ** 2
     ke_kms2 = 0.5 * v_actual_kms ** 2
     e_total_kms2 = ke_kms2 + phi_local_kms2 + phi_bg_kms2
     return e_total_kms2, ke_kms2, phi_local_kms2, phi_bg_kms2
@@ -491,7 +513,8 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
                                      bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
                                      max_leg_duration, hubble_start, hubble_end,
                                      escape_frac=np.inf, record_dt=None, min_bg_substeps=1,
-                                     allow_start_inside_stop=False):
+                                     allow_start_inside_stop=False,
+                                     grp_bg_start=None, grp_bg_end=None):
     """
     Subdivide a leg into shorter sub-steps rather than treating a
     potentially Gyr-long gap as a single static host/single solve_ivp call
@@ -540,9 +563,19 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
     made LOCAL TO THIS WHOLE LEG (not just one sub-step) by shifting each
     sub-step's own t_grid by the cumulative elapsed time of every prior
     sub-step -- None if record_dt was not given.
+
+    grp_bg_start / grp_bg_end: (mass_msun, radius_kpc, offset Quantity) or
+    None -- a SECOND background, the FoF group a satellite host orbits
+    inside (see tree_navigator.satellite_group_background), at the leg's
+    start/end. Interpolated across the sub-steps exactly like the
+    main-branch background (_interpolate_bg, including fade in/out) and
+    passed to integrate_orbit as an extra gravity-only background.
     """
     n_sub = max(1, int(np.ceil((leg_duration / max_leg_duration).to(u.dimensionless_unscaled).value)))
-    bg_active = (bg_offset_start is not None) or (bg_offset_end is not None)
+    bg_active = ((bg_offset_start is not None) or (bg_offset_end is not None)
+                 or (grp_bg_start is not None) or (grp_bg_end is not None))
+    g_m0, g_r0, g_o0 = grp_bg_start if grp_bg_start is not None else (None, None, None)
+    g_m1, g_r1, g_o1 = grp_bg_end if grp_bg_end is not None else (None, None, None)
     if bg_active:
         n_sub = max(n_sub, min_bg_substeps)
     sub_dt = leg_duration / n_sub
@@ -565,6 +598,8 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
             bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
             frac, concentration,
         )
+        grp_host_k, grp_offset_k = _interpolate_bg(g_m0, g_r0, g_o0, g_m1, g_r1, g_o1, frac, concentration)
+        extra_k = [(grp_host_k, grp_offset_k)] if grp_host_k is not None else None
 
         # only the LAST sub-step of the LAST leg should ever use a real
         # (non-infinite) escape check -- earlier sub-steps always pass
@@ -576,6 +611,7 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
             cluster_mass, r_vec, v_vec, host_k, t_max=sub_dt, escape_frac=this_escape_frac,
             background_host=bg_host_k, background_offset=bg_offset_k, hubble_rate=hubble_k,
             record_dt=record_dt, allow_start_inside_stop=allow_start_inside_stop,
+            extra_backgrounds=extra_k,
         )
         if traj_sub is not None:
             t_sub, r_sub = traj_sub
@@ -772,7 +808,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 
     def make_result(status, host_id, r, v, r_over_rvir, steps):
         final_energy_kms2, _, _, _ = _compute_specific_energy_kms2(
-            r, v, mass_msun, radius_kpc, concentration, bg_host, bg_offset,
+            r, v, mass_msun, radius_kpc, concentration, bg_host, bg_offset, extra_bgs=grp_extra,
         )
         result = {
             'status': status,
@@ -831,6 +867,20 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             bg_offset = -rel_pos  # root's position relative to current host
             bg_host = NFWHost(bg_mass_msun * u.Msun, bg_radius_kpc * u.kpc, concentration=concentration)
 
+        # SECOND background (navigator.host_mass_model='own' only): if the
+        # current host is a SATELLITE, the local host above is its own
+        # subhalo mass, and the FoF group it is orbiting inside is added
+        # here as an extra gravity-only potential centered on the group
+        # center (GroupPos) -- unless that group's central IS the main-branch
+        # progenitor, which bg_host already represents. None for centrals.
+        # grp_bg is (mass_msun, radius_kpc, offset) at the leg's START; the
+        # matching END value is computed below alongside bg_*_end.
+        grp_bg = navigator.satellite_group_background(current_id, main_branch_id)
+        grp_extra = None
+        if grp_bg is not None:
+            grp_extra = [(NFWHost(grp_bg[0] * u.Msun, grp_bg[1] * u.kpc, concentration=concentration),
+                          grp_bg[2])]
+
         if verbose:
             r_mag = np.linalg.norm(r_vec.to(u.kpc).value)
             v_mag = np.linalg.norm(v_vec.to(u.km / u.s).value)
@@ -875,6 +925,12 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 bg_offset_end = -rel_pos_end
         else:
             bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end = bg_mass_msun, bg_radius_kpc, bg_offset
+        # END-of-leg satellite-group background, same convention
+        if next_id is not None:
+            grp_bg_end = navigator.satellite_group_background(
+                next_id, navigator.main_branch_id_at_snap(next_snap))
+        else:
+            grp_bg_end = grp_bg
 
         if delta_t_to_next is not None and delta_t_to_next <= remaining:
             t_leg_max, capped_by = delta_t_to_next, 'step'
@@ -903,7 +959,8 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         # active at either end of the leg -- see BG_MIN_SUBSTEPS -- so its
         # mass/radius/offset get interpolated across the leg rather than
         # held fixed and then discretely reset at the next boundary.
-        bg_active = (bg_offset is not None) or (bg_offset_end is not None)
+        bg_active = ((bg_offset is not None) or (bg_offset_end is not None)
+                     or (grp_bg is not None) or (grp_bg_end is not None))
         subdivided = (t_leg_max > max_leg_duration) or bg_active
         rel_pos_full = rel_vel_full = None
         if next_id is not None:
@@ -918,6 +975,9 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 bg_str = "none (current host IS the main branch here)"
             else:
                 bg_str = "none"
+            if grp_bg is not None:
+                bg_str += (f"; satellite-group bg_mass={grp_bg[0]:.3e} Msun, "
+                           f"offset={np.linalg.norm(grp_bg[2].to(u.kpc).value):.3f} kpc")
             rp_str = (f"|rel_pos|={np.linalg.norm(rel_pos_full.to(u.kpc).value):.4f} kpc, "
                       f"|rel_vel|={np.linalg.norm(rel_vel_full.to(u.km/u.s).value):.2f} km/s"
                       if rel_pos_full is not None else "n/a (final step)")
@@ -934,6 +994,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             # this doesn't get confused by a wide but bound eccentric orbit.
             e_total_kms2, ke_kms2, phi_local_kms2, phi_bg_kms2 = _compute_specific_energy_kms2(
                 r_vec, v_vec, mass_msun, radius_kpc, concentration, bg_host, bg_offset,
+                extra_bgs=grp_extra,
             )
             bound_str = "BOUND" if e_total_kms2 < 0 else "UNBOUND"
             print(f"          energy: KE={ke_kms2:.2f}, Phi_local={phi_local_kms2:.2f}, "
@@ -974,6 +1035,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                     bg_mass_msun, bg_radius_kpc, bg_offset, bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
                     max_leg_duration, hubble_start, hubble_end, record_dt=record_dt,
                     min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
+                    grp_bg_start=grp_bg, grp_bg_end=grp_bg_end,
                 )
             else:
                 # 'output'-capped (including the true final step): no next
@@ -990,6 +1052,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                     bg_mass_msun, bg_radius_kpc, bg_offset, bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
                     max_leg_duration, hubble_start, hubble_start, escape_frac=escape_frac, record_dt=record_dt,
                     min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
+                    grp_bg_start=grp_bg, grp_bg_end=grp_bg_end,
                 )
         else:
             # only reached when NOT subdivided, i.e. t_leg_max <= max_leg_duration
@@ -1001,6 +1064,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 cluster_mass, r_vec, v_vec, host, t_max=t_leg_max, escape_frac=escape_frac,
                 background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_start,
                 record_dt=record_dt, allow_start_inside_stop=allow_start_inside_stop,
+                extra_backgrounds=grp_extra,
             )
         current_age = current_age + elapsed
         n_pericenters += n_peri
@@ -1180,8 +1244,19 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
     failures = []  # (halo_idx, cluster_idx, total_time_gyr, status, error_message) -- orbit trace failures only
     #testing mode-just do the first few
     for idx in goodidx:
-        cluster_props = draw_clusters(df['group_m_crit200_msun'][idx], df['group_r_crit200_kpc'][idx])
+        # host mass/radius from the navigator, i.e. the SAME host the orbit
+        # integration starts in (see MergerTreeNavigator.host_properties /
+        # host_mass_model): centrals -> FoF group M200/R200, satellites ->
+        # own SubhaloMass + derived R200 (or group values with 'group')
+        sampler_mass_msun, sampler_radius_kpc, _ = navigator.host_properties(
+            int(df['formation_subhalo_id'][idx]))
+        cluster_props = draw_clusters(sampler_mass_msun, sampler_radius_kpc)
         print("Generated " + str(len(cluster_props['cluster_mass'])) + " clusters for this halo.")
+        n_drawn = len(cluster_props['cluster_mass'])
+        # host mass/radius the sampler was actually given (group M200/R200,
+        # or the subhalo's own mass and derived R200 -- see host_mass_model)
+        cluster_props['sampler_host_mass_msun'] = [sampler_mass_msun] * n_drawn
+        cluster_props['sampler_host_radius_kpc'] = [sampler_radius_kpc] * n_drawn
 
         start_subhalo_id = int(df['formation_subhalo_id'][idx])
 
@@ -1458,6 +1533,8 @@ def save_cluster_output(output_clusters, path, file_format="pickle"):
                 'initial_subhalo_formation_redshift': cluster_props['initial_subhalo_formation_redshift'][i],
                 'cluster_formation_redshift': cluster_props['cluster_formation_redshift'][i],
                 'cluster_formation_age_gyr': cluster_props['cluster_formation_age_gyr'][i],
+                'sampler_host_mass_msun': cluster_props['sampler_host_mass_msun'][i],
+                'sampler_host_radius_kpc': cluster_props['sampler_host_radius_kpc'][i],
                 'final_subhalo_id': final_id if final_id is not None else np.nan,
                 'final_r_over_rvir': cluster_props['final_r_over_rvir'][i],
                 'n_hops': n_hops if n_hops is not None else np.nan,
@@ -1609,6 +1686,15 @@ def main():
                          help="Observational mode: log-normal scatter on the expected number before "
                               "the Poisson draw (default: the chosen relation's own value -- 0 for "
                               "bf20/bf20_seed, 0.26/0.28 dex for harris17_number/harris17_mass).")
+    parser.add_argument("--host-mass-model", choices=HOST_MASS_MODELS, default="own",
+                         help="Host halo for SATELLITE subhalos, used both for the cluster draw and "
+                              "as the local NFW host in the orbit integration (centrals always use "
+                              "their FoF group's M200/R200). own (default): the satellite's own "
+                              "SubhaloMass with an R200c-equivalent radius, plus its FoF group as a "
+                              "second background potential centered on the group center (unless the "
+                              "group's central is the main-branch progenitor, already the background). "
+                              "group: legacy behavior -- the FoF group's M200/R200 as the local host, "
+                              "no second background (reproduces runs made before this option existed).")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -1626,11 +1712,13 @@ def main():
         tree_path = os.path.join("tng_download", f"sublink_full_{tree_id}.hdf5")
         print(f"--tree-path not given, guessing: {tree_path}")
 
-    navigator = MergerTreeNavigator(tree_path, args.snap_redshift_path, box_size_ckpc_h=args.box_size)
+    navigator = MergerTreeNavigator(tree_path, args.snap_redshift_path, box_size_ckpc_h=args.box_size,
+                                    host_mass_model=args.host_mass_model)
+    print(f"host_mass_model = {args.host_mass_model!r}")
     target_age = navigator.age_at_snap(args.output_snap)
     print(f"Output snapshot {args.output_snap} -> cosmic age {target_age:.4f}")
 
-    goodidx = load_merger_tree_idx(df)
+    goodidx = load_merger_tree_idx(df, apply_resolution_cuts=(args.cluster_sampler != "observational"))
 
     record_dt = TRACK_TIME_RESOLUTION if args.save_radius_tracks else None
     track_dir = args.track_dir
@@ -1660,7 +1748,9 @@ def main():
             n_scatter_dex=args.obs_n_scatter_dex,
         )
         print(sampler.describe())
-        n_expected = sampler.expected_number(df['group_m_crit200_msun'].to_numpy()[goodidx]).sum()
+        host_masses = np.array([navigator.host_properties(int(df['formation_subhalo_id'][i]))[0]
+                                for i in goodidx])
+        n_expected = sampler.expected_number(host_masses).sum()
         print(f"Expected number of clusters over the {len(goodidx)} selected halos: {n_expected:.1f}")
     else:
         configure_cluster_sampler("simulation")

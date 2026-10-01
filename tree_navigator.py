@@ -28,8 +28,12 @@ LITTLE_H = 0.6774
 TNG_COSMO = FlatLambdaCDM(H0=100 * LITTLE_H, Om0=0.3089)
 
 
+HOST_MASS_MODELS = ("own", "group")
+
+
 class MergerTreeNavigator:
-    def __init__(self, tree_path, snapshot_redshift_path, box_size_ckpc_h, cosmo=TNG_COSMO):
+    def __init__(self, tree_path, snapshot_redshift_path, box_size_ckpc_h, cosmo=TNG_COSMO,
+                 host_mass_model="own"):
         """
         Parameters:
             tree_path (str): path to sublink_full_<ID>.hdf5
@@ -38,10 +42,27 @@ class MergerTreeNavigator:
             box_size_ckpc_h (float): simulation box size, comoving ckpc/h
                 (same convention as elsewhere in this pipeline)
             cosmo: astropy cosmology to use for age(z) lookups
+            host_mass_model (str): what host_properties() returns for a
+                SATELLITE subhalo (centrals get their FoF group's
+                Group_M_Crit200/Group_R_Crit200 either way):
+                  'own' (default): the satellite's OWN bound mass
+                      (SubhaloMass) and an R200c-equivalent radius derived
+                      from it at that snapshot's redshift. The FoF group it
+                      sits in is supplied separately, as a background
+                      potential (see satellite_group_background).
+                  'group': the legacy behavior -- the FoF group's
+                      Group_M_Crit200/Group_R_Crit200, i.e. the mass of the
+                      (much larger) halo the satellite is orbiting inside.
         """
+        if host_mass_model not in HOST_MASS_MODELS:
+            raise ValueError(f"host_mass_model must be one of {HOST_MASS_MODELS}, got {host_mass_model!r}")
+        self.host_mass_model = host_mass_model
         fields = [
             "SubhaloID", "DescendantID", "FirstProgenitorID", "SnapNum",
             "SubhaloPos", "SubhaloVel", "Group_M_Crit200", "Group_R_Crit200",
+            # central/satellite distinction, satellites' own masses, and the
+            # position of each subhalo's FoF group center
+            "SubhaloMass", "SubfindID", "GroupFirstSub", "GroupPos",
         ]
         with h5py.File(tree_path, "r") as f:
             missing = [k for k in fields if k not in f]
@@ -149,10 +170,31 @@ class MergerTreeNavigator:
         return int(self.data["SnapNum"][self._row(subhalo_id)])
 
     # ------------------------------------------------------------------
-    def host_properties(self, subhalo_id):
+    def is_central(self, subhalo_id):
         """
-        Returns (mass_msun, radius_kpc, snap) for this row, using ITS OWN
-        snapshot's scale factor for the comoving -> physical conversion.
+        True if this subhalo is its FoF group's central (first/most massive
+        subhalo). Uses SubfindID == GroupFirstSub -- both are snapshot-local
+        SUBFIND indices on the same row. (FirstSubhaloInFOFGroupID is NOT
+        used: in these trees it doesn't reliably point back to the central
+        at late times.)
+        """
+        i = self._row(subhalo_id)
+        return int(self.data["SubfindID"][i]) == int(self.data["GroupFirstSub"][i])
+
+    def _r200c_from_mass_kpc(self, mass_msun, snap):
+        """Physical radius (kpc) enclosing mean density 200 rho_crit(z) for mass_msun."""
+        if not hasattr(self, '_rho_crit_cache'):
+            self._rho_crit_cache = {}
+        if snap not in self._rho_crit_cache:
+            z = self._snap_to_redshift[snap]
+            self._rho_crit_cache[snap] = self.cosmo.critical_density(z).to(u.Msun / u.kpc**3).value
+        return (3.0 * mass_msun / (4.0 * np.pi * 200.0 * self._rho_crit_cache[snap])) ** (1.0 / 3.0)
+
+    def group_properties(self, subhalo_id):
+        """
+        (mass_msun, radius_kpc, snap) of the FoF GROUP this subhalo sits in
+        (Group_M_Crit200/Group_R_Crit200), using this row's own snapshot's
+        scale factor for the comoving -> physical conversion.
         """
         i = self._row(subhalo_id)
         snap = int(self.data["SnapNum"][i])
@@ -160,6 +202,56 @@ class MergerTreeNavigator:
         mass_msun = float(self.data["Group_M_Crit200"][i]) * 1e10 / LITTLE_H
         radius_kpc = float(self.data["Group_R_Crit200"][i]) * a / LITTLE_H
         return mass_msun, radius_kpc, snap
+
+    def host_properties(self, subhalo_id):
+        """
+        Returns (mass_msun, radius_kpc, snap): the mass/radius of the halo
+        this subhalo itself IS, used as the local NFW host in the orbit
+        integration and as the host passed to the cluster samplers.
+
+        Centrals: the FoF group's Group_M_Crit200/Group_R_Crit200 (the
+        halo's virial mass). Satellites: depends on host_mass_model (see
+        __init__) -- 'own' gives the satellite's own SubhaloMass with an
+        R200c-equivalent radius; 'group' gives the group's values.
+        """
+        if self.host_mass_model == "group" or self.is_central(subhalo_id):
+            return self.group_properties(subhalo_id)
+        i = self._row(subhalo_id)
+        snap = int(self.data["SnapNum"][i])
+        mass_msun = float(self.data["SubhaloMass"][i]) * 1e10 / LITTLE_H
+        if not mass_msun > 0:
+            return 0.0, 0.0, snap
+        return mass_msun, self._r200c_from_mass_kpc(mass_msun, snap), snap
+
+    def satellite_group_background(self, subhalo_id, main_branch_id=None):
+        """
+        For a SATELLITE subhalo (with host_mass_model='own'), the FoF group
+        it is orbiting inside, as a background potential:
+            (group_mass_msun, group_radius_kpc, offset)
+        where offset (astropy Quantity 3-vector, physical kpc) is the group
+        center's position (GroupPos -- the potential minimum, which
+        coincides with the central's SubhaloPos) RELATIVE TO this subhalo,
+        i.e. in the same frame as a cluster's position relative to it.
+
+        Returns None if the subhalo is a central, if host_mass_model is
+        'group' (the group is already the local host then), or if the
+        group's central is main_branch_id itself (the main-branch
+        background already represents that group -- adding it again would
+        double count).
+        """
+        if self.host_mass_model == "group" or self.is_central(subhalo_id):
+            return None
+        i = self._row(subhalo_id)
+        if main_branch_id is not None:
+            j = self._row(main_branch_id)
+            if (int(self.data["SnapNum"][j]) == int(self.data["SnapNum"][i])
+                    and int(self.data["SubfindID"][j]) == int(self.data["GroupFirstSub"][i])):
+                return None
+        mass_msun, radius_kpc, snap = self.group_properties(subhalo_id)
+        delta = self.data["GroupPos"][i] - self.data["SubhaloPos"][i]
+        delta = (delta + self.box_size_ckpc_h / 2) % self.box_size_ckpc_h - self.box_size_ckpc_h / 2
+        offset_kpc = delta * self._atime(snap) / LITTLE_H
+        return mass_msun, radius_kpc, offset_kpc * u.kpc
 
     def step_forward(self, subhalo_id):
         """

@@ -199,7 +199,8 @@ class _RhsStepLimitExceeded(RuntimeError):
     pass
 
 
-def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate, call_budget):
+def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate,
+         extra_bgs, call_budget):
     call_budget[0] += 1
     if call_budget[0] > MAX_RHS_CALLS_PER_SOLVE:
         raise _RhsStepLimitExceeded(
@@ -259,6 +260,18 @@ def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hu
         Menc_bg = bg_host.mass_enclosed(r_bg)
         r_bg_hat = r_bg_vec / r_bg_actual if r_bg_actual > 1e-12 else np.zeros(3)
         a_total = a_total - _G * Menc_bg / r_bg**2 * r_bg_hat
+
+    # Optional EXTRA backgrounds (same treatment: gravity only) -- e.g. the
+    # FoF group a satellite host is orbiting inside, when that group isn't
+    # the main branch's (see imbh.py / tree_navigator.satellite_group_background).
+    # extra_bgs is a sequence of (NFWHost, offset_kpc ndarray) or None.
+    if extra_bgs:
+        for x_host, x_offset in extra_bgs:
+            r_x_vec = r_vec - x_offset
+            r_x_actual = np.linalg.norm(r_x_vec)
+            r_x = max(r_x_actual, r_soft)
+            r_x_hat = r_x_vec / r_x_actual if r_x_actual > 1e-12 else np.zeros(3)
+            a_total = a_total - _G * x_host.mass_enclosed(r_x) / r_x**2 * r_x_hat
 
     # Last-resort safety net: NFWHost and _chandrasekhar_xfactor are both
     # now guarded against the known degenerate-host (M200/R200<=0) source
@@ -392,7 +405,7 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
                      t_max=50 * u.Gyr, r_stop_frac=R_STOP_FRAC, escape_frac=3.0,
                      background_host=None, background_offset=None,
                      hubble_rate=0.0 / u.Gyr, record_dt=None,
-                     allow_start_inside_stop=False):
+                     allow_start_inside_stop=False, extra_backgrounds=None):
     """
     Like sink_time(), but returns the full final STATE (position and
     velocity relative to the host) at whatever time the integration
@@ -452,6 +465,11 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
             these clusters -- see imbh.py), it's nudged out to a tiny but
             safely nonzero radius first (see _MIN_SOFT_R0_FRAC) rather than
             handed to solve_ivp at the literal origin.
+        extra_backgrounds: sequence of (NFWHost, offset Quantity 3-vector
+            in kpc, relative to `host`) or None. Additional gravity-only
+            potentials, same treatment as background_host -- e.g. the FoF
+            group a satellite host orbits inside. Unlike background_host,
+            these never set the reference center for record_dt tracks.
 
     Returns
     -------
@@ -508,6 +526,9 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     t_max_gyr = t_max.to(u.Gyr).value
 
     bg_offset_kpc = background_offset.to(u.kpc).value if background_host is not None else None
+    extra_bgs = None
+    if extra_backgrounds:
+        extra_bgs = tuple((x_host, x_offset.to(u.kpc).value) for x_host, x_offset in extra_backgrounds)
     record_dt_gyr = record_dt.to(u.Gyr).value if record_dt is not None else None
 
     # If we're ALREADY at/inside the merge radius, OR already beyond the
@@ -563,7 +584,7 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]
 
     sol = _solve_ivp_robust(
-        (m_msun, host, coulomb_log, r_stop, background_host, bg_offset_kpc, hubble_rate_gyr),
+        (m_msun, host, coulomb_log, r_stop, background_host, bg_offset_kpc, hubble_rate_gyr, extra_bgs),
         (0, t_max_gyr), y0, events,
     )
 
@@ -637,7 +658,7 @@ def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape)]
 
     sol = _solve_ivp_robust(
-        (m_msun, host, coulomb_log, r_stop, None, None, 0.0),
+        (m_msun, host, coulomb_log, r_stop, None, None, 0.0, None),
         (0, t_max_gyr), y0, events,
     )
 
