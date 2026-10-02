@@ -69,6 +69,19 @@ Example:
     python plot_radius_tracks.py cluster_tracks --cluster-csv cluster_output_467548_snap99.csv \\
         --tree-path tng_download/sublink_full_467548.hdf5 \\
         --tde-contributors-csv tde_contributors_alpha1.2.csv --restrict-to-tde-contributors
+
+Selecting a run by halo ID (default or observational runs from submit_halos.pl):
+instead of the explicit paths above, pass --halo-id, --data-dir (the base
+output directory, $OUTDIR) and the same run flags used for submit_halos.pl /
+submit_analysis.pl. The track directory, the cluster_output table and (when a
+TDE-contributor option is used) the tde_contributors file are then found from
+the same naming rules (see run_naming.py); any path you DO pass explicitly
+overrides the automatic one. --tree-path auto uses
+tng_download/sublink_full_<ID>.hdf5.
+
+    python plot_radius_tracks.py --halo-id 467548 --data-dir /u/scratch/c/clairewi/imbh-output \\
+        --mode observational --n-relation bf20_seed --radius-relation marks_kroupa12 \\
+        --tree-path auto --restrict-to-tde-contributors
 """
 
 import argparse
@@ -81,6 +94,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from pathlib import Path
+
+from run_naming import add_run_args, run_suffix, analysis_dir, run_description
 
 
 def load_sparse_track(path, max_points):
@@ -116,7 +131,7 @@ def load_cluster_lookup(cluster_csv):
     """
     path = Path(cluster_csv)
     if not path.exists():
-        raise FileNotFoundError(f"The file '{file_path}' does not exist.")
+        raise FileNotFoundError(f"The file '{cluster_csv}' does not exist.")
     file_extension = path.suffix.lower()
     def get_file(path, file_extension):
         if file_extension == '.csv':
@@ -198,7 +213,9 @@ def status_color(status, assigned):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("track_dir", help="Directory of radius_track_h<halo>_c<cluster>.csv files "
+    parser.add_argument("track_dir", nargs="?", default=None,
+                         help="Directory of radius_track_h<halo>_c<cluster>.csv files. Optional if "
+                              "--halo-id is given (then it is found from the run flags). "
                                            "(see imbh.py's --save-radius-tracks / --track-dir)")
     parser.add_argument("--cluster-csv", default=None,
                          help="Path to the cluster_output_<ID>_snap<N>.csv table (imbh.py's "
@@ -220,7 +237,8 @@ def main():
                          help="Path to the raw sublink_full_<ID>.hdf5 tree (same file imbh.py uses). "
                               "If given, overlays the FINAL host's own R_200(t) growth curve on the "
                               "plot -- a direct reference for when/whether a cluster's separation "
-                              "drops inside its eventual host's own virial radius.")
+                              "drops inside its eventual host's own virial radius. With --halo-id, "
+                              "'auto' means tng_download/sublink_full_<ID>.hdf5.")
     parser.add_argument("--snap-redshift-path", default="tng_download/snapshot_redshifts.json",
                          help="Path to snapshot_redshifts.json (only used with --tree-path; default "
                               "matches imbh.py's own default)")
@@ -271,7 +289,53 @@ def main():
                               "color scale for everyone else.")
     parser.add_argument("--seed", type=int, default=0,
                          help="Random seed used for --max-clusters subsampling (default: 0)")
+    parser.add_argument("--halo-id", default=None,
+                         help="Subhalo ID of the run to plot. With this, track_dir, --cluster-csv and "
+                              "(for the TDE-contributor options) --tde-contributors-csv default to that "
+                              "run's files under --data-dir, using the run flags below.")
+    parser.add_argument("--data-dir", default=".",
+                         help="Base output directory of the runs ($OUTDIR; default: .). Only used with "
+                              "--halo-id.")
+    parser.add_argument("--snap", default="99",
+                         help="Output snapshot in the cluster_output file name (default: 99). Only "
+                              "used with --halo-id.")
+    parser.add_argument("--tde-alpha", default="1.2",
+                         help="Power-law alpha in the tde_contributors file name (default: 1.2). Only "
+                              "used with --halo-id. (Not the line transparency, which is --alpha.)")
+    add_run_args(parser)
     args = parser.parse_args()
+
+    # ---- resolve the run's files from --halo-id + run flags (explicit paths win) ----
+    suffix = run_suffix(args)
+    run_desc = run_description(args)
+    if args.halo_id is not None:
+        hid = str(args.halo_id)
+        if args.track_dir is None:
+            args.track_dir = os.path.join(args.data_dir, f"cluster_tracks_{hid}{suffix}")
+        if args.cluster_csv is None:
+            stem = os.path.join(args.data_dir, f"cluster_output_{hid}_{args.snap}{suffix}")
+            # submit_halos.pl writes pickled .dat; fall back to .csv if that's what exists
+            args.cluster_csv = stem + ".dat" if os.path.exists(stem + ".dat") or not os.path.exists(stem + ".csv") \
+                else stem + ".csv"
+        if args.tde_contributors_csv is None and (args.restrict_to_tde_contributors
+                                                  or args.color_by == "tde_contributor"):
+            args.tde_contributors_csv = os.path.join(
+                analysis_dir(args.data_dir, suffix), f"tde_contributors_{hid}_alpha{float(args.tde_alpha)}.csv")
+        if args.tree_path == "auto":
+            args.tree_path = os.path.join("tng_download", f"sublink_full_{hid}.hdf5")
+        print(f"Run: halo {hid}" + (f"  [{run_desc}]" if run_desc else "  [default mode]"))
+        print(f"  tracks:  {args.track_dir}\n  table:   {args.cluster_csv}"
+              + (f"\n  TDE contributors: {args.tde_contributors_csv}" if args.tde_contributors_csv else "")
+              + (f"\n  tree:    {args.tree_path}" if args.tree_path else ""))
+    else:
+        if args.track_dir is None:
+            parser.error("give a track_dir, or --halo-id (plus --data-dir and the run flags)")
+        if args.tree_path == "auto":
+            parser.error("--tree-path auto needs --halo-id")
+    for label, path in (("--cluster-csv", args.cluster_csv), ("--tde-contributors-csv", args.tde_contributors_csv),
+                        ("--tree-path", args.tree_path)):
+        if path is not None and not os.path.exists(path):
+            sys.exit(f"{label} file not found: {path}")
 
     if not os.path.isdir(args.track_dir):
         sys.exit(f"Not a directory: {args.track_dir}")
@@ -462,9 +526,10 @@ def main():
         ax.set_xscale("log")
     if args.restrict_to_tde_contributors:
         ax.set_title(f"Cluster separation vs. time  (N = {n_plotted} of {n_available} "
-                      f"TDE-contributing tracks, {n_total} total)")
+                      f"TDE-contributing tracks, {n_total} total)" + (f"\n{run_desc}" if run_desc else ""))
     else:
-        ax.set_title(f"Cluster separation vs. time  (N = {n_plotted} of {n_total} tracks)")
+        ax.set_title(f"Cluster separation vs. time  (N = {n_plotted} of {n_total} tracks)"
+                     + (f"\n{run_desc}" if run_desc else ""))
 
     if legend_handles:
         ax.legend(handles=legend_handles, loc="best", framealpha=0.9)
