@@ -140,7 +140,7 @@ def main():
         edges = np.array([all_m.min() * 0.9, all_m.max() * 1.1])
     centres = np.sqrt(edges[1:] * edges[:-1])
     xlim = (edges[0], edges[-1])
-    ylim = (10 ** (np.floor(np.log10(all_bh.min()) * 2) / 2), 10 ** (np.ceil(np.log10(all_bh.max()) * 2) / 2))
+    ylim = (10 ** 2, 10 **6)
 
     fig, axes = plt.subplots(2, 1, figsize=(9, 11), sharex=True, sharey=True)
     for ax, (label, data, _) in zip(axes, panels):
@@ -149,7 +149,7 @@ def main():
                 continue
             m_cl, m_bh = d
             marker = MARKERS[i % len(MARKERS)]
-            ax.scatter(m_cl, m_bh, s=14, marker=marker, color=color, alpha=0.35,
+            ax.scatter(m_cl, m_bh, s=20, marker=marker, color=color, alpha=0.35,
                        linewidths=0, rasterized=True)
             idx = np.digitize(m_cl, edges) - 1
             med = np.array([np.median(m_bh[idx == j]) if (idx == j).sum() >= args.min_per_bin else np.nan
@@ -171,8 +171,7 @@ def main():
         ax.set_yscale("log")
         ax.grid(True, which="major", color="0.92", lw=0.6)
         ax.set_axisbelow(True)
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
+
     axes[0].set_xlim(*xlim)
     axes[0].set_ylim(*ylim)
     axes[1].set_xlabel(r"Cluster stellar mass $M_{\rm cl}$ [$M_\odot$]")
@@ -181,7 +180,7 @@ def main():
     handles = [Line2D([], [], color=color, lw=2.5, marker=MARKERS[i % len(MARKERS)], ms=8,
                       markeredgecolor="white", markeredgewidth=1.2, label=label)
                for i, (_, label, color, _) in enumerate(bins)]
-    fig.tight_layout(rect=(0.03, 0, 1, 0.945), h_pad=0.6)
+    fig.tight_layout(rect=(0.03, 0, 1, 0.945), h_pad=0.0)
     fig.legend(handles=handles, frameon=False, loc="lower center", ncol=len(bins),
                bbox_to_anchor=(0.5, 0.94), title=args.legend_title, columnspacing=1.2,
                handlelength=1.8)

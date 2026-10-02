@@ -265,10 +265,10 @@ def main():
                    + "; shaded: 68% binomial interval", fontsize=FONT_SIZE - 3, color="0.35")
 
     for ax in (ax_m, ax_f):
-        ax.grid(True, which="major", color="0.92", lw=0.6)
+        # ax.grid(True, which="major", color="0.92", lw=0.6)
         ax.set_axisbelow(True)
         for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
+            ax.spines[s].set_visible(True)
 
     legend_title = "Halo mass" if not args.pool else None
     if run_desc:
