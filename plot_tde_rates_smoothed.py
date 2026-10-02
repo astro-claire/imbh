@@ -259,9 +259,14 @@ def main():
                  + (f'\n{run_desc}' if run_desc else ''), fontsize=16 if not run_desc else 13)
     ax.legend(frameon=False, title="Stellar mass at z=0", fontsize=20, loc = "upper right")
     plt.tight_layout()
+    # Legend outside the axes, to the right. Added after tight_layout so the
+    # axes keep their size; bbox_inches="tight" below widens the saved image
+    # to include it.
+    ax.legend(frameon=False, title="Halo mass", fontsize=16,
+              loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
 
     output = args.output or f"tde_rate_smoothed_massbins_{tag}.png"
-    plt.savefig(output, dpi=200)
+    plt.savefig(output, dpi=200, bbox_inches="tight")
     print(f"\nSaved {output}")
     if not args.no_show:
         plt.show()
