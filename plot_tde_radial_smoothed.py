@@ -326,8 +326,8 @@ def main():
         ax.set_xscale("log")
         # ax.grid(True, which="major", color="0.9", lw=0.6)
         ax.set_axisbelow(True)
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
+        # for s in ("top", "right"):
+            # ax.spines[s].set_visible(False)
         if not ax.lines:
             ax.text(0.5, 0.5, "no TDEs", transform=ax.transAxes, ha="center", color="0.5")
     for k in range(len(windows), nrow * ncol):
@@ -422,8 +422,8 @@ def main():
                       f"{args.smooth_myr:g} Myr smoothing" + (f"\n{run_desc}" if run_desc else ""),
                       fontsize=FONT_SIZE - 3, color="0.3")
         # ax2.grid(True, color="0.9", lw=0.6)
-        for s in ("top", "right"):
-            ax2.spines[s].set_visible(False)
+        # for s in ("top", "right"):
+            # ax2.spines[s].set_visible(False)
         ax2.legend(frameon=False, title="Halo mass (N halos)")
         fig2.tight_layout()
         out2 = os.path.splitext(out)[0] + "_vs_z.png"
