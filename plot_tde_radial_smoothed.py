@@ -314,7 +314,7 @@ def main():
             lo, hi = band(prof, mean, args.band)
             ax.fill_between(centers, lo, hi, color=color, alpha=0.2, lw=0)
             ax.plot(centers, mean, color=color, lw=2,
-                    label=f"{label} ({prof.shape[0]})" if w == 0 else None)
+                    label=f"{label} " if w == 0 else None)
             ymax = max(ymax, hi.max())
             ypos.append(hi[hi > 0])
             for k in range(len(centers)):
@@ -324,7 +324,7 @@ def main():
                              "center_frac_mean": np.nanmean(fc) if np.isfinite(fc).any() else np.nan})
         ax.set_title(rf"${z_lo:g} < z < {z_hi:g}$")
         ax.set_xscale("log")
-        ax.grid(True, which="major", color="0.9", lw=0.6)
+        # ax.grid(True, which="major", color="0.9", lw=0.6)
         ax.set_axisbelow(True)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
@@ -342,7 +342,7 @@ def main():
     # tight_layout, below), instead of a copy on every panel.
     xlabel = "Separation from central galaxy [kpc]"
     ylabel = (r"fraction of TDE rate per dex" if args.normalize
-              else r"$d\dot M_{\rm TDE}/d\log_{10} r$  [$M_\odot$ yr$^{-1}$ dex$^{-1}$]")
+              else r"$d\dot N_{\rm TDE}/d\log_{10} r$  [yr$^{-1}$ dex$^{-1}$]")
     if nrow == 1 and not args.normalize:
         # a single row isn't tall enough for the long label on one line
         ylabel = ylabel.replace("  [", "\n[")
@@ -382,9 +382,7 @@ def main():
     fig.text(left / 2, (gy0 + gy1) / 2, ylabel, ha="center", va="center", rotation=90,
              multialignment="center", fontsize=AXIS_LABEL_FONT_SIZE)
     fig.legend(frameon=False, loc="lower center", ncol=len(loaded), bbox_to_anchor=((gx0 + gx1) / 2, top),
-               title=(rf"Halo mass (N halos)   ·   $\alpha={args.alpha}$, {args.smooth_dex:g} dex "
-                      f"smoothing, shaded: {BAND_DESC[args.band]}"
-                      + (f"\n{run_desc}" if run_desc else "")))
+               )
 
     tagstr = f"alpha{args.alpha}" + ("_norm" if args.normalize else "") + suffix + escaped_suffix(args)
     out = args.output or f"tde_radial_massbins_{tagstr}.png"
@@ -415,7 +413,7 @@ def main():
                  for qq in (0.16, 0.5, 0.84)}
             z = age_to_redshift(t_c)
             ax2.fill_between(z, q[0.16], q[0.84], color=color, alpha=0.2, lw=0)
-            ax2.plot(z, q[0.5], color=color, lw=2, label=f"{label} ({len(halos)})")
+            ax2.plot(z, q[0.5], color=color, lw=2, label=f"{label}")
         ax2.set_xlim(Z_MAX, 0)
         ax2.set_yscale("log")
         ax2.set_xlabel("Redshift")
@@ -423,7 +421,7 @@ def main():
         ax2.set_title(f"median (line) and 16–84th percentile (shaded) of the bin-mean distribution; "
                       f"{args.smooth_myr:g} Myr smoothing" + (f"\n{run_desc}" if run_desc else ""),
                       fontsize=FONT_SIZE - 3, color="0.3")
-        ax2.grid(True, color="0.9", lw=0.6)
+        # ax2.grid(True, color="0.9", lw=0.6)
         for s in ("top", "right"):
             ax2.spines[s].set_visible(False)
         ax2.legend(frameon=False, title="Halo mass (N halos)")
