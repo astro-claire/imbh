@@ -65,6 +65,7 @@ from run_naming import (add_run_args, run_suffix, analysis_dir, run_description,
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import astropy.units as u
 from astropy.cosmology import FlatLambdaCDM
 from scipy.ndimage import gaussian_filter1d, uniform_filter1d
@@ -86,12 +87,14 @@ Z_MAX = 20
 
 # Base font size (pt) for every label, tick and legend; titles/labels scale from it.
 FONT_SIZE = 20
+TICK_FONT_SIZE = FONT_SIZE + 2        # tick labels
+AXIS_LABEL_FONT_SIZE = FONT_SIZE + 4  # the single shared x / y label of the panel grid
 plt.rcParams.update({
     "font.size": FONT_SIZE,
     "axes.titlesize": FONT_SIZE + 1,
     "axes.labelsize": FONT_SIZE + 1,
-    "xtick.labelsize": FONT_SIZE - 1,
-    "ytick.labelsize": FONT_SIZE - 1,
+    "xtick.labelsize": TICK_FONT_SIZE,
+    "ytick.labelsize": TICK_FONT_SIZE,
     "legend.fontsize": FONT_SIZE,
     "legend.title_fontsize": FONT_SIZE - 1,
 })
@@ -327,15 +330,22 @@ def main():
             ax.spines[s].set_visible(False)
         if not ax.lines:
             ax.text(0.5, 0.5, "no TDEs", transform=ax.transAxes, ha="center", color="0.5")
-    for ax in axes_flat[len(windows):]:
-        ax.set_visible(False)
+    for k in range(len(windows), nrow * ncol):
+        axes_flat[k].set_visible(False)
+        # sharex only labels the bottom row's x ticks; the panel above an empty
+        # slot is the bottom of its column, so give it its tick labels back
+        r, c = divmod(k, ncol)
+        if r > 0:
+            axes[r - 1, c].xaxis.set_tick_params(labelbottom=True)
 
+    # One shared x label and one shared y label for the whole grid (placed after
+    # tight_layout, below), instead of a copy on every panel.
+    xlabel = "Separation from central galaxy [kpc]"
     ylabel = (r"fraction of TDE rate per dex" if args.normalize
               else r"$d\dot M_{\rm TDE}/d\log_{10} r$  [$M_\odot$ yr$^{-1}$ dex$^{-1}$]")
-    for ax in axes[-1]:
-        ax.set_xlabel("Separation from central galaxy [kpc]")
-    for ax in axes[:, 0]:
-        ax.set_ylabel(ylabel)
+    if nrow == 1 and not args.normalize:
+        # a single row isn't tall enough for the long label on one line
+        ylabel = ylabel.replace("  [", "\n[")
     if args.r_range:
         axes_flat[0].set_xlim(*[float(x) for x in args.r_range.split(",")])
     if args.logy and ypos:
@@ -344,19 +354,43 @@ def main():
         axes_flat[0].set_ylim(max(pos.max() * 1e-4, pos.min()), pos.max() * 2)
     else:
         axes_flat[0].set_ylim(0, ymax * 1.05 if ymax > 0 else 1)
+        if not args.normalize and ymax > 0:
+            # Put the power of ten in the shared y label rather than matplotlib's
+            # "1e-7" offset text, which would sit on top of the panel titles.
+            # (The panels share one y axis, so one formatter covers them all.)
+            exp10 = int(np.floor(np.log10(ymax)))
+            if exp10 != 0:
+                axes_flat[0].yaxis.set_major_formatter(
+                    mticker.FuncFormatter(lambda v, _pos, e=exp10: f"{v / 10**e:g}"))
+                ylabel = ylabel.replace("[$M_\\odot$", rf"[$10^{{{exp10}}}\,M_\odot$")
     top = 0.80 if nrow == 1 else 0.89
     if run_desc:
         # one more legend-title line above the panels (run / escaped selection)
         top -= 0.08 if nrow == 1 else 0.045
-    fig.tight_layout(rect=(0, 0, 1, top))
-    fig.legend(frameon=False, loc="lower center", ncol=len(loaded), bbox_to_anchor=(0.5, top),
+    # Reserve a strip on the left and bottom (sized from the label font) for the
+    # shared labels; tight_layout keeps all tick labels inside the rest.
+    w_in, h_in = fig.get_size_inches()
+    line_in = AXIS_LABEL_FONT_SIZE / 72.0 * 1.5          # one label line plus padding
+    left = line_in * (ylabel.count("\n") + 1) / w_in
+    bottom = line_in / h_in
+    fig.tight_layout(rect=(left, bottom, 1, top))
+    grid = [a.get_position() for a in axes_flat]         # all slots, so labels centre on the grid
+    gx0, gx1 = min(b.x0 for b in grid), max(b.x1 for b in grid)
+    gy0, gy1 = min(b.y0 for b in grid), max(b.y1 for b in grid)
+    fig.text((gx0 + gx1) / 2, bottom / 2, xlabel, ha="center", va="center",
+             fontsize=AXIS_LABEL_FONT_SIZE)
+    fig.text(left / 2, (gy0 + gy1) / 2, ylabel, ha="center", va="center", rotation=90,
+             multialignment="center", fontsize=AXIS_LABEL_FONT_SIZE)
+    fig.legend(frameon=False, loc="lower center", ncol=len(loaded), bbox_to_anchor=((gx0 + gx1) / 2, top),
                title=(rf"Halo mass (N halos)   ·   $\alpha={args.alpha}$, {args.smooth_dex:g} dex "
                       f"smoothing, shaded: {BAND_DESC[args.band]}"
                       + (f"\n{run_desc}" if run_desc else "")))
 
     tagstr = f"alpha{args.alpha}" + ("_norm" if args.normalize else "") + suffix + escaped_suffix(args)
     out = args.output or f"tde_radial_massbins_{tagstr}.png"
-    fig.savefig(out, dpi=200)
+    # bbox_inches="tight" keeps a legend wider than the panel grid (e.g. one row
+    # of panels) from being cut off at the figure edge
+    fig.savefig(out, dpi=200, bbox_inches="tight")
     csv = os.path.splitext(out)[0] + ".csv"
     pd.DataFrame(rows).to_csv(csv, index=False)
     print(f"\nSaved {out} and {csv}")
