@@ -36,7 +36,7 @@ from matplotlib.lines import Line2D
 from run_naming import add_run_args, run_suffix, run_description
 from plot_imbh_occupation import DEFAULT_MASS_BINS, EXTRA_COLORS, MARKERS, load_halo, classify
 
-FONT_SIZE = 18
+FONT_SIZE = 24
 plt.rcParams.update({
     "font.size": FONT_SIZE,
     "axes.labelsize": FONT_SIZE + 2,
@@ -166,7 +166,7 @@ def main():
             ax.axhline(args.mbh_min, ls=":", color="0.45", lw=1.2, zorder=0)
 
         ax.text(0.03, 0.95, label, transform=ax.transAxes, ha="left", va="top",
-                fontsize=FONT_SIZE + 2, fontweight="bold")
+                fontsize=FONT_SIZE + 2)
         ax.set_xscale("log")
         ax.set_yscale("log")
         # ax.grid(True, which="major", color="0.92", lw=0.6)
