@@ -41,6 +41,20 @@ RADIAL_R_MIN_KPC = 1e-2
 RADIAL_R_MAX_KPC = 1e3
 RADIAL_N_BINS = 50
 
+# Accounting for the IMBH's own mass (see timescale_analysis):
+#  * SUBTRACT_IMBH_MASS: the IMBH formed out of the cluster's stars, so the
+#    stellar power-law profile is rescaled to hold M_cluster - M_IMBH
+#    (rho0 -> rho0 * (1 - M_IMBH/M_cluster)) before any TDE quantity is computed.
+#  * TRH_DELAY: TDEs only start this many cluster HALF-MASS relaxation times
+#    (Spitzer 1987, see half_mass_relaxation_time_gyr) after the IMBH forms;
+#    the time available for TDEs shrinks by the same amount. 0 = no delay.
+# Both can be changed from the command line (--no-subtract-imbh, --trh-delay).
+SUBTRACT_IMBH_MASS = True
+TRH_DELAY = 1.0
+# Coulomb logarithm ln(gamma N) for t_rh; gamma matches the 0.2 used in
+# calc_relaxation_time / calc_cutoff_radius below, for consistency.
+TRH_COULOMB_GAMMA = 0.2
+
 def load_data_file(file_path):
     """
     Checks the file extension and loads a .csv or .dat file into a Pandas DataFrame.
@@ -71,43 +85,96 @@ def set_up_timebins(resolution):
     mass_trelax_array_msun = np.zeros(nsteps)* u.Msun
     return tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun
 
-def timescale_analysis(df, idx, alpha):
+def half_mass_relaxation_time_gyr(m_star_msun, r_h_pc, m_mean_msun=1.0, gamma=TRH_COULOMB_GAMMA):
+    """
+    Spitzer (1987) half-mass relaxation time, in Gyr:
+
+        t_rh = 0.138 N^(1/2) r_h^(3/2) / ( m^(1/2) G^(1/2) ln(gamma N) ),   N = M / m
+
+    for a cluster of stellar mass m_star_msun, 3D half-mass radius r_h_pc and
+    mean stellar mass m_mean_msun (1 Msun, matching Mstar elsewhere in this file).
+    """
+    n_stars = m_star_msun / m_mean_msun
+    coulomb_log = np.log(gamma * n_stars)
+    if not (n_stars > 0 and r_h_pc > 0 and coulomb_log > 0):
+        return np.nan
+    t = (0.138 * np.sqrt(n_stars) * (r_h_pc * u.pc) ** 1.5
+         / (np.sqrt(m_mean_msun * u.Msun) * np.sqrt(G) * coulomb_log))
+    return t.to(u.Gyr).value
+
+
+def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None):
+    """
+    Returns (mass_lost_bins, t_relax_bin, t_cutoff_gyr, t_delay_gyr), or four
+    Nones if this cluster produces no TDEs.
+
+    subtract_imbh / trh_delay default to SUBTRACT_IMBH_MASS / TRH_DELAY (see
+    their comment above). With the delay, TDEs start t_delay_gyr after the
+    IMBH forms and t_cutoff_gyr is the time available AFTER that delay.
+    """
+    subtract_imbh = SUBTRACT_IMBH_MASS if subtract_imbh is None else subtract_imbh
+    trh_delay = TRH_DELAY if trh_delay is None else trh_delay
     stellar_radius = stellar_radius_approximation(1* u.Msun)
     limiting_tscale_gyr = []
     roche = False # start out with no roche effects
     if df['IMBH_mass_msun'][idx]<5e2:
         #placeholder--need to decide what to do with the small BHs. 
-        return None,None,None
+        return None,None,None,None
     elif df['IMBH_final_formation_time_gyr'][idx] >= df['total_time_gyr'][idx]:
         #placeholder - if the IMBH hasn't formed yet, don't do anything
-        return None,None,None
+        return None,None,None,None
     else: 
+        # ---- the stars that formed the IMBH are no longer in the cluster ----
+        m_imbh = float(df['IMBH_mass_msun'][idx])
+        m_cluster = float(df['cluster_mass_msun'][idx])
+        if subtract_imbh:
+            f_star = 1.0 - m_imbh / m_cluster
+            if f_star <= 0:
+                return None,None,None,None  # IMBH as massive as the whole cluster: no stars left
+        else:
+            f_star = 1.0
+        # stellar profile normalisation actually used for every TDE quantity below
+        rho0_star = df['rho0_msun_pc3'][idx] * f_star
+
+        # ---- TDEs start one (or trh_delay) half-mass relaxation time(s) after the IMBH forms ----
+        t_delay_gyr = 0.0
+        if trh_delay > 0:
+            t_delay_gyr = trh_delay * half_mass_relaxation_time_gyr(m_cluster * f_star,
+                                                                    df['cluster_radius_pc'][idx])
+            if not np.isfinite(t_delay_gyr):
+                return None,None,None,None
+        t_start_gyr = df['IMBH_final_formation_time_gyr'][idx] + t_delay_gyr
+
         if df['min_roche_radius_kpc'][idx]< df['cluster_radius_pc'][idx] /1e3:
             #If roche lobe goes within cluster, need to consider roche effects (the outer radius is small)
             roche = True
-            limiting_tscale_gyr.append(df['time_of_min_roche_gyr'][idx]-df['IMBH_final_formation_time_gyr'][idx])
-        limiting_tscale_gyr.append(df['total_time_gyr'][idx]-df['IMBH_final_formation_time_gyr'][idx])
+            limiting_tscale_gyr.append(df['time_of_min_roche_gyr'][idx]-t_start_gyr)
+        limiting_tscale_gyr.append(df['total_time_gyr'][idx]-t_start_gyr)
         t_cutoff_gyr = min(limiting_tscale_gyr)
         # print(f"The cutoff time is {t_cutoff_gyr}")
+        if not t_cutoff_gyr > 0:
+            # trace ended (inspiral / output time) or the Roche-limited time
+            # passed before the delay was over: no TDEs from this cluster
+            return None,None,None,None
 
         r_sphere_of_influence = sphere_of_influence(df['IMBH_mass_msun'][idx], df['r0_pc'][idx],
-                                                     df['rho0_msun_pc3'][idx], alpha)
+                                                     rho0_star, alpha)
 
         r = calc_cutoff_radius(t_cutoff_gyr, df['IMBH_mass_msun'][idx],
-                                df['r0_pc'][idx], df['rho0_msun_pc3'][idx], alpha,
+                                df['r0_pc'][idx], rho0_star, alpha,
                                 df['cluster_radius_pc'][idx])
         # print(r)
         # r_orbital_inner = calc_orbital_relaxation_radius(df['IMBH_mass_msun'][idx],df['r0_pc'][idx],
-                                                    #  df['rho0_msun_pc3'][idx], alpha,df['cluster_radius_pc'][idx] )
+                                                    #  rho0_star, alpha,df['cluster_radius_pc'][idx] )
         sigma_r, rho_r, M_r = calc_structural_props(r.value, df['IMBH_mass_msun'][idx],
-                                                     df['rho0_msun_pc3'][idx],
+                                                     rho0_star,
                                                      df['r0_pc'][idx], alpha)
         if roche:
             outer_radius_pc = min(r_sphere_of_influence.value, df['r0_pc'][idx],df['min_roche_radius_kpc'][idx] * 1e3) 
         else: 
             outer_radius_pc = min(r_sphere_of_influence.value, df['r0_pc'][idx])
         r_orbital_inner = stellar_radius.to('pc')
-        r_orbital_mstar = calc_min_enclosed_radius(2*u.Msun,df['r0_pc'][idx],df['rho0_msun_pc3'][idx],alpha  )
+        r_orbital_mstar = calc_min_enclosed_radius(2*u.Msun,df['r0_pc'][idx],rho0_star,alpha  )
         r_orbital_inner = max(r_orbital_inner, r_orbital_mstar)
 
         Nbins = 6
@@ -122,20 +189,20 @@ def timescale_analysis(df, idx, alpha):
                 radii_bins = np.logspace(np.log10(r_orbital_inner.value),np.log10(outer_radius_pc),Nbins)
                 radii_bins = np.linspace(r_orbital_inner.value,outer_radius_pc,Nbins)
                 structural_props_bins = [calc_structural_props(radii_bins[i], df['IMBH_mass_msun'][idx],
-                                                     df['rho0_msun_pc3'][idx],
+                                                     rho0_star,
                                                      df['r0_pc'][idx], alpha) for i in range(Nbins)]
                 mass_bins = [structural_props_bins[i][2] for i in range(Nbins)]
                 # mass_bins = [calc_structural_props(radii_bins[i], df['IMBH_mass_msun'][idx],
-                #                                      df['rho0_msun_pc3'][idx],
+                #                                      rho0_star,
                 #                                      df['r0_pc'][idx], alpha)[2] for i in range(Nbins) ]
                 sigma_bins = [structural_props_bins[i][0] for i in range(Nbins)]
                 rho_bins = [structural_props_bins[i][1] for i in range(Nbins)]
                 mass_lost_bins = [mass_bins[i+1]-mass_bins[i] for i in range(Nbins-1)]
                 # _,_, M_r_inner = calc_structural_props(r_orbital_inner.value, df['IMBH_mass_msun'][idx],
-                #                                      df['rho0_msun_pc3'][idx],
+                #                                      rho0_star,
                 #                                      df['r0_pc'][idx], alpha)
                 sigma_r_outer,rho_r_outer, M_r_outer =calc_structural_props(outer_radius_pc, df['IMBH_mass_msun'][idx],
-                                                     df['rho0_msun_pc3'][idx],
+                                                     rho0_star,
                                                      df['r0_pc'][idx], alpha) 
                 # M_star_removed_msun = M_r_outer - M_r_inner
                 M_star_removed_msun= sum(mass_lost_bins)
@@ -153,20 +220,20 @@ def timescale_analysis(df, idx, alpha):
             if r_orbital_inner< outer_radius_pc:
                 radii_bins = np.linspace(r_orbital_inner,outer_radius_pc,Nbins)
                 structural_props_bins = [calc_structural_props(radii_bins[i], df['IMBH_mass_msun'][idx],
-                                                     df['rho0_msun_pc3'][idx],
+                                                     rho0_star,
                                                      df['r0_pc'][idx], alpha) for i in range(Nbins)]
                 mass_bins = [structural_props_bins[i][2] for i in range(Nbins)]
                 # mass_bins = [calc_structural_props(radii_bins[i], df['IMBH_mass_msun'][idx],
-                #                                      df['rho0_msun_pc3'][idx],
+                #                                      rho0_star,
                 #                                      df['r0_pc'][idx], alpha)[2] for i in range(Nbins) ]
                 sigma_bins = [structural_props_bins[i][0] for i in range(Nbins)]
                 rho_bins = [structural_props_bins[i][1] for i in range(Nbins)]
                 mass_lost_bins = [mass_bins[i+1]-mass_bins[i] for i in range(Nbins-1)]
                 # _,_, M_r_inner = calc_structural_props(r_orbital_inner.value, df['IMBH_mass_msun'][idx],
-                #                                      df['rho0_msun_pc3'][idx],
+                #                                      rho0_star,
                 #                                      df['r0_pc'][idx], alpha)
                 sigma_r_outer,rho_r_outer, M_r_outer =calc_structural_props(outer_radius_pc, df['IMBH_mass_msun'][idx],
-                                                     df['rho0_msun_pc3'][idx],
+                                                     rho0_star,
                                                      df['r0_pc'][idx], alpha) 
                 # M_star_removed_msun = M_r_outer - M_r_inner
                 M_star_removed_msun= sum(mass_lost_bins)
@@ -187,7 +254,7 @@ def timescale_analysis(df, idx, alpha):
         cluster_relaxation_time_gyr = calc_relaxation_time(sigma_r_outer,rho_r_outer, M_r_outer)
         tde_rate = M_star_removed_msun/cluster_relaxation_time_gyr / u.Gyr
 
-        return np.array(mass_lost_bins*u.Msun),np.array(t_relax_bin), t_cutoff_gyr
+        return np.array(mass_lost_bins*u.Msun),np.array(t_relax_bin), t_cutoff_gyr, t_delay_gyr
 
 def sphere_of_influence(imbh_mass,r0,rho0, alpha):
     """
@@ -367,8 +434,37 @@ def _load_radius_track(track_path, track_dir, cache):
 
 
 
+def _burst_bins(t_start_yr, t_end_yr, t0_yr, dt_yr, n_bins):
+    """
+    Time bins covered by a constant-rate burst over [t_start_yr, t_end_yr).
+
+    Bin i of the grid is centred on t0_yr + i*dt_yr and spans +/- dt_yr/2.
+    Returns (idx, weights, t_mid_yr): the bin indices the burst overlaps (inside
+    the grid), the fraction of each bin's width it covers (0-1), and the
+    midpoint time of the covered part of each bin. A burst of rate R therefore
+    adds R*weights to the binned rate, and deposits exactly R*(t_end - t_start)
+    of mass (minus any part falling off the grid).
+    """
+    if not t_end_yr > t_start_yr:
+        return np.array([], dtype=int), np.array([]), np.array([])
+    i0 = int(np.floor((t_start_yr - t0_yr) / dt_yr + 0.5))
+    i1 = int(np.floor((t_end_yr - t0_yr) / dt_yr + 0.5))
+    i0, i1 = max(i0, 0), min(i1, n_bins - 1)
+    if i1 < i0:
+        return np.array([], dtype=int), np.array([]), np.array([])
+    idx = np.arange(i0, i1 + 1)
+    lo = t0_yr + (idx - 0.5) * dt_yr
+    hi = lo + dt_yr
+    a = np.maximum(lo, t_start_yr)
+    b = np.minimum(hi, t_end_yr)
+    covered = np.clip(b - a, 0.0, None)
+    keep = covered > 0
+    return idx[keep], covered[keep] / dt_yr, 0.5 * (a + b)[keep]
+
+
 def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
-                  resolution = 1e5*u.yr, track_dir=None, radial_edges_kpc=None):
+                  resolution = 1e5*u.yr, track_dir=None, radial_edges_kpc=None,
+                  subtract_imbh=None, trh_delay=None):
     """
     Returns (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc,
     n_clusters_with_tde, contributing_rows, radial):
@@ -423,7 +519,9 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
             inside timescale_analysis, e.g. by its own 5e2 Msun floor).
             Each dict has 'row_index' (this cluster's position in df),
             'radius_track_path' (straight from df, may be NaN/empty if it
-            has none), 'IMBH_mass_msun', and 'total_mass_lost_msun' (summed
+            has none), 'IMBH_mass_msun', 'tde_delay_gyr', 'tde_mass_emitted_msun'
+            (mass actually released inside the TDE time window, i.e. what this
+            cluster adds to the time-integrated rate), and 'total_mass_lost_msun' (summed
             across every mass-loss bin this cluster contributed) -- enough
             to filter or cross-reference downstream (see
             plot_radius_tracks.py's --tde-contributors-csv) without
@@ -431,6 +529,9 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
     """
     resolution = resolution.to('yr').value
     n_bins = len(tscale_array_yr)
+    # actual spacing of the time grid (set_up_timebins uses linspace, so this is
+    # ~resolution but not exactly); bin i covers tscale[i] +/- grid_dt_yr/2
+    grid_dt_yr = float(tscale_array_yr[1] - tscale_array_yr[0])
     radius_sum_kpc = np.zeros(n_bins)
     radius_count = np.zeros(n_bins, dtype=int)
     track_cache = {}
@@ -470,12 +571,13 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
     # for clusteridx in range(2):
         if df['IMBH_mass_msun'][clusteridx]>0:
             halo_formation_time = cosmo.age(df[formation_z_col][clusteridx])
-            start_time = halo_formation_time+ (df['IMBH_final_formation_time_gyr'][clusteridx]*u.Gyr)
-            mass_lost_bins,t_relax_bin, t_cutoff_gyr = timescale_analysis(df, clusteridx, alpha)
+            mass_lost_bins,t_relax_bin, t_cutoff_gyr, t_delay_gyr = timescale_analysis(
+                df, clusteridx, alpha, subtract_imbh=subtract_imbh, trh_delay=trh_delay)
             if t_cutoff_gyr is not None: 
-                i = int(round((t_cutoff_gyr * 1e9 - tscale_array_yr[0]) / resolution))
-                j_start = int(round((start_time.value * 1e9 - tscale_array_yr[0]) / resolution))
-
+                # TDEs start t_delay_gyr (trh_delay half-mass relaxation times)
+                # after the IMBH forms -- see timescale_analysis
+                start_time = (halo_formation_time
+                              + (df['IMBH_final_formation_time_gyr'][clusteridx] + t_delay_gyr) * u.Gyr)
                 # ---- radius-vs-time lookup for this cluster, if it has one ----
                 track_t_gyr = track_r_kpc = None
                 if has_track_col:
@@ -491,56 +593,78 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
                     'radius_track_path': df['radius_track_path'][clusteridx] if has_track_col else None,
                     'IMBH_mass_msun': df['IMBH_mass_msun'][clusteridx],
                     'total_mass_lost_msun': float(np.sum(mass_lost_bins)),
+                    'tde_delay_gyr': float(t_delay_gyr),
+                    # mass actually emitted as TDEs inside the time window (each
+                    # mass-loss bin is cut off at t_cutoff_gyr); filled below
+                    'tde_mass_emitted_msun': 0.0,
                 })
+                emitted_msun = 0.0
 
                 for binidx in range(len(mass_lost_bins)):
-                    t_end =  start_time.value+min(t_cutoff_gyr,  t_relax_bin[binidx])
-                    k_end = int(round((t_end * 1e9 - tscale_array_yr[0]) / resolution))
+                    # Each mass-loss bin releases its mass at a constant rate
+                    # mass/t_relax from t_start until min(t_cutoff, t_relax) later.
+                    # Spread it over the time grid by the exact fraction of each
+                    # bin it covers (see _burst_bins), so the deposited mass is
+                    # exactly rate x duration -- no extra end bin, and bursts
+                    # shorter than one bin are no longer rounded up to a full bin.
+                    t_start_yr = start_time.to(u.yr).value
+                    duration_gyr = min(t_cutoff_gyr, t_relax_bin[binidx])
+                    t_end_yr = t_start_yr + duration_gyr * 1e9
                     rate = mass_lost_bins[binidx] / t_relax_bin[binidx] * u.Msun / u.Gyr
                     mass = mass_lost_bins[binidx]* u.Msun
-                    tde_rate_array_msunyr[j_start:k_end+1] += rate
-                    mass_trelax_array_msun[k_end+1] += mass
                     rate_msunyr = float(mass_lost_bins[binidx] / t_relax_bin[binidx]) / 1e9
+                    # mass_trelax diagnostic: unchanged convention (bin after the burst's end)
+                    k_end = int(round((t_end_yr - tscale_array_yr[0]) / grid_dt_yr))
+                    if 0 <= k_end + 1 < n_bins:
+                        mass_trelax_array_msun[k_end+1] += mass
+
+                    tbins, wts, t_mid_yr = _burst_bins(t_start_yr, t_end_yr, tscale_array_yr[0],
+                                                       grid_dt_yr, n_bins)
+                    if len(tbins) == 0:
+                        continue
+                    emitted_msun += rate_msunyr * grid_dt_yr * float(np.sum(wts))
+                    tde_rate_array_msunyr[tbins] += rate * wts
                     if is_escaped:
-                        rate_escaped[j_start:k_end+1] += rate_msunyr
+                        rate_escaped[tbins] += rate_msunyr * wts
 
-                    if track_t_gyr is None and k_end >= j_start:
-                        radial_no_track[j_start:k_end+1] += rate_msunyr
+                    if track_t_gyr is None:
+                        radial_no_track[tbins] += rate_msunyr * wts
                         if is_escaped:
-                            radial_no_track_escaped[j_start:k_end+1] += rate_msunyr
+                            radial_no_track_escaped[tbins] += rate_msunyr * wts
+                        continue
 
-                    if track_t_gyr is not None and k_end >= j_start:
-                        # cosmic time (Gyr) of every bin in THIS burst -> time
-                        # since the CLUSTER's own formation (the track's own
-                        # convention), then linearly interpolated against the
-                        # saved orbit trace (clamped at the ends by np.interp,
-                        # which is fine: the track spans the cluster's whole
-                        # trace, so a burst time falling outside it just means
-                        # sub-bin rounding at a boundary).
-                        t_bin_cosmic_gyr = tscale_array_yr[j_start:k_end+1] / 1e9
-                        t_since_formation_gyr = t_bin_cosmic_gyr - halo_formation_time.to(u.Gyr).value
-                        r_interp_kpc = np.interp(t_since_formation_gyr, track_t_gyr, track_r_kpc)
-                        radius_sum_kpc[j_start:k_end+1] += r_interp_kpc
-                        radius_count[j_start:k_end+1] += 1
+                    # cosmic time (Gyr) of the covered part of every bin in THIS
+                    # burst -> time since the CLUSTER's own formation (the track's
+                    # own convention), then linearly interpolated against the
+                    # saved orbit trace (clamped at the ends by np.interp, which is
+                    # fine: the track spans the cluster's whole trace, so a burst
+                    # time falling outside it just means sub-bin rounding at a
+                    # boundary).
+                    t_since_formation_gyr = t_mid_yr / 1e9 - halo_formation_time.to(u.Gyr).value
+                    r_interp_kpc = np.interp(t_since_formation_gyr, track_t_gyr, track_r_kpc)
+                    radius_sum_kpc[tbins] += r_interp_kpc
+                    radius_count[tbins] += 1
 
-                        # ---- rate-weighted separation histogram ----
-                        # Past the end of an inspiraled cluster's trace, np.interp
-                        # would hold the stop radius; the cluster is at the center.
-                        tbins = np.arange(j_start, k_end + 1)
-                        in_track = np.ones(len(tbins), dtype=bool)
-                        if (has_status_col and df['status'][clusteridx] == 'inspiraled'
-                                and len(track_t_gyr)):
-                            in_track = t_since_formation_gyr <= track_t_gyr[-1]
-                            radial_inspiraled[tbins[~in_track]] += rate_msunyr
-                        r_in = r_interp_kpc[in_track]
-                        ridx = np.searchsorted(radial_edges_kpc, r_in, side='right') - 1
-                        n_out = np.count_nonzero((ridx < 0) | (ridx >= n_rbins))
-                        radial_clipped_msun += n_out * rate_msunyr * resolution
-                        ridx = np.clip(ridx, 0, n_rbins - 1)
-                        np.add.at(radial_hist, (tbins[in_track], ridx), rate_msunyr)
-                        if is_escaped:
-                            radial_clipped_escaped_msun += n_out * rate_msunyr * resolution
-                            np.add.at(radial_hist_escaped, (tbins[in_track], ridx), rate_msunyr)
+                    # ---- rate-weighted separation histogram ----
+                    # Past the end of an inspiraled cluster's trace, np.interp
+                    # would hold the stop radius; the cluster is at the center.
+                    in_track = np.ones(len(tbins), dtype=bool)
+                    if (has_status_col and df['status'][clusteridx] == 'inspiraled'
+                            and len(track_t_gyr)):
+                        in_track = t_since_formation_gyr <= track_t_gyr[-1]
+                        radial_inspiraled[tbins[~in_track]] += rate_msunyr * wts[~in_track]
+                    r_in = r_interp_kpc[in_track]
+                    w_in = wts[in_track]
+                    ridx = np.searchsorted(radial_edges_kpc, r_in, side='right') - 1
+                    out = (ridx < 0) | (ridx >= n_rbins)
+                    clipped = rate_msunyr * grid_dt_yr * float(np.sum(w_in[out]))
+                    radial_clipped_msun += clipped
+                    ridx = np.clip(ridx, 0, n_rbins - 1)
+                    np.add.at(radial_hist, (tbins[in_track], ridx), rate_msunyr * w_in)
+                    if is_escaped:
+                        radial_clipped_escaped_msun += clipped
+                        np.add.at(radial_hist_escaped, (tbins[in_track], ridx), rate_msunyr * w_in)
+                contributing_rows[-1]['tde_mass_emitted_msun'] = emitted_msun
 
     with np.errstate(invalid='ignore'):
         mean_radius_kpc = np.where(radius_count > 0, radius_sum_kpc / np.maximum(radius_count, 1), np.nan)
@@ -598,6 +722,12 @@ def main():
     parser.add_argument("--output-dir", default=".",
                          help="Directory to write the tde_rates/tde_contributors CSVs to "
                               "(default: current directory).")
+    parser.add_argument("--no-subtract-imbh", action="store_true",
+                         help="Don't remove the IMBH's mass from the cluster's stellar profile "
+                              "(default: the profile is rescaled to hold M_cluster - M_IMBH).")
+    parser.add_argument("--trh-delay", type=float, default=TRH_DELAY,
+                         help="Delay the start of TDEs by this many cluster half-mass relaxation "
+                              f"times after the IMBH forms (default: {TRH_DELAY:g}; 0 = no delay).")
     args = parser.parse_args()
 
     subhalo_id = args.subhalo_id or infer_subhalo_id(args.input_path)
@@ -607,6 +737,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     tag = f"{subhalo_id}_alpha{float(args.alpha)}"
     print(f"Subhalo {subhalo_id}, alpha = {float(args.alpha)}")
+    print(f"IMBH mass subtracted from the stellar profile: {not args.no_subtract_imbh}; "
+          f"TDE onset delayed by {args.trh_delay:g} half-mass relaxation time(s)")
     df = load_data_file(args.input_path)
     print(df.columns)
     tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun = set_up_timebins(1e5*u.yr)
@@ -615,6 +747,7 @@ def main():
      contributing_rows, radial) = run_clusters(
         df, float(args.alpha), tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
         resolution=1e5*u.yr, track_dir=args.track_dir, radial_edges_kpc=radial_edges_kpc,
+        subtract_imbh=not args.no_subtract_imbh, trh_delay=args.trh_delay,
     )
     output_df = pd.DataFrame({
         'time': tscale_array_yr[:-2],
@@ -647,7 +780,7 @@ def main():
         clipped_escaped_msun=radial['clipped_escaped_msun'],
         subhalo_id=subhalo_id, alpha=float(args.alpha),
     )
-    dt_yr = 1e5
+    dt_yr = float(tscale_array_yr[1] - tscale_array_yr[0])  # actual grid spacing (~1e5 yr)
     tot = float(np.sum(tde_rate_array_msunyr.to(u.Msun / u.yr).value)) * dt_yr
     parts = {k: float(np.sum(radial[k])) * dt_yr for k in ('hist_msunyr', 'inspiraled_msunyr', 'no_track_msunyr')}
     print(f"Radial TDE histogram written to {radial_path}: of {tot:.3g} Msun lost, "
@@ -666,6 +799,10 @@ def main():
     # without re-running timescale_analysis themselves.
     contributors_path = os.path.join(args.output_dir, f'tde_contributors_{tag}.csv')
     pd.DataFrame(contributing_rows).to_csv(contributors_path, index=False)
+    if contributing_rows and args.trh_delay > 0:
+        delays = np.array([r['tde_delay_gyr'] for r in contributing_rows]) * 1e3
+        print(f"TDE onset delay (t_rh) for contributing clusters: median {np.median(delays):.3g} Myr, "
+              f"16-84%: {np.percentile(delays, 16):.3g}-{np.percentile(delays, 84):.3g} Myr")
     print(f"{len(contributing_rows)} of {len(df)} clusters actively contributed to the TDE rate "
           f"-- see {contributors_path}")
 
