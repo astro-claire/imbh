@@ -38,7 +38,7 @@ from run_naming import add_run_args, run_suffix, analysis_dir, run_description
 from plot_tde_rates_smoothed import (DEFAULT_MASS_BINS, EXTRA_COLORS, Z_MAX, load_rates,
                                      smooth, band, age_to_redshift)
 
-FONT_SIZE = 20
+FONT_SIZE = 24
 plt.rcParams.update({
     "font.size": FONT_SIZE,
     "axes.labelsize": FONT_SIZE,
@@ -151,8 +151,8 @@ def main():
 
     for ax in axes.flat:
         ax.set_xlim(Z_MAX, 0)  # redshift decreases left to right: time runs forward
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
+        # for s in ("top", "right"):
+        #     ax.spines[s].set_visible(False)
     for r in range(2):
         if args.logy:
             axes[r, 0].set_yscale("log")
@@ -163,15 +163,17 @@ def main():
             axes[r, 0].set_ylim(bottom=0)
         # row label on the right-hand edge of the row
         axes[r, 1].text(1.03, 0.5, row_labels[r], transform=axes[r, 1].transAxes, rotation=270,
-                        ha="left", va="center", fontsize=FONT_SIZE + 2, fontweight="bold")
+                        ha="left", va="center", fontsize=FONT_SIZE + 2, )
     for c, (col_label, _, _, _) in enumerate(columns):
-        axes[0, c].set_title(col_label, fontsize=FONT_SIZE + 2, fontweight="bold", pad=12)
+        axes[0, c].set_title(col_label, fontsize=FONT_SIZE + 2, pad=12)
 
     fig.supxlabel("Redshift", fontsize=FONT_SIZE + 2, y=0.035)
     fig.supylabel(r"TDE rate ($M_\odot$/yr)", fontsize=FONT_SIZE + 2, x=0.015)
 
     handles = [Line2D([], [], color=color, lw=2.5, label=label) for _, label, color, _ in mass_bins]
     fig.tight_layout(rect=(0.01, 0.01, 0.97, 0.90), h_pad=1.0, w_pad=1.0)
+    fig.subplots_adjust(wspace=0, hspace=0)
+
     fig.legend(handles=handles, frameon=False, loc="lower center", ncol=len(handles),
                bbox_to_anchor=(0.5, 0.905), title=args.legend_title)
 
