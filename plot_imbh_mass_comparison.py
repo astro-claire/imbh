@@ -169,7 +169,7 @@ def main():
                 fontsize=FONT_SIZE + 2, fontweight="bold")
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.grid(True, which="major", color="0.92", lw=0.6)
+        # ax.grid(True, which="major", color="0.92", lw=0.6)
         ax.set_axisbelow(True)
 
     axes[0].set_xlim(*xlim)

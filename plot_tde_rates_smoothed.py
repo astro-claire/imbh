@@ -257,6 +257,9 @@ def main():
     ax.set_title(rf'$\alpha = {args.alpha}$, {args.smooth_myr:g} Myr {args.kernel} smoothing'
                  f'\n(shaded: {band_desc})'
                  + (f'\n{run_desc}' if run_desc else ''), fontsize=16 if not run_desc else 13)
+    if args.mode != "observational":
+        ax.axvspan(7, 0, color='grey', alpha=0.3)
+
     ax.legend(frameon=False, title="Stellar mass at z=0", fontsize=20, loc = "upper right")
     plt.tight_layout()
     # Legend outside the axes, to the right. Added after tight_layout so the
