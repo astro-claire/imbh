@@ -5,7 +5,7 @@ rates vs. redshift for two model runs (columns) and two cluster selections
 
     rows    (shared x axis): top    = escaped clusters excluded ("Bound to galaxy")
                              bottom = escaped clusters only     ("Escaped")
-    columns (shared y axis): left   = --left-flags  run (default: default mode, "Maximal model")
+    columns (shared y axis): left   = --left-flags  run (default: default mode with --jitter-dex 0.3, "Maximal model")
                              right  = --right-flags run (default: --mode observational
                                       --n-relation bf20_seed --radius-relation marks_kroupa12,
                                       "Conservative model")
@@ -24,7 +24,7 @@ plot_tde_rates_smoothed.py and run_naming.py must sit next to this script.
 Examples:
     python plot_tde_rates_quad.py --data-dir /u/scratch/c/clairewi/imbh-output
     python plot_tde_rates_quad.py --data-dir ... --logy --smooth-myr 100
-    python plot_tde_rates_quad.py --data-dir ... --left-flags "--jitter-dex 0.3"
+    python plot_tde_rates_quad.py --data-dir ... --left-flags ""   # maximal model without jitter
 """
 import argparse
 import shlex
@@ -49,7 +49,7 @@ plt.rcParams.update({
     "legend.title_fontsize": FONT_SIZE - 2,
 })
 
-DEFAULT_LEFT_FLAGS = ""
+DEFAULT_LEFT_FLAGS = "--jitter-dex 0.3"  # default mode, smoothed bootstrap (0.3 dex)
 DEFAULT_RIGHT_FLAGS = "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12"
 ROWS = [("exclude", "Bound to galaxy"), ("only", "Escaped")]
 SHADE_Z = (7, 0)  # no new clusters form below z = 7 in the default (simulation-calibrated) mode
@@ -72,7 +72,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default=".", help="Base output directory ($OUTDIR).")
     p.add_argument("--left-flags", default=DEFAULT_LEFT_FLAGS,
-                   help='Run-selection flags for the left column, one quoted string (default: "" = default mode).')
+                   help=f'Run-selection flags for the left column, one quoted string (default: "{DEFAULT_LEFT_FLAGS.split("  #")[0]}"; '
+                        '"" = default mode without jitter).')
     p.add_argument("--right-flags", default=DEFAULT_RIGHT_FLAGS,
                    help=f'Run-selection flags for the right column (default: "{DEFAULT_RIGHT_FLAGS}").')
     p.add_argument("--left-label", default="Maximal model")

@@ -1,7 +1,7 @@
 """
 Two-panel figure of IMBH mass vs. host-cluster stellar mass, sharing the x
 axis: the top panel is one model run, the bottom panel another (by default
-the default-mode run, labelled "Maximal model", over the observational run
+the default-mode run with --jitter-dex 0.3, labelled "Maximal model", over the observational run
 with --n-relation bf20_seed --radius-relation marks_kroupa12, labelled
 "Conservative model").
 
@@ -46,7 +46,7 @@ plt.rcParams.update({
     "legend.title_fontsize": FONT_SIZE - 2,
 })
 
-DEFAULT_TOP_FLAGS = ""
+DEFAULT_TOP_FLAGS = "--jitter-dex 0.3"  # default mode, smoothed bootstrap (0.3 dex)
 DEFAULT_BOTTOM_FLAGS = "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12"
 
 
@@ -86,7 +86,8 @@ def main():
     p.add_argument("--bottom-data-dir", default=None, help="Override --data-dir for the bottom run.")
     p.add_argument("--snap", default="99", help="Output snapshot in the cluster_output file names (default: 99).")
     p.add_argument("--top-flags", default=DEFAULT_TOP_FLAGS,
-                   help='Run-selection flags for the top panel, as one quoted string (default: "" = default mode).')
+                   help=f'Run-selection flags for the top panel, as one quoted string (default: "{DEFAULT_TOP_FLAGS.split("  #")[0]}"; '
+                        '"" = default mode without jitter).')
     p.add_argument("--bottom-flags", default=DEFAULT_BOTTOM_FLAGS,
                    help=f'Run-selection flags for the bottom panel (default: "{DEFAULT_BOTTOM_FLAGS}").')
     p.add_argument("--top-label", default="Maximal model")
