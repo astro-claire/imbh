@@ -9,7 +9,10 @@ analysis.py outputs and tag their own figures/CSVs with it:
     otherwise              : suffix "_<...>"  -> analysis files in <data-dir>/analysis<suffix>
 
     <suffix> = [_obs_<n-relation>_<mass-function>_<radius-relation>_<phase-space>
-                _host<host-mass-model>_boost<n-boost>][_<label>]
+                _host<host-mass-model>_boost<n-boost>][_<jitter tag>][_<label>]
+
+    <jitter tag> (default mode only) = jit<s> if --mass-jitter-dex == --radius-jitter-dex
+                                       = jitM<m>R<r> otherwise; absent if both are 0
 
 KEEP IN SYNC with the naming block in submit_halos.pl and submit_analysis.pl.
 
@@ -41,8 +44,32 @@ def add_run_args(parser):
     g.add_argument("--host-mass-model", choices=HOST_MASS_MODELS, default="own")
     g.add_argument("--n-boost", default="1.0",
                    help="As passed to submit_halos.pl (used verbatim in the names, e.g. 1.0).")
+    g.add_argument("--jitter-dex", type=float, default=0.0,
+                   help="Default mode: smoothed-bootstrap jitter on cluster mass and radius "
+                        "[dex], as passed to submit_halos.pl (default 0 = none).")
+    g.add_argument("--mass-jitter-dex", type=float, default=None,
+                   help="Override --jitter-dex for cluster mass only.")
+    g.add_argument("--radius-jitter-dex", type=float, default=None,
+                   help="Override --jitter-dex for cluster radius only.")
     g.add_argument("--label", default="")
     return parser
+
+
+def _jitter_widths(args):
+    j = getattr(args, "jitter_dex", 0.0) or 0.0
+    m = getattr(args, "mass_jitter_dex", None)
+    r = getattr(args, "radius_jitter_dex", None)
+    return (j if m is None else m), (j if r is None else r)
+
+
+def jitter_tag(args):
+    """'' / 'jit<s>' / 'jitM<m>R<r>' (default mode only). KEEP IN SYNC with imbh.jitter_tag."""
+    if args.mode == "observational":
+        return ""
+    m, r = _jitter_widths(args)
+    if m == 0 and r == 0:
+        return ""
+    return f"jit{m:g}" if m == r else f"jitM{m:g}R{r:g}"
 
 
 def run_suffix(args):
@@ -53,6 +80,8 @@ def run_suffix(args):
     if args.mode == "observational":
         parts.append(f"obs_{args.n_relation}_{args.mass_function}_{args.radius_relation}_"
                      f"{args.phase_space}_host{args.host_mass_model}_boost{args.n_boost}")
+    if jitter_tag(args):
+        parts.append(jitter_tag(args))
     if args.label:
         parts.append(args.label)
     return "".join(f"_{p}" for p in parts)
@@ -106,6 +135,9 @@ def run_description(args):
         bits.append(f"obs: {args.n_relation}, {args.mass_function}, {args.radius_relation}, "
                     f"{args.phase_space}, host {args.host_mass_model}"
                     + (f", boost {args.n_boost}" if args.n_boost not in ("1", "1.0") else ""))
+    if jitter_tag(args):
+        m, r = _jitter_widths(args)
+        bits.append(f"jitter {m:g} dex" if m == r else f"jitter M {m:g} / R {r:g} dex")
     if args.label:
         bits.append(args.label)
     return "; ".join(bits)

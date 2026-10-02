@@ -11,7 +11,10 @@ in mass to the query host, in log-mass space.
 
 Separation and velocity are resampled in dimensionless, self-similar units
 (R/R_vir and v/v_circ(host)) and rescaled to the query host's own R_vir/
-v_circ. Cluster mass and half-mass radius are resampled as-is.
+v_circ. Cluster mass and half-mass radius are resampled as-is, optionally
+with independent log-normal jitter added to each (a smoothed bootstrap -- see
+mass_jitter_dex / radius_jitter_dex), so repeated draws of the same catalog
+cluster don't produce identical clusters.
 
 PERFORMANCE: this version is optimized for two things that matter at your
 catalog's scale (~10^5-10^6 halos/clusters):
@@ -75,6 +78,7 @@ class ClusterPopulationSampler:
                  cluster_hmradius_key='hmradii_kpc', bandwidth_dex=0.3,
                  window_sigma=6.0, max_window_points=3000, min_effective_weight=5.0,
                  filter_unbound=True, host_concentration=4.0,
+                 mass_jitter_dex=0.0, radius_jitter_dex=0.0,
                  rng=None, _skip_build=False):
         """
         Parameters:
@@ -115,6 +119,15 @@ class ClusterPopulationSampler:
                 (only used if filter_unbound=True). Should match whatever
                 concentration your orbit integration downstream assumes,
                 for consistency.
+            mass_jitter_dex, radius_jitter_dex (float): smoothed-bootstrap
+                scatter. Each resampled cluster's log10 mass and log10
+                half-mass radius get independent Gaussian offsets with these
+                standard deviations (dex), so the same catalog cluster drawn
+                twice no longer gives two identical clusters. 0 (default)
+                reproduces the plain bootstrap. The offsets are median-
+                preserving in log space, so the MEAN linear mass/radius rises
+                by 10**(0.5*ln(10)*sigma**2) (x1.27 for 0.3 dex). Can also be
+                changed after construction/loading with set_jitter().
             rng (np.random.Generator or None): defaults to np.random.default_rng().
             _skip_build (bool): internal use (for load()) -- skip __init__'s
                 normal pickle-loading path.
@@ -127,6 +140,7 @@ class ClusterPopulationSampler:
         self.min_effective_weight = min_effective_weight
         self.filter_unbound = filter_unbound
         self.host_concentration = host_concentration
+        self.set_jitter(mass_jitter_dex, radius_jitter_dex)
         self.rng = rng if rng is not None else np.random.default_rng()
 
         if _skip_build:
@@ -310,6 +324,13 @@ class ClusterPopulationSampler:
         weights = np.exp(-0.5 * ((window - log_target) / self.bandwidth_dex) ** 2)
         return i0, i1, weights
 
+    def set_jitter(self, mass_jitter_dex=0.0, radius_jitter_dex=0.0):
+        """Set the smoothed-bootstrap scatter (dex) on resampled cluster mass / radius."""
+        if mass_jitter_dex < 0 or radius_jitter_dex < 0:
+            raise ValueError("jitter widths must be >= 0 dex")
+        self.mass_jitter_dex = float(mass_jitter_dex)
+        self.radius_jitter_dex = float(radius_jitter_dex)
+
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
@@ -376,8 +397,18 @@ class ClusterPopulationSampler:
 
         v_circ_target = np.sqrt(G_KPC_MSUN_KMS * subhalo_mass / subhalo_radius)  # km/s, plain float
 
-        cluster_mass = self.cl_mass[idx] * u.Msun
-        cluster_radius = (self.cl_hmradius[idx] * u.kpc).to(u.pc)
+        cl_mass = self.cl_mass[idx]
+        cl_hmradius = self.cl_hmradius[idx]
+        # smoothed bootstrap: independent log-normal scatter on each resampled
+        # cluster's mass and radius (getattr: samplers saved before this existed)
+        m_jit = getattr(self, 'mass_jitter_dex', 0.0)
+        r_jit = getattr(self, 'radius_jitter_dex', 0.0)
+        if m_jit > 0:
+            cl_mass = cl_mass * 10 ** self.rng.normal(0.0, m_jit, size=n_draw)
+        if r_jit > 0:
+            cl_hmradius = cl_hmradius * 10 ** self.rng.normal(0.0, r_jit, size=n_draw)
+        cluster_mass = cl_mass * u.Msun
+        cluster_radius = (cl_hmradius * u.kpc).to(u.pc)
         sep_mag = self.cl_dist_over_rvir[idx] * subhalo_radius       # kpc, plain float
         vel_mag = self.cl_vel_over_vcirc[idx] * v_circ_target        # km/s, plain float
         cos_theta = self.cl_cos_theta[idx]                            # may contain NaN (no geometry info)

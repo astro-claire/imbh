@@ -26,7 +26,7 @@
 # tde_contributors_...csv) into:
 #   default mode, no label:  $OUTDIR                (same as run_analysis.sh)
 #   otherwise:               $OUTDIR/analysis<suffix>/
-# where <suffix> = [_<obs tag>][_<label>], so different configurations never
+# where <suffix> = [_<obs tag>][_<jitter tag>][_<label>], so different configurations never
 # overwrite each other's analysis files.
 
 use strict;
@@ -44,6 +44,10 @@ my %opt = (
     'mode'            => 'default',          # default | observational
     'host-mass-model' => 'own',              # own | group
     'label'           => '',
+    # default-mode smoothed-bootstrap jitter on cluster mass/radius [dex]
+    'jitter-dex'        => '0',
+    'mass-jitter-dex'   => '',               # empty = --jitter-dex
+    'radius-jitter-dex' => '',               # empty = --jitter-dex
     'seed'            => '',                 # accepted for symmetry with submit_halos.pl; unused
     'alpha'           => '1.2',
     'h_rt'            => '4:00:00',
@@ -62,7 +66,7 @@ my %opt = (
 
 GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
-    'host-mass-model=s', 'label=s', 'seed=s', 'alpha=s', 'h_rt=s', 'h_data=s',
+    'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'alpha=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
     'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'wait-for-model!', 'dry-run!', 'help',
 ) or die "Bad options -- see the header of $0\n";
@@ -90,7 +94,19 @@ my $obs_tag = $obs
     ? "obs_$opt{'n-relation'}_$opt{'mass-function'}_$opt{'radius-relation'}_$opt{'phase-space'}"
       . "_host$opt{'host-mass-model'}_boost$opt{'n-boost'}"
     : '';
-my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $opt{label}));
+# smoothed-bootstrap jitter (default mode only) -- same tag as run_naming.jitter_tag
+for my $k ('jitter-dex', 'mass-jitter-dex', 'radius-jitter-dex') {
+    die "--$k must be a non-negative number\n"
+        if length $opt{$k} && $opt{$k} !~ /^[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?$/;
+}
+my $mjit = length $opt{'mass-jitter-dex'}   ? $opt{'mass-jitter-dex'}   : $opt{'jitter-dex'};
+my $rjit = length $opt{'radius-jitter-dex'} ? $opt{'radius-jitter-dex'} : $opt{'jitter-dex'};
+($mjit, $rjit) = (sprintf('%g', $mjit), sprintf('%g', $rjit));
+my $has_jit = ($mjit > 0 || $rjit > 0);
+die "--jitter-dex / --mass-jitter-dex / --radius-jitter-dex only apply to --mode default\n"
+    if $obs && $has_jit;
+my $jit_tag = !$has_jit ? '' : ($mjit eq $rjit ? "jit$mjit" : "jitM${mjit}R${rjit}");
+my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $jit_tag, $opt{label}));
 my $mode_short = $obs ? 'obs' : 'def';
 
 my $analysis_dir = length($suffix) ? "$opt{outdir}/analysis$suffix" : $opt{outdir};
@@ -155,7 +171,7 @@ END_TEMPLATE
 # ---------------------------------------------------------------- submit
 my @halos = split ' ', $opt{halos};
 die "No halo IDs given\n" unless @halos;
-print "Analysis for mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '')
+print "Analysis for mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ($has_jit ? " ($jit_tag)" : '')
     . ", host-mass-model: $opt{'host-mass-model'}" . ($opt{label} ? ", label: $opt{label}" : '')
     . ", alpha: $opt{alpha}\n";
 print "Analysis outputs -> $analysis_dir\n";

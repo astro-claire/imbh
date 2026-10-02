@@ -148,7 +148,21 @@ cluster_sampler = None
 CLUSTER_SAMPLER_MODES = ("simulation", "observational")
 
 
-def configure_cluster_sampler(mode="simulation", rng=None, **obs_kwargs):
+def jitter_tag(mass_jitter_dex=0.0, radius_jitter_dex=0.0):
+    """
+    Output-name tag for the simulation sampler's smoothed-bootstrap jitter:
+    '' (none), 'jit<s>' (same width on mass and radius) or 'jitM<m>R<r>'.
+    KEEP IN SYNC with run_naming.jitter_tag and the naming block of
+    submit_halos.pl / submit_analysis.pl.
+    """
+    m, r = float(mass_jitter_dex or 0), float(radius_jitter_dex or 0)
+    if m == 0 and r == 0:
+        return ""
+    return f"jit{m:g}" if m == r else f"jitM{m:g}R{r:g}"
+
+
+def configure_cluster_sampler(mode="simulation", rng=None, mass_jitter_dex=0.0,
+                              radius_jitter_dex=0.0, **obs_kwargs):
     """
     Select the cluster sampler that draw_clusters() uses.
 
@@ -165,12 +179,17 @@ def configure_cluster_sampler(mode="simulation", rng=None, **obs_kwargs):
             If phase_space='simulation', CLUSTER_SAMPLER_PATH is also loaded
             to supply the positions/velocities.
 
+    mass_jitter_dex / radius_jitter_dex (simulation mode only): width of the
+    independent log-normal jitter added to each bootstrapped cluster's mass
+    and half-mass radius (smoothed bootstrap; 0 = plain bootstrap, as before).
+
     rng seeds the observational sampler (the simulation sampler keeps its
     own unseeded generator, unchanged from before).
     """
     global cluster_sampler
     if mode == "simulation":
         cluster_sampler = ClusterPopulationSampler.load(CLUSTER_SAMPLER_PATH)
+        cluster_sampler.set_jitter(mass_jitter_dex, radius_jitter_dex)
     elif mode == "observational":
         phase_space_sampler = None
         if obs_kwargs.get("phase_space", "analytic") == "simulation":
@@ -1673,6 +1692,16 @@ def main():
                               "empirical relations (N_GC-M_halo, cluster mass function, cluster "
                               "mass-radius) -- see observational_cluster_sampler.py and the "
                               "--obs-* options below, which are ignored in simulation mode.")
+    parser.add_argument("--sim-jitter-dex", type=float, default=0.0,
+                         help="Simulation mode: smoothed bootstrap -- add independent log-normal "
+                              "jitter of this width (dex) to every resampled cluster's mass AND "
+                              "half-mass radius, so the same catalog cluster drawn twice doesn't give "
+                              "two identical clusters (default: 0 = plain bootstrap, as before). "
+                              "--sim-mass-jitter-dex / --sim-radius-jitter-dex override it per quantity.")
+    parser.add_argument("--sim-mass-jitter-dex", type=float, default=None,
+                         help="Simulation mode: jitter width on cluster mass only (default: --sim-jitter-dex).")
+    parser.add_argument("--sim-radius-jitter-dex", type=float, default=None,
+                         help="Simulation mode: jitter width on cluster radius only (default: --sim-jitter-dex).")
     parser.add_argument("--obs-n-relation", choices=sorted(N_RELATIONS), default="bf20",
                          help="Observational mode: cluster number vs halo mass relation "
                               "(default: bf20 = Burkert & Forbes 2020 z=0, one GC per 5e9 Msun; "
@@ -1710,6 +1739,13 @@ def main():
                               "group: legacy behavior -- the FoF group's M200/R200 as the local host, "
                               "no second background (reproduces runs made before this option existed).")
     args = parser.parse_args()
+    mass_jit = args.sim_mass_jitter_dex if args.sim_mass_jitter_dex is not None else args.sim_jitter_dex
+    radius_jit = args.sim_radius_jitter_dex if args.sim_radius_jitter_dex is not None else args.sim_jitter_dex
+    if mass_jit < 0 or radius_jit < 0:
+        parser.error("jitter widths must be >= 0 dex")
+    if args.cluster_sampler == "observational" and (mass_jit > 0 or radius_jit > 0):
+        parser.error("--sim-*jitter-dex only applies to the simulation cluster sampler "
+                     "(the observational sampler already draws masses/radii from continuous relations)")
 
     df = pd.read_csv(args.csv_path)
     required = {"delta_t_gyr", "halfmass_rad_kpc", "dm_mass_msun", "formation_subhalo_id"}
@@ -1767,7 +1803,9 @@ def main():
         n_expected = sampler.expected_number(host_masses).sum()
         print(f"Expected number of clusters over the {len(goodidx)} selected halos: {n_expected:.1f}")
     else:
-        configure_cluster_sampler("simulation")
+        configure_cluster_sampler("simulation", mass_jitter_dex=mass_jit, radius_jitter_dex=radius_jit)
+        print(f"simulation sampler jitter: mass {mass_jit:g} dex, radius {radius_jit:g} dex"
+              + ("" if (mass_jit or radius_jit) else " (plain bootstrap)"))
 
     output_clusters = iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=args.debug_trace,
                                         record_dt=record_dt, track_dir=track_dir,
@@ -1783,6 +1821,8 @@ def main():
         ext = "dat" if args.save_format == "pickle" else "csv"
         # tag observational-mode runs so they never overwrite a default-mode output
         mode_tag = "_obs" if args.cluster_sampler == "observational" else ""
+        jtag = jitter_tag(mass_jit, radius_jit)
+        mode_tag += f"_{jtag}" if jtag else ""
         save_path = os.path.join(os.path.dirname(args.csv_path) or ".",
                                   f"cluster_output_{tree_id}_snap{args.output_snap}{mode_tag}.{ext}")
         print(f"--save-path not given, using: {save_path}")

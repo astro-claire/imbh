@@ -11,6 +11,7 @@
 #   perl submit_halos.pl --mode observational             # observational mode, default settings
 #   perl submit_halos.pl --mode observational --n-relation bf20_seed --radius-relation marks_kroupa12
 #   perl submit_halos.pl --halos "467548 685512"          # only these halos
+#   perl submit_halos.pl --jitter-dex 0.3                # default mode, smoothed bootstrap (0.3 dex on M and r)
 #   perl submit_halos.pl --label v2                       # tag outputs so older runs aren't overwritten
 #   perl submit_halos.pl --dry-run                        # write + print the job scripts, don't submit
 #
@@ -19,6 +20,7 @@
 #                       $OUTDIR/cluster_tracks_<ID>[_<label>]/
 #   observational mode: $OUTDIR/cluster_output_<ID>_<SNAP>_<obs tag>[_<label>].dat
 #                       $OUTDIR/cluster_tracks_<ID>_<obs tag>[_<label>]/
+#   default mode with jitter: <SNAP>_jit<s>[_<label>] (or _jitM<m>R<r> if mass/radius widths differ)
 #   with <obs tag> = obs_<n-relation>_<mass-function>_<radius-relation>_<phase-space>_host<model>_boost<n-boost>
 # Without --label, default-mode names match what run_analysis.sh expects
 # (and will overwrite earlier default-mode outputs in $OUTDIR).
@@ -42,6 +44,10 @@ my %opt = (
     'mode'            => 'default',          # default | observational
     'host-mass-model' => 'own',              # own | group
     'label'           => '',
+    # default-mode smoothed-bootstrap jitter on cluster mass/radius [dex]
+    'jitter-dex'        => '0',
+    'mass-jitter-dex'   => '',               # empty = --jitter-dex
+    'radius-jitter-dex' => '',               # empty = --jitter-dex
     'seed'            => '',
     'h_rt'            => '24:00:00',
     'h_data'          => '4G',
@@ -58,11 +64,11 @@ my %opt = (
 
 GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
-    'host-mass-model=s', 'label=s', 'seed=s', 'h_rt=s', 'h_data=s',
+    'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
     'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'dry-run!', 'help',
 ) or die "Bad options -- see the header of $0\n";
-if ($opt{help}) { system('sed', '-n', '2,26p', $0); exit 0; }
+if ($opt{help}) { system('sed', '-n', '2,28p', $0); exit 0; }
 
 my %allowed = (
     'mode'            => [qw(default observational)],
@@ -84,7 +90,19 @@ my $obs_tag = $obs
     ? "obs_$opt{'n-relation'}_$opt{'mass-function'}_$opt{'radius-relation'}_$opt{'phase-space'}"
       . "_host$opt{'host-mass-model'}_boost$opt{'n-boost'}"
     : '';
-my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $opt{label}));
+# smoothed-bootstrap jitter (default mode only) -- same tag as run_naming.jitter_tag
+for my $k ('jitter-dex', 'mass-jitter-dex', 'radius-jitter-dex') {
+    die "--$k must be a non-negative number\n"
+        if length $opt{$k} && $opt{$k} !~ /^[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?$/;
+}
+my $mjit = length $opt{'mass-jitter-dex'}   ? $opt{'mass-jitter-dex'}   : $opt{'jitter-dex'};
+my $rjit = length $opt{'radius-jitter-dex'} ? $opt{'radius-jitter-dex'} : $opt{'jitter-dex'};
+($mjit, $rjit) = (sprintf('%g', $mjit), sprintf('%g', $rjit));
+my $has_jit = ($mjit > 0 || $rjit > 0);
+die "--jitter-dex / --mass-jitter-dex / --radius-jitter-dex only apply to --mode default\n"
+    if $obs && $has_jit;
+my $jit_tag = !$has_jit ? '' : ($mjit eq $rjit ? "jit$mjit" : "jitM${mjit}R${rjit}");
+my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $jit_tag, $opt{label}));
 my $mode_short = $obs ? 'obs' : 'def';
 
 my $jobdir = "$opt{outdir}/jobscripts";
@@ -141,7 +159,8 @@ END_TEMPLATE
 # ---------------------------------------------------------------- submit
 my @halos = split ' ', $opt{halos};
 die "No halo IDs given\n" unless @halos;
-print "Mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ", host-mass-model: $opt{'host-mass-model'}"
+print "Mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ($has_jit ? " ($jit_tag)" : '')
+    . ", host-mass-model: $opt{'host-mass-model'}"
     . ($opt{label} ? ", label: $opt{label}" : '') . "\n";
 print "Job scripts in $jobdir\n";
 
@@ -171,6 +190,7 @@ for my $id (@halos) {
             "--obs-n-boost $opt{'n-boost'}";
         push @args, "--obs-n-scatter-dex $opt{'n-scatter-dex'}" if length $opt{'n-scatter-dex'};
     }
+    push @args, "--sim-mass-jitter-dex $mjit --sim-radius-jitter-dex $rjit" if $has_jit;
     push @args, "--seed $opt{seed}" if length $opt{seed};
     my $cmd = join(' ', @args);
 
