@@ -27,6 +27,7 @@ Examples:
     python plot_tde_rates_quad.py --data-dir ... --left-flags ""   # maximal model without jitter
 """
 import argparse
+import re
 import shlex
 
 import numpy as np
@@ -59,6 +60,36 @@ def wrap_words(text, words_per_line):
     """Break text into lines of at most words_per_line words (so it fits the z = 7 -> 0 strip)."""
     w = text.split()
     return "\n".join(" ".join(w[i:i + words_per_line]) for i in range(0, len(w), words_per_line))
+
+
+_NUM = r"(\d+(?:\.\d+)?)[eE]\+?(-?\d+)"
+
+
+def _pow10(m):
+    """'1e11' -> 10^{11}, '3e10' -> 3\\times10^{10} (mathtext)."""
+    mant, exp = m.group(1), int(m.group(2))
+    return f"10^{{{exp}}}" if float(mant) == 1 else f"{mant}\\times10^{{{exp}}}"
+
+
+def format_mass_label(label):
+    """
+    Turn a --bin label like ">1e11", "gt1e11", "1e10-1e11" or "<1e9" into
+    mathtext with powers of ten and solar-mass units, e.g.
+    "$>10^{11}\\,M_\\odot$" or "$10^{10}$–$10^{11}\\,M_\\odot$" (same style
+    as DEFAULT_MASS_BINS). Labels that already contain '$', or that hold no
+    number in 1e11 form, are returned unchanged.
+    """
+    if "$" in label or not re.search(_NUM, label):
+        return label
+    s = label.strip()
+    s = re.sub(r"^(gt|>)\s*", ">", s, flags=re.I)
+    s = re.sub(r"^(lt|<)\s*", "<", s, flags=re.I)
+    rng = re.fullmatch(_NUM + r"\s*[-–]\s*" + _NUM, s)
+    if rng:
+        lo = _pow10(re.match(_NUM, rng.group(0)))
+        hi = _pow10(re.search(_NUM + r"$", rng.group(0)))
+        return f"${lo}$–${hi}\\,M_\\odot$"
+    return "$" + re.sub(_NUM, _pow10, s) + r"\,M_\odot$"
 
 
 def parse_run_flags(flag_string):
@@ -103,7 +134,7 @@ def main():
             if len(e) < 2:
                 p.error("--bin needs a label followed by at least one subhalo ID")
             tag = "".join(c if c.isalnum() or c in "-_." else "_" for c in e[0])
-            mass_bins.append((tag, e[0], EXTRA_COLORS[i % len(EXTRA_COLORS)], e[1:]))
+            mass_bins.append((tag, format_mass_label(e[0]), EXTRA_COLORS[i % len(EXTRA_COLORS)], e[1:]))
     else:
         mass_bins = DEFAULT_MASS_BINS
 
