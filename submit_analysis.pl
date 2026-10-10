@@ -18,6 +18,10 @@
 #                        (job name imbh_<def|obs>_<ID>) has finished
 #   --h_rt / --h_data    resources per job (default 4:00:00 / 4G)
 #   --dry-run            write + print the job scripts, don't submit
+#   --loss-cone MODE     TDE supply prescription passed to analysis.py:
+#                        none (default, original) | log | full | relax
+#   --include-undepleted with --loss-cone log/full/relax: also count shells
+#                        that are not depleted within the cluster's lifetime
 #
 # Reads, per halo (same names as submit_halos.pl):
 #   $OUTDIR/cluster_output_<ID>_<SNAP><suffix>.dat
@@ -26,8 +30,9 @@
 # tde_contributors_...csv) into:
 #   default mode, no label:  $OUTDIR                (same as run_analysis.sh)
 #   otherwise:               $OUTDIR/analysis<suffix>/
-# where <suffix> = [_<obs tag>][_<jitter tag>][_<label>], so different configurations never
-# overwrite each other's analysis files.
+# where <suffix> = [_<obs tag>][_<jitter tag>][_<label>][_lc<MODE>[U]], so different
+# configurations never overwrite each other's analysis files. (_lc<MODE> is added
+# for any --loss-cone other than none; U marks --include-undepleted.)
 
 use strict;
 use warnings;
@@ -61,6 +66,8 @@ my %opt = (
     'n-boost'         => '1.0',
     'n-scatter-dex'   => '',                 # not part of the names; accepted and ignored
     'wait-for-model'  => 0,
+    'loss-cone'       => 'none',             # none | log | full | relax (see analysis.py)
+    'include-undepleted' => 0,
     'dry-run'         => 0,
 );
 
@@ -69,6 +76,7 @@ GetOptions(\%opt,
     'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'alpha=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
     'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'wait-for-model!', 'dry-run!', 'help',
+    'loss-cone=s', 'include-undepleted!',
 ) or die "Bad options -- see the header of $0\n";
 if ($opt{help}) { system('sed', '-n', '2,31p', $0); exit 0; }
 
@@ -79,6 +87,7 @@ my %allowed = (
     'mass-function'   => [qw(gclf icmf)],
     'radius-relation' => [qw(brown_gnedin21 brown_gnedin21_young marks_kroupa12 const_surface_density)],
     'phase-space'     => [qw(analytic simulation)],
+    'loss-cone'       => [qw(none log full relax)],
 );
 for my $k (sort keys %allowed) {
     die "--$k must be one of: @{$allowed{$k}} (got '$opt{$k}')\n"
@@ -109,7 +118,17 @@ my $jit_tag = !$has_jit ? '' : ($mjit eq $rjit ? "jit$mjit" : "jitM${mjit}R${rji
 my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $jit_tag, $opt{label}));
 my $mode_short = $obs ? 'obs' : 'def';
 
-my $analysis_dir = length($suffix) ? "$opt{outdir}/analysis$suffix" : $opt{outdir};
+# analysis-only tag (the model outputs don't depend on it). KEEP IN SYNC with
+# run_naming.loss_cone_tag.
+die "--include-undepleted needs --loss-cone log, full or relax\n"
+    if $opt{'include-undepleted'} && $opt{'loss-cone'} eq 'none';
+my $lc_tag = $opt{'loss-cone'} eq 'none' ? ''
+           : "lc$opt{'loss-cone'}" . ($opt{'include-undepleted'} ? 'U' : '');
+my $asuffix = $suffix . (length $lc_tag ? "_$lc_tag" : '');
+my $lc_args = $opt{'loss-cone'} eq 'none' ? ''
+            : " --loss-cone $opt{'loss-cone'}" . ($opt{'include-undepleted'} ? ' --include-undepleted' : '');
+
+my $analysis_dir = length($asuffix) ? "$opt{outdir}/analysis$asuffix" : $opt{outdir};
 my $jobdir = "$opt{outdir}/jobscripts";
 make_path($jobdir) unless -d $jobdir;
 
@@ -149,7 +168,7 @@ if [ ! -f "$DAT" ]; then
 fi
 mkdir -p "$ANALYSIS_DIR"
 
-CMD="python analysis.py $DAT __ALPHA__ --subhalo-id $ID --output-dir $ANALYSIS_DIR"
+CMD="python analysis.py $DAT __ALPHA__ --subhalo-id $ID --output-dir $ANALYSIS_DIR__LC_ARGS__"
 if [ -d "$TRACKDIR" ]; then
     CMD="$CMD --track-dir $TRACKDIR"
 else
@@ -173,7 +192,8 @@ my @halos = split ' ', $opt{halos};
 die "No halo IDs given\n" unless @halos;
 print "Analysis for mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ($has_jit ? " ($jit_tag)" : '')
     . ", host-mass-model: $opt{'host-mass-model'}" . ($opt{label} ? ", label: $opt{label}" : '')
-    . ", alpha: $opt{alpha}\n";
+    . ", alpha: $opt{alpha}, loss cone: $opt{'loss-cone'}"
+    . ($opt{'include-undepleted'} ? ' (+undepleted)' : '') . "\n";
 print "Analysis outputs -> $analysis_dir\n";
 print "Job scripts in $jobdir\n";
 
@@ -205,12 +225,13 @@ for my $id (@halos) {
         TRACKDIR     => $trackdir,
         ANALYSIS_DIR => $analysis_dir,
         ALPHA        => $opt{alpha},
+        LC_ARGS      => $lc_args,
     );
     (my $script = $template) =~ s/__([A-Z][A-Z_]*?)__/exists $fill{$1} ? $fill{$1} : "__${1}__"/ge;
     die "Internal error: unfilled placeholder $1 in job script for halo $id\n"
         if $script =~ /__([A-Z][A-Z_]*)__/;
 
-    my $path = "$jobdir/analysis_${mode_short}_$id$suffix.sh";
+    my $path = "$jobdir/analysis_${mode_short}_$id$asuffix.sh";
     open(my $fh, '>', $path) or die "Cannot write $path: $!\n";
     print $fh $script;
     close($fh);

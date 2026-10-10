@@ -55,6 +55,32 @@ TRH_DELAY = 1.0
 # calc_relaxation_time / calc_cutoff_radius below, for consistency.
 TRH_COULOMB_GAMMA = 0.2
 
+# Loss-cone treatment of the TDE supply (see depletion_shells / --loss-cone):
+#  * 'none' : the original prescription -- every star in the region where the
+#             local relaxation time t_relax(r) < t_life (one critical radius,
+#             calc_cutoff_radius) is disrupted, each shell at rate
+#             dM / t_relax(outer edge). Reproduces the paper-draft results.
+#  * 'log'  : depletion time t_dep = t_relax * ln(J_c^2/J_lc^2), with
+#             J_lc^2/J_c^2 ~ 2 r_T / a and a ~ r (empty-loss-cone / diffusive
+#             regime). Shells with t_dep < t_life are depleted, each at rate
+#             dM / t_dep.
+#  * 'full' : t_dep = t_relax * [ln(J_c^2/J_lc^2) + q], q = P / (R_lc t_relax),
+#             which tends to t_relax*ln(1/R_lc) for q << 1 (empty loss cone) and
+#             to P / R_lc for q >> 1 (full loss cone: the supply is limited by the
+#             orbital period, not by relaxation) -- the usual interpolation of
+#             the Cohn & Kulsrud (1978) flux, cf. Merritt (2013) ch. 6.
+#  * 'relax': the shell method with t_dep = t_relax (no loss-cone factor) --
+#             only for checking the shell method against 'none'.
+# 'log'/'full'/'relax' replace the single critical radius with N_SHELLS
+# log-spaced shells between r_in and r_out, because t_dep(r) need not be
+# monotonic once the loss-cone terms are included.
+# INCLUDE_UNDEPLETED: also let shells with t_dep > t_life contribute, at rate
+# dM / t_dep for the whole lifetime (a partial, steady supply).
+LOSS_CONE = 'none'
+LOSS_CONE_MODES = ('none', 'log', 'full', 'relax')
+N_SHELLS = 30
+INCLUDE_UNDEPLETED = False
+
 def load_data_file(file_path):
     """
     Checks the file extension and loads a .csv or .dat file into a Pandas DataFrame.
@@ -103,7 +129,8 @@ def half_mass_relaxation_time_gyr(m_star_msun, r_h_pc, m_mean_msun=1.0, gamma=TR
     return t.to(u.Gyr).value
 
 
-def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None):
+def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
+                       loss_cone=None, n_shells=None, include_undepleted=None):
     """
     Returns (mass_lost_bins, t_relax_bin, t_cutoff_gyr, t_delay_gyr), or four
     Nones if this cluster produces no TDEs.
@@ -114,6 +141,11 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None):
     """
     subtract_imbh = SUBTRACT_IMBH_MASS if subtract_imbh is None else subtract_imbh
     trh_delay = TRH_DELAY if trh_delay is None else trh_delay
+    loss_cone = LOSS_CONE if loss_cone is None else loss_cone
+    n_shells = N_SHELLS if n_shells is None else n_shells
+    include_undepleted = INCLUDE_UNDEPLETED if include_undepleted is None else include_undepleted
+    if loss_cone not in LOSS_CONE_MODES:
+        raise ValueError(f"loss_cone must be one of {LOSS_CONE_MODES}, got {loss_cone!r}")
     stellar_radius = stellar_radius_approximation(1* u.Msun)
     limiting_tscale_gyr = []
     roche = False # start out with no roche effects
@@ -159,6 +191,22 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None):
 
         r_sphere_of_influence = sphere_of_influence(df['IMBH_mass_msun'][idx], df['r0_pc'][idx],
                                                      rho0_star, alpha)
+
+        if loss_cone != 'none':
+            # ---- depletion-time shell method (see depletion_shells) ----
+            # same inner/outer limits as the original prescription below
+            outer_pc = min(r_sphere_of_influence.value, df['r0_pc'][idx])
+            if roche:
+                outer_pc = min(outer_pc, df['min_roche_radius_kpc'][idx] * 1e3)
+            inner_pc = max(stellar_radius.to('pc').value,
+                           calc_min_enclosed_radius(2*u.Msun, df['r0_pc'][idx], rho0_star, alpha).value)
+            mass_lost_bins, t_dep_bin = depletion_shells(
+                m_imbh, df['r0_pc'][idx], rho0_star, alpha, inner_pc, outer_pc, t_cutoff_gyr,
+                mode=loss_cone, n_shells=n_shells, include_undepleted=include_undepleted,
+                rstar_pc=stellar_radius.to('pc').value)
+            if len(mass_lost_bins) == 0:
+                return None, None, None, None
+            return mass_lost_bins, t_dep_bin, t_cutoff_gyr, t_delay_gyr
 
         r = calc_cutoff_radius(t_cutoff_gyr, df['IMBH_mass_msun'][idx],
                                 df['r0_pc'][idx], rho0_star, alpha,
@@ -255,6 +303,73 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None):
         tde_rate = M_star_removed_msun/cluster_relaxation_time_gyr / u.Gyr
 
         return np.array(mass_lost_bins*u.Msun),np.array(t_relax_bin), t_cutoff_gyr, t_delay_gyr
+
+def depletion_time_gyr(r_pc, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar=1.0):
+    """
+    Time (Gyr) to deplete the stars at radius r_pc (array) around the IMBH.
+
+        t_relax = 0.34 sigma^3 / (G^2 rho m ln Lambda)   (as calc_relaxation_time,
+                  ln Lambda = ln(0.2 M(<r)/m), floored at 1 so the innermost
+                  few-star shells can't give a zero/negative time)
+        r_T     = R_* (M_BH/m)^(1/3);   R_lc = J_lc^2/J_c^2 ~ 2 r_T / a,  a ~ r
+        'relax' : t_dep = t_relax
+        'log'   : t_dep = t_relax * ln(1/R_lc)
+        'full'  : t_dep = t_relax * [ln(1/R_lc) + q],  q = P / (R_lc t_relax),
+                  P = 2 pi sqrt(r^3 / G M_BH)   (Keplerian, valid inside r_infl)
+    ln(1/R_lc) is floored at 1. Also returns (ln(1/R_lc), q) for diagnostics.
+    """
+    r_pc = np.atleast_1d(np.asarray(r_pc, dtype=float))
+    sigma, rho, M = calc_structural_props(r_pc, imbh_mass, rho0, r0, alpha)
+    coulomb_log = np.maximum(np.log(0.2 * M.to(u.Msun).value / Mstar), 1.0)
+    t_relax = (0.34 * sigma**3 / G**2 / rho / (Mstar * u.Msun) / coulomb_log).to(u.Gyr).value
+    r_T = rstar_pc * (imbh_mass / Mstar) ** (1. / 3.)
+    R_lc = np.minimum(2 * r_T / r_pc, 1.0)
+    lc_log = np.maximum(np.log(1. / R_lc), 1.0)
+    period = (2 * np.pi * np.sqrt((r_pc * u.pc)**3 / (G * imbh_mass * u.Msun))).to(u.Gyr).value
+    q = period / (R_lc * t_relax)
+    if mode == 'relax':
+        t_dep = t_relax
+    elif mode == 'log':
+        t_dep = t_relax * lc_log
+    elif mode == 'full':
+        t_dep = t_relax * (lc_log + q)
+    else:
+        raise ValueError(f"unknown loss-cone mode {mode!r}")
+    return t_dep, lc_log, q
+
+
+def depletion_shells(imbh_mass, r0, rho0, alpha, r_in_pc, r_out_pc, t_life_gyr,
+                     mode='log', n_shells=N_SHELLS, include_undepleted=False, rstar_pc=None,
+                     Mstar=1.0):
+    """
+    Split [r_in, r_out] into n_shells log-spaced shells and return
+    (mass_lost_msun, t_dep_gyr), one entry per contributing shell:
+
+      * t_dep is evaluated at each shell's geometric midpoint (depletion_time_gyr);
+      * a shell is DEPLETED within the lifetime if t_dep < t_life (t_life = the
+        time available after the TDE onset delay, i.e. t_cutoff_gyr). Only
+        depleted shells contribute unless include_undepleted is set.
+
+    run_clusters then releases each shell's mass dM at rate dM / t_dep for
+    min(t_dep, t_life), so a depleted shell is emptied completely, and (with
+    include_undepleted) an undepleted one gives a steady dM / t_dep for the
+    whole lifetime. Averaged over the lifetime, the depleted part is the
+    N_*(t_dep < t_life) / t_life estimate.
+    """
+    if rstar_pc is None:
+        rstar_pc = (1 * u.Rsun).to(u.pc).value
+    if not (r_out_pc > r_in_pc > 0) or not t_life_gyr > 0:
+        return np.array([]), np.array([])
+    edges = np.logspace(np.log10(r_in_pc), np.log10(r_out_pc), n_shells + 1)
+    m_edges = calc_structural_props(edges, imbh_mass, rho0, r0, alpha)[2].to(u.Msun).value
+    dM = np.diff(m_edges)
+    r_mid = np.sqrt(edges[:-1] * edges[1:])
+    t_dep, _, _ = depletion_time_gyr(r_mid, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar)
+    keep = (dM > 0) & np.isfinite(t_dep) & (t_dep > 0)
+    if not include_undepleted:
+        keep &= t_dep < t_life_gyr
+    return dM[keep], t_dep[keep]
+
 
 def sphere_of_influence(imbh_mass,r0,rho0, alpha):
     """
@@ -464,7 +579,8 @@ def _burst_bins(t_start_yr, t_end_yr, t0_yr, dt_yr, n_bins):
 
 def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
                   resolution = 1e5*u.yr, track_dir=None, radial_edges_kpc=None,
-                  subtract_imbh=None, trh_delay=None):
+                  subtract_imbh=None, trh_delay=None, loss_cone=None, n_shells=None,
+                  include_undepleted=None):
     """
     Returns (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc,
     n_clusters_with_tde, contributing_rows, radial):
@@ -572,7 +688,8 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
         if df['IMBH_mass_msun'][clusteridx]>0:
             halo_formation_time = cosmo.age(df[formation_z_col][clusteridx])
             mass_lost_bins,t_relax_bin, t_cutoff_gyr, t_delay_gyr = timescale_analysis(
-                df, clusteridx, alpha, subtract_imbh=subtract_imbh, trh_delay=trh_delay)
+                df, clusteridx, alpha, subtract_imbh=subtract_imbh, trh_delay=trh_delay,
+                loss_cone=loss_cone, n_shells=n_shells, include_undepleted=include_undepleted)
             if t_cutoff_gyr is not None: 
                 # TDEs start t_delay_gyr (trh_delay half-mass relaxation times)
                 # after the IMBH forms -- see timescale_analysis
@@ -728,6 +845,18 @@ def main():
     parser.add_argument("--trh-delay", type=float, default=TRH_DELAY,
                          help="Delay the start of TDEs by this many cluster half-mass relaxation "
                               f"times after the IMBH forms (default: {TRH_DELAY:g}; 0 = no delay).")
+    parser.add_argument("--loss-cone", choices=LOSS_CONE_MODES, default=LOSS_CONE,
+                         help="TDE supply prescription (see LOSS_CONE at the top of this file): "
+                              "'none' = original critical-radius method (default); 'log' = depletion "
+                              "time t_relax*ln(J_c^2/J_lc^2); 'full' = t_relax*[ln(J_c^2/J_lc^2)+q], "
+                              "valid in both the empty and full loss-cone regimes; 'relax' = shell "
+                              "method without a loss-cone factor (check against 'none'). Use a "
+                              "separate --output-dir per mode (submit_analysis.pl does this).")
+    parser.add_argument("--n-shells", type=int, default=N_SHELLS,
+                         help=f"Number of log-spaced shells for --loss-cone log/full/relax (default: {N_SHELLS}).")
+    parser.add_argument("--include-undepleted", action="store_true",
+                         help="With --loss-cone log/full/relax: let shells with t_dep > t_life "
+                              "contribute dM/t_dep for the whole lifetime (default: only depleted shells).")
     args = parser.parse_args()
 
     subhalo_id = args.subhalo_id or infer_subhalo_id(args.input_path)
@@ -739,6 +868,9 @@ def main():
     print(f"Subhalo {subhalo_id}, alpha = {float(args.alpha)}")
     print(f"IMBH mass subtracted from the stellar profile: {not args.no_subtract_imbh}; "
           f"TDE onset delayed by {args.trh_delay:g} half-mass relaxation time(s)")
+    print(f"Loss-cone prescription: {args.loss_cone}"
+          + (f" ({args.n_shells} shells{', undepleted shells included' if args.include_undepleted else ''})"
+             if args.loss_cone != 'none' else ""))
     df = load_data_file(args.input_path)
     print(df.columns)
     tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun = set_up_timebins(1e5*u.yr)
@@ -748,6 +880,8 @@ def main():
         df, float(args.alpha), tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
         resolution=1e5*u.yr, track_dir=args.track_dir, radial_edges_kpc=radial_edges_kpc,
         subtract_imbh=not args.no_subtract_imbh, trh_delay=args.trh_delay,
+        loss_cone=args.loss_cone, n_shells=args.n_shells,
+        include_undepleted=args.include_undepleted,
     )
     output_df = pd.DataFrame({
         'time': tscale_array_yr[:-2],
