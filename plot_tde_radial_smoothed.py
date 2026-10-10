@@ -60,7 +60,7 @@ import argparse
 import os
 
 from mass_labels import format_mass_label
-from run_naming import (add_run_args, run_suffix, analysis_dir, run_description,
+from run_naming import (add_run_args, analysis_suffix, analysis_dir, run_description,
                         add_escaped_arg, escaped_suffix, escaped_description)
 
 import numpy as np
@@ -251,7 +251,7 @@ def main():
     add_escaped_arg(p)
     args = p.parse_args()
 
-    suffix = run_suffix(args)
+    suffix = analysis_suffix(args)
     data_dir = analysis_dir(args.data_dir, suffix)
     run_desc = run_description(args)
     print(f"Reading analysis outputs from {data_dir}"

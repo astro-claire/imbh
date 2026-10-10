@@ -47,7 +47,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 from mass_labels import format_mass_label
-from run_naming import add_run_args, run_suffix, analysis_dir, run_description
+from run_naming import add_run_args, analysis_suffix, analysis_dir, run_description
 from plot_tde_rates_smoothed import (DEFAULT_MASS_BINS, EXTRA_COLORS, Z_MAX, load_rates,
                                      smooth, band, age_to_redshift)
 
@@ -135,7 +135,7 @@ def main():
     columns = []  # (label, run args, suffix, data dir)
     for flags, label in ((args.left_flags, args.left_label), (args.right_flags, args.right_label)):
         rargs = parse_run_flags(flags)
-        suffix = run_suffix(rargs)
+        suffix = analysis_suffix(rargs)
         ddir = analysis_dir(args.data_dir, suffix)
         print(f"{label}: {ddir}  [{run_description(rargs) or 'default mode'}]")
         columns.append((label, rargs, suffix, ddir))

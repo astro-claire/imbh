@@ -95,7 +95,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from pathlib import Path
 
-from run_naming import add_run_args, run_suffix, analysis_dir, run_description
+from run_naming import add_run_args, run_suffix, analysis_suffix, analysis_dir, run_description
 
 
 def load_sparse_track(path, max_points):
@@ -320,7 +320,7 @@ def main():
         if args.tde_contributors_csv is None and (args.restrict_to_tde_contributors
                                                   or args.color_by == "tde_contributor"):
             args.tde_contributors_csv = os.path.join(
-                analysis_dir(args.data_dir, suffix), f"tde_contributors_{hid}_alpha{float(args.tde_alpha)}.csv")
+                analysis_dir(args.data_dir, analysis_suffix(args)), f"tde_contributors_{hid}_alpha{float(args.tde_alpha)}.csv")
         if args.tree_path == "auto":
             args.tree_path = os.path.join("tng_download", f"sublink_full_{hid}.hdf5")
         print(f"Run: halo {hid}" + (f"  [{run_desc}]" if run_desc else "  [default mode]"))

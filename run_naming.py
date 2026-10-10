@@ -52,6 +52,11 @@ def add_run_args(parser):
     g.add_argument("--radius-jitter-dex", type=float, default=None,
                    help="Override --jitter-dex for cluster radius only.")
     g.add_argument("--label", default="")
+    g.add_argument("--loss-cone", choices=["none", "log", "full", "relax"], default="none",
+                   help="analysis.py --loss-cone mode the TDE rates were computed with "
+                        "(as passed to submit_analysis.pl; default none = original prescription).")
+    g.add_argument("--include-undepleted", action="store_true",
+                   help="The analysis run used --include-undepleted.")
     return parser
 
 
@@ -85,6 +90,20 @@ def run_suffix(args):
     if args.label:
         parts.append(args.label)
     return "".join(f"_{p}" for p in parts)
+
+
+def loss_cone_tag(args):
+    """'' for --loss-cone none, else 'lc<mode>[U]'. KEEP IN SYNC with submit_analysis.pl."""
+    mode = getattr(args, "loss_cone", "none") or "none"
+    if mode == "none":
+        return ""
+    return f"lc{mode}" + ("U" if getattr(args, "include_undepleted", False) else "")
+
+
+def analysis_suffix(args):
+    """run_suffix plus the analysis-only loss-cone tag: names the analysis<suffix>/ folder."""
+    lc = loss_cone_tag(args)
+    return run_suffix(args) + (f"_{lc}" if lc else "")
 
 
 def analysis_dir(data_dir, suffix):
@@ -140,4 +159,7 @@ def run_description(args):
         bits.append(f"jitter {m:g} dex" if m == r else f"jitter M {m:g} / R {r:g} dex")
     if args.label:
         bits.append(args.label)
+    if loss_cone_tag(args):
+        bits.append(f"loss cone: {args.loss_cone}"
+                    + (" + undepleted" if getattr(args, "include_undepleted", False) else ""))
     return "; ".join(bits)
