@@ -42,6 +42,7 @@ default-mode plots are never overwritten:
 import argparse
 import os
 
+from mass_labels import format_mass_label
 from run_naming import (add_run_args, run_suffix, analysis_dir, run_description,
                         add_escaped_arg, escaped_suffix, escaped_description)
 
@@ -197,7 +198,7 @@ def main():
                 parser.error("--bin needs a label followed by at least one subhalo ID")
             label, ids = entry[0], entry[1:]
             tag = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
-            mass_bins.append((tag, label, EXTRA_COLORS[i % len(EXTRA_COLORS)], ids))
+            mass_bins.append((tag, format_mass_label(label), EXTRA_COLORS[i % len(EXTRA_COLORS)], ids))
     else:
         mass_bins = DEFAULT_MASS_BINS
 
