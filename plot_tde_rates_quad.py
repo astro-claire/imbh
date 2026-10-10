@@ -3,8 +3,15 @@ Four-panel version of plot_tde_rates_smoothed.py: smoothed, bin-averaged TDE
 rates vs. redshift for two model runs (columns) and two cluster selections
 (rows).
 
-    rows    (shared x axis): top    = escaped clusters excluded ("Bound to galaxy")
-                             bottom = escaped clusters only     ("Escaped")
+    rows    (shared x axis), --split event-distance (default):
+                             top    = TDEs that went off within --r200-factor (default 3)
+                                      R200c of the main progenitor at the time of the event
+                             bottom = TDEs that went off beyond it
+                             (top + bottom = total rate; see distance_split.py)
+                             --split z0-status (the old behaviour):
+                             top    = escaped clusters excluded ("Bound to galaxy")
+                             bottom = escaped clusters only     ("Escaped"), where
+                                      'escaped' = beyond 3 R200c of the z = 0 host at z = 0
     columns (shared y axis): left   = --left-flags  run (default: default mode with --jitter-dex 0.3, "Maximal model")
                              right  = --right-flags run (default: --mode observational
                                       --n-relation bf20_seed --radius-relation marks_kroupa12,
@@ -20,6 +27,11 @@ Reads <data-dir>/tde_rates_<ID>_alpha<alpha>.csv for a default-mode run, or
 <data-dir>/analysis<suffix>/... for any other run (see run_naming.py); the
 files must carry tde_rate_escaped_msunyr (analysis.py with the escaped split).
 plot_tde_rates_smoothed.py and run_naming.py must sit next to this script.
+--split event-distance instead reads <same dir>/tde_radial_<ID>_alpha<alpha>.npz
+(also written by analysis.py) plus each halo's merger tree
+<--tree-dir>/sublink_full_<ID>.hdf5 for the main progenitor's R200c(z); the
+R200c history is cached as r200_history_<ID>.csv in --r200-cache-dir.
+distance_split.py and tree_navigator.py must sit next to this script.
 
 Examples:
     python plot_tde_rates_quad.py --data-dir /u/scratch/c/clairewi/imbh-output
@@ -52,7 +64,7 @@ plt.rcParams.update({
 
 DEFAULT_LEFT_FLAGS = "--jitter-dex 0.3"  # default mode, smoothed bootstrap (0.3 dex)
 DEFAULT_RIGHT_FLAGS = "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12"
-ROWS = [("exclude", "Bound to galaxy"), ("only", "Escaped")]
+ROWS = [("exclude", "Bound to galaxy"), ("only", "Escaped")]  # --split z0-status
 SHADE_Z = (7, 0)  # no new clusters form below z = 7 in the default (simulation-calibrated) mode
 
 
@@ -79,8 +91,20 @@ def main():
                    help=f'Run-selection flags for the right column (default: "{DEFAULT_RIGHT_FLAGS}").')
     p.add_argument("--left-label", default="Maximal model")
     p.add_argument("--right-label", default="Conservative model")
-    p.add_argument("--top-label", default=ROWS[0][1])
-    p.add_argument("--bottom-label", default=ROWS[1][1])
+    p.add_argument("--split", choices=["event-distance", "z0-status"], default="event-distance",
+                   help="How the rows divide the rate: by the cluster's separation from the main "
+                        "progenitor when each TDE goes off (default), or by the cluster's z = 0 "
+                        "'escaped' status (the old behaviour).")
+    p.add_argument("--r200-factor", type=float, default=3.0,
+                   help="event-distance split: threshold in units of the main progenitor's R200c "
+                        "at the time of the event (default: 3).")
+    p.add_argument("--tree-dir", default="tng_download",
+                   help="event-distance split: directory holding sublink_full_<ID>.hdf5.")
+    p.add_argument("--snap-redshift-path", default="tng_download/snapshot_redshifts.json")
+    p.add_argument("--r200-cache-dir", default=None,
+                   help="Where to cache r200_history_<ID>.csv (default: --data-dir).")
+    p.add_argument("--top-label", default=None)
+    p.add_argument("--bottom-label", default=None)
     p.add_argument("--shade-text", default="no further star cluster formation",
                    help="Text written in the grey z = 7 -> 0 region of default-mode panels ('' for none).")
     p.add_argument("--shade-text-y", type=float, default=0.95,
@@ -116,20 +140,44 @@ def main():
         print(f"{label}: {ddir}  [{run_description(rargs) or 'default mode'}]")
         columns.append((label, rargs, suffix, ddir))
 
-    row_labels = [args.top_label, args.bottom_label]
+    if args.split == "event-distance":
+        from distance_split import load_rates_by_distance
+        f = f"{args.r200_factor:g}"
+        default_labels = [rf"Within ${f}\,R_{{200c}}$", rf"Beyond ${f}\,R_{{200c}}$"]
+    else:
+        default_labels = [ROWS[0][1], ROWS[1][1]]
+    row_labels = [args.top_label if args.top_label is not None else default_labels[0],
+                  args.bottom_label if args.bottom_label is not None else default_labels[1]]
+    cache_dir = args.r200_cache_dir or args.data_dir
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), sharex=True, sharey="row")
     row_hi = [[], []]  # positive band tops per row, for log y-limits
     band_desc = None
     for c, (col_label, rargs, _, ddir) in enumerate(columns):
-        for r, (escaped, _) in enumerate(ROWS):
+        # per mass bin: (time_yr, [top-row rates, bottom-row rates], used_ids)
+        print(f"\n[{col_label}]")
+        per_bin = {}
+        for bin_tag, label, color, halo_ids in mass_bins:
+            if args.split == "event-distance":
+                loaded = load_rates_by_distance(ddir, halo_ids, args.alpha, age_to_redshift,
+                                                args.tree_dir, args.snap_redshift_path,
+                                                factor=args.r200_factor, cache_dir=cache_dir)
+                if loaded is not None:
+                    time_yr, near, far, used_ids = loaded
+                    per_bin[bin_tag] = (time_yr, [near, far], used_ids)
+            else:
+                rows_loaded = [load_rates(ddir, halo_ids, args.alpha, escaped) for escaped, _ in ROWS]
+                if rows_loaded[0] is not None:
+                    per_bin[bin_tag] = (rows_loaded[0][0], [rl[1] for rl in rows_loaded],
+                                        rows_loaded[0][2])
+        for r in range(2):
             ax = axes[r, c]
             print(f"\n[{col_label} / {row_labels[r]}]")
             for bin_tag, label, color, halo_ids in mass_bins:
-                loaded = load_rates(ddir, halo_ids, args.alpha, escaped)
-                if loaded is None:
-                    print(f"WARNING: no tde_rates files for bin {bin_tag}; skipping it in this panel")
+                if bin_tag not in per_bin:
+                    print(f"WARNING: no analysis files for bin {bin_tag}; skipping it in this panel")
                     continue
-                time_yr, rates, used_ids = loaded
+                time_yr, row_rates, used_ids = per_bin[bin_tag]
+                rates = row_rates[r]
                 dt_yr = np.median(np.diff(time_yr))
                 smoothed = smooth(rates, dt_yr, args.smooth_myr, args.kernel)
                 mean = smoothed.mean(axis=0)
@@ -170,7 +218,8 @@ def main():
         axes[0, c].set_title(col_label, fontsize=FONT_SIZE + 2, pad=12)
 
     fig.supxlabel("Redshift", fontsize=FONT_SIZE + 2, y=0.035)
-    fig.supylabel(r"TDE rate ($M_\odot$/yr)", fontsize=FONT_SIZE + 2, x=0.015)
+    # 1 Msun stars: the mass-loss rate in Msun/yr is the event rate in 1/yr
+    fig.supylabel(r"TDE rate (yr$^{-1}$)", fontsize=FONT_SIZE + 2, x=0.015)
 
     handles = [Line2D([], [], color=color, lw=2.5, label=label) for _, label, color, _ in mass_bins]
     fig.tight_layout(rect=(0.01, 0.01, 0.97, 0.90), h_pad=1.0, w_pad=1.0)
@@ -180,8 +229,9 @@ def main():
                bbox_to_anchor=(0.5, 0.905), title=args.legend_title)
 
     tags = [s.lstrip("_") or "default" for _, _, s, _ in columns]
+    split_tag = f"_evdist{args.r200_factor:g}R200" if args.split == "event-distance" else ""
     out = args.output or (f"tde_rate_smoothed_quad_alpha{args.alpha}_{args.smooth_myr:g}Myr_"
-                          f"{tags[0]}_vs_{tags[1]}.png")
+                          f"{tags[0]}_vs_{tags[1]}{split_tag}.png")
     fig.savefig(out, dpi=200, bbox_inches="tight")
     print(f"\nSaved {out}  (shaded bands: {band_desc})")
     if not args.no_show:
