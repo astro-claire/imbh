@@ -11,6 +11,8 @@
 #   perl submit_analysis.pl --mode observational --n-relation bf20_seed
 #
 # Options that don't affect file names (e.g. --seed) are accepted and ignored.
+# --seeds "1 2 3" analyses the matching submit_halos.pl --seeds realizations
+# (labels seed1, seed2, ... appended to any --label).
 #
 # Extra options:
 #   --alpha 1.2          power-law index passed to analysis.py (default 1.2)
@@ -42,6 +44,8 @@ use warnings;
 use Getopt::Long;
 use File::Path qw(make_path);
 
+my @ORIG_ARGV = @ARGV;   # for --seeds (re-invokes this script once per seed)
+
 # ---------------------------------------------------------------- settings
 my %opt = (
     'model-dir'       => '/u/home/c/clairewi/project-snaoz/imbh-model',
@@ -57,6 +61,7 @@ my %opt = (
     'mass-jitter-dex'   => '',               # empty = --jitter-dex
     'radius-jitter-dex' => '',               # empty = --jitter-dex
     'seed'            => '',                 # accepted for symmetry with submit_halos.pl; unused
+    'seeds'           => '',                 # e.g. "1 2 3 4 5": analyse each seed<k> realization
     'alpha'           => '1.2',
     'h_rt'            => '4:00:00',
     'h_data'          => '4G',
@@ -78,12 +83,35 @@ my %opt = (
 
 GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
-    'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'alpha=s', 'h_rt=s', 'h_data=s',
+    'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'seeds=s', 'alpha=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
     'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'resolution-cuts=s', 'wait-for-model!', 'dry-run!', 'help',
     'loss-cone=s', 'include-undepleted!', 'coulomb-log=s',
 ) or die "Bad options -- see the header of $0\n";
-if ($opt{help}) { system('sed', '-n', '2,31p', $0); exit 0; }
+if ($opt{help}) { system('sed', '-n', '2,40p', $0); exit 0; }
+
+# ---------------------------------------------------------------- --seeds
+# Repeated random realizations: re-run this script once per seed, labelling
+# each realization seed<k> (appended to any --label), so every realization
+# gets its own output names and analysis folder.
+if (length $opt{seeds}) {
+    my @seeds = split /[\s,]+/, $opt{seeds};
+    die "--seeds must be non-negative integers\n" if !@seeds || grep { !/^\d+$/ } @seeds;
+    my @base;   # original arguments minus --seeds / --seed / --label
+    for (my $i = 0; $i < @ORIG_ARGV; $i++) {
+        my $a = $ORIG_ARGV[$i];
+        next if $a =~ /^--?(?:seeds|seed|label)=/;
+        if ($a =~ /^--?(?:seeds|seed|label)$/) { $i++; next; }
+        push @base, $a;
+    }
+    for my $s (@seeds) {
+        my $label = join('_', grep { length } ($opt{label}, "seed$s"));
+        print "=== seed $s (label $label) ===\n";
+        system($^X, $0, @base, '--seed', $s, '--label', $label) == 0
+            or die "submission for seed $s failed\n";
+    }
+    exit 0;
+}
 
 my %allowed = (
     'mode'            => [qw(default observational)],

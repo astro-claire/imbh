@@ -13,6 +13,11 @@
 #   perl submit_halos.pl --halos "467548 685512"          # only these halos
 #   perl submit_halos.pl --jitter-dex 0.3                # default mode, smoothed bootstrap (0.3 dex on M and r)
 #   perl submit_halos.pl --label v2                       # tag outputs so older runs aren't overwritten
+#   perl submit_halos.pl --jitter-dex 0.1 --seeds "1 2 3 4 5"   # 5 independent realizations,
+#                         labelled seed1..seed5 (appended to any --label)
+#
+# --seed S gives each halo its own seed, S*10^7 + <halo ID>, so a run is
+# reproducible and different halos' draws are independent of each other.
 #   perl submit_halos.pl --dry-run                        # write + print the job scripts, don't submit
 #
 # Output names (per halo ID, SNAP=--snap):
@@ -38,6 +43,8 @@ use warnings;
 use Getopt::Long;
 use File::Path qw(make_path);
 
+my @ORIG_ARGV = @ARGV;   # for --seeds (re-invokes this script once per seed)
+
 # ---------------------------------------------------------------- settings
 my %opt = (
     'model-dir'       => '/u/home/c/clairewi/project-snaoz/imbh-model',
@@ -57,6 +64,7 @@ my %opt = (
     'mass-jitter-dex'   => '',               # empty = --jitter-dex
     'radius-jitter-dex' => '',               # empty = --jitter-dex
     'seed'            => '',
+    'seeds'           => '',                 # e.g. "1 2 3 4 5": one labelled run per seed
     'h_rt'            => '24:00:00',
     'h_data'          => '4G',
     'radius-tracks'   => 1,                  # --no-radius-tracks to turn off
@@ -73,11 +81,35 @@ my %opt = (
 
 GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
-    'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'h_rt=s', 'h_data=s',
+    'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'seeds=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
     'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'resolution-cuts=s', 'dry-run!', 'help',
 ) or die "Bad options -- see the header of $0\n";
-if ($opt{help}) { system('sed', '-n', '2,28p', $0); exit 0; }
+if ($opt{help}) { system('sed', '-n', '2,40p', $0); exit 0; }
+
+# ---------------------------------------------------------------- --seeds
+# Repeated random realizations: re-run this script once per seed, labelling
+# each realization seed<k> (appended to any --label), so every realization
+# gets its own output names and analysis folder.
+if (length $opt{seeds}) {
+    my @seeds = split /[\s,]+/, $opt{seeds};
+    die "--seeds must be non-negative integers\n" if !@seeds || grep { !/^\d+$/ } @seeds;
+    my @base;   # original arguments minus --seeds / --seed / --label
+    for (my $i = 0; $i < @ORIG_ARGV; $i++) {
+        my $a = $ORIG_ARGV[$i];
+        next if $a =~ /^--?(?:seeds|seed|label)=/;
+        if ($a =~ /^--?(?:seeds|seed|label)$/) { $i++; next; }
+        push @base, $a;
+    }
+    for my $s (@seeds) {
+        my $label = join('_', grep { length } ($opt{label}, "seed$s"));
+        print "=== seed $s (label $label) ===\n";
+        system($^X, $0, @base, '--seed', $s, '--label', $label) == 0
+            or die "submission for seed $s failed\n";
+    }
+    exit 0;
+}
+die "--seed must be a non-negative integer\n" if length $opt{seed} && $opt{seed} !~ /^\d+$/;
 
 my %allowed = (
     'mode'            => [qw(default observational)],
@@ -208,7 +240,8 @@ for my $id (@halos) {
     }
     push @args, "--sim-mass-jitter-dex $mjit --sim-radius-jitter-dex $rjit" if $has_jit;
     push @args, "--resolution-cuts $opt{'resolution-cuts'}" if $opt{'resolution-cuts'} ne 'auto';
-    push @args, "--seed $opt{seed}" if length $opt{seed};
+    # per-halo seed: independent streams for different halos, reproducible per (seed, halo)
+    push @args, "--seed " . ($opt{seed} * 10_000_000 + $id) if length $opt{seed};
     my $cmd = join(' ', @args);
 
     my $jobname = "imbh_${mode_short}_$id";   # SGE job names can't start with a digit
