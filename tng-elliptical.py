@@ -8,6 +8,16 @@ Morphology is measured directly from each candidate's stellar particle cutout
 (kappa_rot and the circularity distribution), because the TNG API does not
 expose the stellar circularity supplementary catalog for TNG50-1 subhalos.
 
+Each candidate's dark-matter merger tree is checked before it is accepted
+(tree_checks.py): candidates whose dark counterpart is a satellite at z=0, or
+whose tree is missing a large part of the assembly history (a broken
+main-branch link or a central/satellite identity swap), are rejected and the
+next-ranked candidate is used instead. Outputs are tagged with the stellar
+mass range, so running the script once per mass bin keeps every bin's files:
+  tng_download/elliptical_candidates_ranked_<tag>.json   all candidates, ranked
+  tng_download/selected_ellipticals_<tag>.json           accepted (+ tree checks)
+  tng_download/rejected_ellipticals_<tag>.json           rejected, with reasons
+
 Requires: requests, h5py, numpy (>= 1.20)
     pip install requests h5py numpy
 
@@ -18,6 +28,7 @@ then find your key at https://www.tng-project.org/users/profile/
 import os
 import json
 import requests
+from tree_checks import check_tree, describe, MAX_UNEXPLAINED_FRAC
 import h5py
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -210,6 +221,12 @@ def measure_subhalo_morphology(sub, box_size_ckpc_h):
 # kinematically hot / dispersion-supported. The last criterion is measured
 # from each candidate's star particles (see kinematic_morphology), and the
 # candidates are ranked from lowest to highest kappa_rot.
+def mass_range_tag(mass_min_msun, mass_max_msun=None):
+    """File-name tag for a stellar-mass range, e.g. 'Mstar1e9-1e10' or 'Mstar1e11-inf'."""
+    hi = f"{mass_max_msun:.0e}" if mass_max_msun is not None else "inf"
+    return f"Mstar{mass_min_msun:.0e}-{hi}".replace("+", "")
+
+
 def find_prototypical_elliptical(mass_min_msun=1e11, mass_max_msun=None):
     """
     Search TNG50-1 at z=0 for elliptical candidates with total stellar
@@ -280,7 +297,8 @@ def find_prototypical_elliptical(mass_min_msun=1e11, mass_max_msun=None):
           f"(dispersion-dominated).")
 
     # save the full ranked table so the selection is reproducible / citable
-    table_path = os.path.join(OUT_DIR, "elliptical_candidates_ranked.json")
+    table_path = os.path.join(OUT_DIR, f"elliptical_candidates_ranked_"
+                                       f"{mass_range_tag(mass_min_msun, mass_max_msun)}.json")
     with open(table_path, "w") as f:
         json.dump([{"subhalo_id": int(sid), "mass_stars_msun": float(ms),
                     "sfr_msun_yr": float(sfr), **morph}
@@ -471,6 +489,20 @@ if __name__ == "__main__":
         help="Number of best (lowest kappa_rot) candidates to download merger trees for "
              "(default: 5)",
     )
+    parser.add_argument(
+        "--max-unexplained-frac", type=float, default=MAX_UNEXPLAINED_FRAC,
+        help="Reject a candidate whose dark merger tree has a main-branch mass gain not "
+             "accounted for by the tree larger than this fraction of its z=0 mass "
+             f"(default: {MAX_UNEXPLAINED_FRAC}; see tree_checks.py)",
+    )
+    parser.add_argument(
+        "--no-tree-checks", action="store_true",
+        help="Accept candidates without checking their merger trees (the old behavior).",
+    )
+    parser.add_argument(
+        "--exclude", type=int, nargs="*", default=[],
+        help="TNG50-1 subhalo IDs to skip (e.g. galaxies rejected by hand)",
+    )
     args = parser.parse_args()
     if args.n_select < 1:
         raise SystemExit("--n-select must be at least 1.")
@@ -486,23 +518,46 @@ if __name__ == "__main__":
     )
 
     # Walk down the kappa_rot ranking and keep the best N candidates that have
-    # a counterpart in TNG50-1-Dark (a candidate without a bijective match is
-    # skipped and the next-ranked one is used instead).
-    selected = []  # list of dicts, one per downloaded galaxy
+    # a counterpart in TNG50-1-Dark AND a usable merger tree (a candidate that
+    # fails either is skipped and the next-ranked one is used instead).
+    tag = mass_range_tag(args.mass_min, args.mass_max)
+    selected, rejected = [], []  # lists of dicts, one per galaxy
     for sub_id, mass_stars, sfr, morph in ranked:
         if len(selected) == args.n_select:
             break
+        entry = {"subhalo_id": int(sub_id), "mass_stars_msun": float(mass_stars), **morph}
+        if int(sub_id) in args.exclude:
+            print(f"  skipping subhalo {sub_id}: excluded on the command line")
+            rejected.append({**entry, "reasons": ["excluded on the command line"]})
+            continue
         try:
             dark_id = match_to_dark(sub_id)
         except RuntimeError as e:
             print(f"  skipping subhalo {sub_id}: {e}")
+            rejected.append({**entry, "reasons": [str(e)]})
             continue
-        selected.append({"subhalo_id": int(sub_id), "dark_subhalo_id": int(dark_id),
-                         "mass_stars_msun": float(mass_stars), **morph})
+        entry["dark_subhalo_id"] = int(dark_id)
+        if not args.no_tree_checks:
+            # the full tree is needed for the check (it is kept on disk either way)
+            _, full_path = download_merger_tree(dark_id, full_tree=True)
+            chk = check_tree(full_path, args.max_unexplained_frac)
+            print(describe(f"  tree check for {SIM_DARK} {dark_id}", chk))
+            entry["tree_check"] = chk
+            if not chk["ok"]:
+                print(f"  skipping subhalo {sub_id} (kappa_rot = {morph['kappa_rot']:.3f}): "
+                      f"merger tree failed the checks")
+                rejected.append({**entry, "reasons": chk["reasons"]})
+                continue
+        selected.append(entry)
 
     if len(selected) < args.n_select:
         print(f"  WARNING: only {len(selected)} of the requested {args.n_select} "
-              f"candidates could be matched to {SIM_DARK}.")
+              f"candidates passed (matched to {SIM_DARK}"
+              f"{'' if args.no_tree_checks else ' with a usable merger tree'}). "
+              f"Widen the mass range or raise the search limit.")
+    if rejected:
+        print(f"  {len(rejected)} candidate(s) rejected: "
+              + ", ".join(f"{r['subhalo_id']}" for r in rejected))
     n_rot = sum(s["kappa_rot"] >= KAPPA_ROT_ELLIPTICAL for s in selected)
     if n_rot:
         print(f"  WARNING: {n_rot} of the selected galaxies have kappa_rot >= "
@@ -528,9 +583,17 @@ if __name__ == "__main__":
         print(f"  full tree: {n_prog} subhalo entries over {len(kinematics)} snapshots")
 
     # record of which galaxies were selected and where their trees are
-    sel_path = os.path.join(OUT_DIR, "selected_ellipticals.json")
+    sel_path = os.path.join(OUT_DIR, f"selected_ellipticals_{tag}.json")
     with open(sel_path, "w") as f:
         json.dump(selected, f, indent=2)
     print(f"\nSaved the selected galaxies to {sel_path}")
+    rej_path = os.path.join(OUT_DIR, f"rejected_ellipticals_{tag}.json")
+    with open(rej_path, "w") as f:
+        json.dump(rejected, f, indent=2)
+    print(f"Saved the rejected candidates (with reasons) to {rej_path}")
+    print("\nSelected (TNG50-1 -> TNG50-1-Dark, kappa_rot):")
+    for s in selected:
+        print(f"  {s['subhalo_id']:>8d} -> {s['dark_subhalo_id']:>8d}   {s['kappa_rot']:.3f}")
+    print("Dark IDs for submit_halos.pl --halos: " + " ".join(str(s["dark_subhalo_id"]) for s in selected))
 
     print("Done. Files are in:", os.path.abspath(OUT_DIR))

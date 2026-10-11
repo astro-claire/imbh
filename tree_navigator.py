@@ -33,7 +33,7 @@ HOST_MASS_MODELS = ("own", "group")
 
 class MergerTreeNavigator:
     def __init__(self, tree_path, snapshot_redshift_path, box_size_ckpc_h, cosmo=TNG_COSMO,
-                 host_mass_model="own"):
+                 host_mass_model="own", fill_main_branch_gaps=True):
         """
         Parameters:
             tree_path (str): path to sublink_full_<ID>.hdf5
@@ -53,6 +53,21 @@ class MergerTreeNavigator:
                   'group': the legacy behavior -- the FoF group's
                       Group_M_Crit200/Group_R_Crit200, i.e. the mass of the
                       (much larger) halo the satellite is orbiting inside.
+            fill_main_branch_gaps (bool): SubLink sometimes links the main
+                branch across a snapshot (e.g. snap 3 -> 5), leaving no
+                main-branch subhalo at the skipped snapshot. With True
+                (default), each skipped snapshot gets a VIRTUAL main-branch
+                row whose position/velocity are interpolated in cosmic time
+                between the neighbouring main-branch subhalos (mass in log;
+                R200c from the interpolated mass), so main_branch_id_at_snap
+                never returns None inside the main branch's lifetime. Virtual
+                rows are never linked into the tree (no DescendantID /
+                FirstProgenitorID of a real row points at them), so no cluster
+                is ever handed to one -- they only serve as the main-branch
+                REFERENCE (background potential, separations, R200c history).
+                False reproduces the old behavior, where a skipped snapshot
+                returned None and every host there was treated as if it
+                were the main branch itself.
         """
         if host_mass_model not in HOST_MASS_MODELS:
             raise ValueError(f"host_mass_model must be one of {HOST_MASS_MODELS}, got {host_mass_model!r}")
@@ -82,6 +97,12 @@ class MergerTreeNavigator:
 
         self.root_id = self._find_root()
         self._main_branch_by_snap = self._build_main_branch_lookup()
+        self.virtual_ids = set()
+        self.main_branch_gaps = self._main_branch_gaps(self._main_branch_by_snap)
+        if fill_main_branch_gaps and self.main_branch_gaps:
+            self._fill_main_branch_gaps(self._main_branch_by_snap)
+            print(f"  note: main branch skips snapshot(s) {self.main_branch_gaps}; filled with "
+                  f"interpolated stand-in main progenitors (see fill_main_branch_gaps)")
 
     def _find_root(self):
         root_rows = np.where(self.data["DescendantID"] == -1)[0]
@@ -110,6 +131,69 @@ class MergerTreeNavigator:
             fp_id = int(self.data["FirstProgenitorID"][row])
             current = fp_id if fp_id != -1 else None
         return lookup
+
+    @staticmethod
+    def _main_branch_gaps(lookup):
+        """Snapshots inside the main branch's lifetime with no main-branch subhalo."""
+        snaps = sorted(lookup)
+        return sorted(set(range(snaps[0], snaps[-1] + 1)) - set(snaps)) if snaps else []
+
+    def _fill_main_branch_gaps(self, lookup):
+        """
+        Add a virtual main-branch row at every snapshot the main branch skips
+        (see __init__'s fill_main_branch_gaps), and register it in `lookup`.
+        Interpolation is linear in cosmic time between the bracketing real
+        main-branch subhalos: comoving position (with the periodic wrap),
+        peculiar velocity, and log mass (SubhaloMass and Group_M_Crit200);
+        Group_R_Crit200 is recomputed from the interpolated M200c at the
+        virtual snapshot. The row is its own FoF central (SubfindID ==
+        GroupFirstSub == -1 - its index among the virtual rows, never equal
+        to a real SUBFIND index) with GroupPos = SubhaloPos.
+        """
+        box = self.box_size_ckpc_h
+        new = {k: [] for k in self.data}
+        next_id = int(np.max(self.data["SubhaloID"])) + 1
+        for gap in self._main_branch_gaps(lookup):
+            s0 = max(s for s in lookup if s < gap)
+            s1 = min(s for s in lookup if s > gap)
+            i0, i1 = self._row(lookup[s0]), self._row(lookup[s1])
+            t0, t1, t = (self.age_at_snap(x).value for x in (s0, s1, gap))
+            w = (t - t0) / (t1 - t0)
+
+            d = self.data["SubhaloPos"][i1] - self.data["SubhaloPos"][i0]
+            d = (d + box / 2) % box - box / 2
+            pos = (self.data["SubhaloPos"][i0] + w * d) % box
+            vel = (1 - w) * self.data["SubhaloVel"][i0] + w * self.data["SubhaloVel"][i1]
+
+            def log_interp(field):
+                a, b = float(self.data[field][i0]), float(self.data[field][i1])
+                return a ** (1 - w) * b ** w if a > 0 and b > 0 else (1 - w) * a + w * b
+
+            m200 = log_interp("Group_M_Crit200")                       # 1e10 Msun/h
+            r200_kpc = self._r200c_from_mass_kpc(m200 * 1e10 / LITTLE_H, gap) if m200 > 0 else 0.0
+            sentinel = -1 - len(new["SubhaloID"])
+            row = {
+                "SubhaloID": next_id, "DescendantID": -1, "FirstProgenitorID": -1, "SnapNum": gap,
+                "SubhaloPos": pos, "SubhaloVel": vel, "GroupPos": pos,
+                "Group_M_Crit200": m200, "Group_R_Crit200": r200_kpc * LITTLE_H / self._atime(gap),
+                "SubhaloMass": log_interp("SubhaloMass"),
+                "SubfindID": sentinel, "GroupFirstSub": sentinel,
+            }
+            for k in new:
+                new[k].append(row[k])
+            lookup[gap] = next_id
+            self.virtual_ids.add(next_id)
+            next_id += 1
+        n0 = len(self.data["SubhaloID"])
+        for k, vals in new.items():
+            arr = np.asarray(vals, dtype=self.data[k].dtype)
+            self.data[k] = np.concatenate([self.data[k], arr.reshape((len(vals),) + self.data[k].shape[1:])])
+        for j, sid in enumerate(new["SubhaloID"]):
+            self.id_to_row[int(sid)] = n0 + j
+
+    def is_virtual(self, subhalo_id):
+        """True for a stand-in main-branch row added at a skipped snapshot."""
+        return int(subhalo_id) in self.virtual_ids
 
     def main_branch_id_at_snap(self, snap):
         """
@@ -244,9 +328,17 @@ class MergerTreeNavigator:
         i = self._row(subhalo_id)
         if main_branch_id is not None:
             j = self._row(main_branch_id)
-            if (int(self.data["SnapNum"][j]) == int(self.data["SnapNum"][i])
-                    and int(self.data["SubfindID"][j]) == int(self.data["GroupFirstSub"][i])):
+            same_snap = int(self.data["SnapNum"][j]) == int(self.data["SnapNum"][i])
+            if same_snap and int(self.data["SubfindID"][j]) == int(self.data["GroupFirstSub"][i]):
                 return None
+            if same_snap and self.is_virtual(main_branch_id):
+                # a stand-in main progenitor has no SUBFIND index to compare:
+                # treat this satellite's group as the main branch's own group
+                # if the group center lies within half its R200c of the stand-in
+                d = self.data["GroupPos"][i] - self.data["SubhaloPos"][j]
+                d = (d + self.box_size_ckpc_h / 2) % self.box_size_ckpc_h - self.box_size_ckpc_h / 2
+                if np.linalg.norm(d) < 0.5 * float(self.data["Group_R_Crit200"][j]):
+                    return None
         mass_msun, radius_kpc, snap = self.group_properties(subhalo_id)
         delta = self.data["GroupPos"][i] - self.data["SubhaloPos"][i]
         delta = (delta + self.box_size_ckpc_h / 2) % self.box_size_ckpc_h - self.box_size_ckpc_h / 2

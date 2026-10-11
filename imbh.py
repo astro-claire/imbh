@@ -1774,6 +1774,12 @@ def main():
                               "one. 'on' with --cluster-sampler observational gives the matched-cut "
                               "comparison (outputs tagged _zcut); 'off' with the simulation sampler "
                               "extrapolates it (tagged _nozcut).")
+    parser.add_argument("--no-fill-main-branch-gaps", action="store_true",
+                         help="Reproduce runs made before the fix for snapshots the SubLink main branch "
+                              "skips: there, every host was treated as the main progenitor (no background "
+                              "potential, separations measured from each cluster's own host). By default "
+                              "such snapshots get an interpolated stand-in main progenitor "
+                              "(MergerTreeNavigator fill_main_branch_gaps).")
     parser.add_argument("--host-mass-model", choices=HOST_MASS_MODELS, default="own",
                          help="Host halo for SATELLITE subhalos, used both for the cluster draw and "
                               "as the local NFW host in the orbit integration (centrals always use "
@@ -1810,7 +1816,8 @@ def main():
         print(f"--tree-path not given, guessing: {tree_path}")
 
     navigator = MergerTreeNavigator(tree_path, args.snap_redshift_path, box_size_ckpc_h=args.box_size,
-                                    host_mass_model=args.host_mass_model)
+                                    host_mass_model=args.host_mass_model,
+                                    fill_main_branch_gaps=not args.no_fill_main_branch_gaps)
     print(f"host_mass_model = {args.host_mass_model!r}")
     target_age = navigator.age_at_snap(args.output_snap)
     print(f"Output snapshot {args.output_snap} -> cosmic age {target_age:.4f}")
