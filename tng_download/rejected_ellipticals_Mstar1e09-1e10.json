@@ -1,0 +1,184 @@
+[
+  {
+    "subhalo_id": 744263,
+    "mass_stars_msun": 1932934750.5166814,
+    "kappa_rot": 0.4554119711177956,
+    "f_circ07": 0.14821284632380827,
+    "spheroid_frac": 0.7232695738716692,
+    "n_stars": 37644,
+    "dark_subhalo_id": 1150366,
+    "tree_check": {
+      "ok": false,
+      "reasons": [
+        "missing history: main branch gains 7.80e+10 Msun at snap 96->97 with only 6.88e+10 Msun in the tree before (11% of the z=0 mass unaccounted for)"
+      ],
+      "root_mass_msun": 80485859328.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.1140740264023736,
+      "max_unexplained_snaps": [
+        96,
+        97
+      ],
+      "main_branch_first_snap": 1,
+      "main_branch_gaps": [],
+      "satellite_snaps": [
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95,
+        96,
+        97
+      ],
+      "n_rows": 3733
+    },
+    "reasons": [
+      "missing history: main branch gains 7.80e+10 Msun at snap 96->97 with only 6.88e+10 Msun in the tree before (11% of the z=0 mass unaccounted for)"
+    ]
+  },
+  {
+    "subhalo_id": 717017,
+    "mass_stars_msun": 2239813994.6855626,
+    "kappa_rot": 0.46324113386676374,
+    "f_circ07": 0.17055624285120202,
+    "spheroid_frac": 0.7206272713948597,
+    "n_stars": 38250,
+    "dark_subhalo_id": 1095686,
+    "tree_check": {
+      "ok": false,
+      "reasons": [
+        "missing history: main branch gains 1.00e+11 Msun at snap 80->81 with only 8.58e+10 Msun in the tree before (10% of the z=0 mass unaccounted for)"
+      ],
+      "root_mass_msun": 140984434688.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.10364093776264005,
+      "max_unexplained_snaps": [
+        80,
+        81
+      ],
+      "main_branch_first_snap": 1,
+      "main_branch_gaps": [],
+      "satellite_snaps": [
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88
+      ],
+      "n_rows": 8870
+    },
+    "reasons": [
+      "missing history: main branch gains 1.00e+11 Msun at snap 80->81 with only 8.58e+10 Msun in the tree before (10% of the z=0 mass unaccounted for)"
+    ]
+  },
+  {
+    "subhalo_id": 692981,
+    "mass_stars_msun": 7419382934.750517,
+    "kappa_rot": 0.4885812144425547,
+    "f_circ07": 0.228885146704935,
+    "spheroid_frac": 0.5547138491030216,
+    "n_stars": 129630,
+    "dark_subhalo_id": 1044309,
+    "tree_check": {
+      "ok": false,
+      "reasons": [
+        "missing history: main branch gains 1.08e+11 Msun at snap 85->86 with only 2.15e+07 Msun in the tree before (83% of the z=0 mass unaccounted for)"
+      ],
+      "root_mass_msun": 129683701760.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.8319589919299972,
+      "max_unexplained_snaps": [
+        85,
+        86
+      ],
+      "main_branch_first_snap": 3,
+      "main_branch_gaps": [
+        71,
+        74
+      ],
+      "satellite_snaps": [
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        72,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        98
+      ],
+      "n_rows": 187
+    },
+    "reasons": [
+      "missing history: main branch gains 1.08e+11 Msun at snap 85->86 with only 2.15e+07 Msun in the tree before (83% of the z=0 mass unaccounted for)"
+    ]
+  }
+]

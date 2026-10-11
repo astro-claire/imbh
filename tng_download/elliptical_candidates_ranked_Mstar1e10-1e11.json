@@ -1,0 +1,182 @@
+[
+  {
+    "subhalo_id": 509709,
+    "mass_stars_msun": 73586802480.07086,
+    "sfr_msun_yr": 0.00395572,
+    "kappa_rot": 0.3731080885563685,
+    "f_circ07": 0.10856213466077586,
+    "spheroid_frac": 0.7626152581267387,
+    "n_stars": 1141669
+  },
+  {
+    "subhalo_id": 495451,
+    "mass_stars_msun": 69744611750.81192,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.401669186814405,
+    "f_circ07": 0.11762282771983967,
+    "spheroid_frac": 0.6274239530102167,
+    "n_stars": 1153116
+  },
+  {
+    "subhalo_id": 613192,
+    "mass_stars_msun": 46607026867.43431,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.4329107698959984,
+    "f_circ07": 0.1659238514160126,
+    "spheroid_frac": 0.7995599189712741,
+    "n_stars": 804451
+  },
+  {
+    "subhalo_id": 481428,
+    "mass_stars_msun": 83102598169.47151,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.43884569936000983,
+    "f_circ07": 0.1858557743104836,
+    "spheroid_frac": 0.6036862793794552,
+    "n_stars": 1337848
+  },
+  {
+    "subhalo_id": 513105,
+    "mass_stars_msun": 45568940064.95424,
+    "sfr_msun_yr": 0.0954492,
+    "kappa_rot": 0.44472294606074675,
+    "f_circ07": 0.20294210574651447,
+    "spheroid_frac": 0.8128109138824492,
+    "n_stars": 764113
+  },
+  {
+    "subhalo_id": 524506,
+    "mass_stars_msun": 45656480661.35223,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.4526581691210694,
+    "f_circ07": 0.22759396320749162,
+    "spheroid_frac": 0.5084137284958072,
+    "n_stars": 782989
+  },
+  {
+    "subhalo_id": 541218,
+    "mass_stars_msun": 47760555063.478004,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.4536972336433347,
+    "f_circ07": 0.2503128249481763,
+    "spheroid_frac": 0.4953165588908841,
+    "n_stars": 791679
+  },
+  {
+    "subhalo_id": 511920,
+    "mass_stars_msun": 88165633303.80869,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.4761671369102594,
+    "f_circ07": 0.3030805335573912,
+    "spheroid_frac": 0.4871264386612865,
+    "n_stars": 1410433
+  },
+  {
+    "subhalo_id": 516760,
+    "mass_stars_msun": 66965751402.421036,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.48938708573173006,
+    "f_circ07": 0.2939455325726569,
+    "spheroid_frac": 0.45784276279471553,
+    "n_stars": 1125082
+  },
+  {
+    "subhalo_id": 516101,
+    "mass_stars_msun": 48789636846.767044,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.5084657249709175,
+    "f_circ07": 0.30876767511059294,
+    "spheroid_frac": 0.561492616121393,
+    "n_stars": 822183
+  },
+  {
+    "subhalo_id": 546870,
+    "mass_stars_msun": 42490552111.012695,
+    "sfr_msun_yr": 0.000960571,
+    "kappa_rot": 0.513643321699552,
+    "f_circ07": 0.3075664885232126,
+    "spheroid_frac": 0.37011793903822043,
+    "n_stars": 721109
+  },
+  {
+    "subhalo_id": 543114,
+    "mass_stars_msun": 65502509595.51225,
+    "sfr_msun_yr": 0.00367945,
+    "kappa_rot": 0.5262717130272017,
+    "f_circ07": 0.24725530429672685,
+    "spheroid_frac": 0.8803089831037296,
+    "n_stars": 1124092
+  },
+  {
+    "subhalo_id": 503987,
+    "mass_stars_msun": 61312518452.90818,
+    "sfr_msun_yr": 0.0725668,
+    "kappa_rot": 0.5268307006234236,
+    "f_circ07": 0.3167511356946068,
+    "spheroid_frac": 0.3909524316796964,
+    "n_stars": 1048165
+  },
+  {
+    "subhalo_id": 489206,
+    "mass_stars_msun": 95720696781.81282,
+    "sfr_msun_yr": 0.0952943,
+    "kappa_rot": 0.5367545931717272,
+    "f_circ07": 0.3584874473986322,
+    "spheroid_frac": 0.429928188368947,
+    "n_stars": 1612882
+  },
+  {
+    "subhalo_id": 571454,
+    "mass_stars_msun": 43719368172.42397,
+    "sfr_msun_yr": 0.0108885,
+    "kappa_rot": 0.5502460766556577,
+    "f_circ07": 0.4093756364315202,
+    "spheroid_frac": 0.43927585572778727,
+    "n_stars": 749843
+  },
+  {
+    "subhalo_id": 540082,
+    "mass_stars_msun": 51751107174.4907,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.5745920071292404,
+    "f_circ07": 0.3855554734098488,
+    "spheroid_frac": 0.34825774376872837,
+    "n_stars": 872798
+  },
+  {
+    "subhalo_id": 546114,
+    "mass_stars_msun": 45406111603.18866,
+    "sfr_msun_yr": 0.00169337,
+    "kappa_rot": 0.5941721756836451,
+    "f_circ07": 0.34653829033371175,
+    "spheroid_frac": 0.36673518440303615,
+    "n_stars": 720970
+  },
+  {
+    "subhalo_id": 454171,
+    "mass_stars_msun": 75709625036.90582,
+    "sfr_msun_yr": 0.00253801,
+    "kappa_rot": 0.6905520355818024,
+    "f_circ07": 0.5618544798633267,
+    "spheroid_frac": 0.2101809173082058,
+    "n_stars": 1283516
+  },
+  {
+    "subhalo_id": 478216,
+    "mass_stars_msun": 59276498376.14408,
+    "sfr_msun_yr": 0.017258,
+    "kappa_rot": 0.6924506682807523,
+    "f_circ07": 0.5598653914763735,
+    "spheroid_frac": 0.22535243836052024,
+    "n_stars": 982183
+  },
+  {
+    "subhalo_id": 572328,
+    "mass_stars_msun": 43397254207.26306,
+    "sfr_msun_yr": 0.0,
+    "kappa_rot": 0.6992064604880813,
+    "f_circ07": 0.5773730459014768,
+    "spheroid_frac": 0.14615287459878187,
+    "n_stars": 728212
+  }
+]

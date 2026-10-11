@@ -1,0 +1,132 @@
+[
+  {
+    "subhalo_id": 509709,
+    "mass_stars_msun": 73586802480.07086,
+    "kappa_rot": 0.3731080885563685,
+    "f_circ07": 0.10856213466077586,
+    "spheroid_frac": 0.7626152581267387,
+    "n_stars": 1141669,
+    "dark_subhalo_id": 801308,
+    "tree_check": {
+      "ok": true,
+      "reasons": [],
+      "root_mass_msun": 1768186970112.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.008733107700721204,
+      "max_unexplained_snaps": [
+        97,
+        98
+      ],
+      "main_branch_first_snap": 1,
+      "main_branch_gaps": [],
+      "satellite_snaps": [],
+      "n_rows": 85989
+    },
+    "mpb_path": "tng_download/sublink_mpb_801308.hdf5",
+    "full_tree_path": "tng_download/sublink_full_801308.hdf5"
+  },
+  {
+    "subhalo_id": 495451,
+    "mass_stars_msun": 69744611750.81192,
+    "kappa_rot": 0.401669186814405,
+    "f_circ07": 0.11762282771983967,
+    "spheroid_frac": 0.6274239530102167,
+    "n_stars": 1153116,
+    "dark_subhalo_id": 753345,
+    "tree_check": {
+      "ok": true,
+      "reasons": [],
+      "root_mass_msun": 2338254749696.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.015455547576113546,
+      "max_unexplained_snaps": [
+        67,
+        68
+      ],
+      "main_branch_first_snap": 1,
+      "main_branch_gaps": [],
+      "satellite_snaps": [],
+      "n_rows": 122677
+    },
+    "mpb_path": "tng_download/sublink_mpb_753345.hdf5",
+    "full_tree_path": "tng_download/sublink_full_753345.hdf5"
+  },
+  {
+    "subhalo_id": 481428,
+    "mass_stars_msun": 83102598169.47151,
+    "kappa_rot": 0.43884569936000983,
+    "f_circ07": 0.1858557743104836,
+    "spheroid_frac": 0.6036862793794552,
+    "n_stars": 1337848,
+    "dark_subhalo_id": 745415,
+    "tree_check": {
+      "ok": true,
+      "reasons": [],
+      "root_mass_msun": 2364473606144.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.02202337516464061,
+      "max_unexplained_snaps": [
+        78,
+        79
+      ],
+      "main_branch_first_snap": 0,
+      "main_branch_gaps": [],
+      "satellite_snaps": [],
+      "n_rows": 108960
+    },
+    "mpb_path": "tng_download/sublink_mpb_745415.hdf5",
+    "full_tree_path": "tng_download/sublink_full_745415.hdf5"
+  },
+  {
+    "subhalo_id": 513105,
+    "mass_stars_msun": 45568940064.95424,
+    "kappa_rot": 0.44472294606074675,
+    "f_circ07": 0.20294210574651447,
+    "spheroid_frac": 0.8128109138824492,
+    "n_stars": 764113,
+    "dark_subhalo_id": 826784,
+    "tree_check": {
+      "ok": true,
+      "reasons": [],
+      "root_mass_msun": 1247263326208.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.030055583858118216,
+      "max_unexplained_snaps": [
+        97,
+        98
+      ],
+      "main_branch_first_snap": 1,
+      "main_branch_gaps": [],
+      "satellite_snaps": [],
+      "n_rows": 56329
+    },
+    "mpb_path": "tng_download/sublink_mpb_826784.hdf5",
+    "full_tree_path": "tng_download/sublink_full_826784.hdf5"
+  },
+  {
+    "subhalo_id": 524506,
+    "mass_stars_msun": 45656480661.35223,
+    "kappa_rot": 0.4526581691210694,
+    "f_circ07": 0.22759396320749162,
+    "spheroid_frac": 0.5084137284958072,
+    "n_stars": 782989,
+    "dark_subhalo_id": 802209,
+    "tree_check": {
+      "ok": true,
+      "reasons": [],
+      "root_mass_msun": 1812677656576.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.045431744946069615,
+      "max_unexplained_snaps": [
+        95,
+        96
+      ],
+      "main_branch_first_snap": 1,
+      "main_branch_gaps": [],
+      "satellite_snaps": [],
+      "n_rows": 79082
+    },
+    "mpb_path": "tng_download/sublink_mpb_802209.hdf5",
+    "full_tree_path": "tng_download/sublink_full_802209.hdf5"
+  }
+]

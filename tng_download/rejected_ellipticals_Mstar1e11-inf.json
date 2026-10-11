@@ -1,0 +1,53 @@
+[
+  {
+    "subhalo_id": 307485,
+    "mass_stars_msun": 208333333333.33334,
+    "kappa_rot": 0.40266573647107134,
+    "f_circ07": 0.13186703454198329,
+    "spheroid_frac": 0.6026335857914361,
+    "n_stars": 2907811,
+    "dark_subhalo_id": 467548,
+    "tree_check": {
+      "ok": false,
+      "reasons": [
+        "missing history: main branch gains 1.30e+13 Msun at snap 91->92 with only 2.89e+12 Msun in the tree before (59% of the z=0 mass unaccounted for)"
+      ],
+      "root_mass_msun": 17086679089152.0,
+      "root_is_central": true,
+      "max_unexplained_frac": 0.5894338334894565,
+      "max_unexplained_snaps": [
+        91,
+        92
+      ],
+      "main_branch_first_snap": 0,
+      "main_branch_gaps": [],
+      "satellite_snaps": [
+        71,
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91
+      ],
+      "n_rows": 384306
+    },
+    "reasons": [
+      "missing history: main branch gains 1.30e+13 Msun at snap 91->92 with only 2.89e+12 Msun in the tree before (59% of the z=0 mass unaccounted for)"
+    ]
+  }
+]
