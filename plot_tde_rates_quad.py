@@ -62,8 +62,8 @@ plt.rcParams.update({
     "legend.title_fontsize": FONT_SIZE - 2,
 })
 
-DEFAULT_LEFT_FLAGS = "--jitter-dex 0.3"  # default mode, smoothed bootstrap (0.3 dex)
-DEFAULT_RIGHT_FLAGS = "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12"
+DEFAULT_LEFT_FLAGS = "--jitter-dex 0.1 --loss-cone full"  # default mode, smoothed bootstrap (0.3 dex)
+DEFAULT_RIGHT_FLAGS = "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12 --loss-cone full"
 ROWS = [("exclude", "Bound to galaxy"), ("only", "Escaped")]  # --split z0-status
 SHADE_Z = (7, 0)  # no new clusters form below z = 7 in the default (simulation-calibrated) mode
 
