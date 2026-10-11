@@ -194,8 +194,12 @@ def main():
             if not bins_here:
                 continue
             ncol = max(len(cubes[(sel, b[0])]["halos"]) for b in bins_here)
-            fig, axes = plt.subplots(len(bins_here), ncol, figsize=(4 * ncol, 3.2 * len(bins_here) + 0.8),
-                                     sharex=True, squeeze=False)
+            nrow = len(bins_here)
+            # Panels touch: shared x and y over the whole grid, halo ID written inside each panel.
+            fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 2.9 * nrow + 0.8),
+                                     sharex=True, sharey=True, squeeze=False,
+                                     gridspec_kw={"wspace": 0, "hspace": 0})
+            gmax = 0.0
             for i, (tag, blabel, color, ids) in enumerate(bins_here):
                 c = cubes.get((sel, tag))
                 for j in range(ncol):
@@ -210,17 +214,20 @@ def main():
                         ax.plot(z[sl], curve[sl], color=color, lw=0.6, alpha=0.6)
                     ax.plot(z[sl], s.mean(0)[sl], color=color, lw=1.8)
                     ax.axvspan(*SHADE_Z, color="grey", alpha=0.3, lw=0)
-                    if not args.linear and hi.max() > 0:
-                        ax.set_yscale("log")
-                        ax.set_ylim(hi.max() * 1e-4, hi.max() * 2)
-                    ax.set_xlim(Z_MAX, 0)
-                    ax.set_title(f"{c['halos'][j]}", fontsize=FONT_SIZE - 4)
-                    ax.tick_params(labelsize=FONT_SIZE - 7)
-                axes[i, 0].set_ylabel(blabel, fontsize=FONT_SIZE - 4)
-            fig.supxlabel("Redshift", fontsize=FONT_SIZE - 2)
-            fig.suptitle(f"{selection_label(sel, args.r200_factor)}: TDE rate (yr$^{{-1}}$) per halo, "
-                         f"{len(runs)} realizations", fontsize=FONT_SIZE - 2)
-            fig.tight_layout()
+                    gmax = max(gmax, float(hi[z <= Z_MAX].max()))
+                    ax.text(0.95, 0.93, f"{c['halos'][j]}", transform=ax.transAxes, ha="right", va="top",
+                            fontsize=FONT_SIZE - 6)
+                    ax.tick_params(labelsize=FONT_SIZE - 7, direction="in", top=True, right=True, which="both")
+                axes[i, -1].yaxis.set_label_position("right")
+                axes[i, -1].set_ylabel(blabel, fontsize=FONT_SIZE - 6, rotation=270, labelpad=22)
+            axes[0, 0].set_xlim(Z_MAX, 0)
+            axes[0, 0].set_xticks([15, 10, 5])             # no labels on the shared panel edges
+            if not args.linear and gmax > 0:
+                axes[0, 0].set_yscale("log")
+                axes[0, 0].set_ylim(gmax * 1e-4, gmax * 2)
+            fig.supxlabel("Redshift", fontsize=FONT_SIZE - 2, y=0.02)
+            fig.supylabel(r"TDE rate (yr$^{-1}$)", fontsize=FONT_SIZE - 2, x=0.06)
+            fig.suptitle(selection_label(sel, args.r200_factor), fontsize=FONT_SIZE - 2, y=0.94)
             out = f"{prefix}_perhalo_{sel}.png"
             fig.savefig(out, dpi=150, bbox_inches="tight")
             print(f"Saved {out}")
