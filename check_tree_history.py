@@ -1,5 +1,5 @@
 """
-Check each SubLink tree for missing assembly history: snapshots where the
+Check each SubLink tree for (1) snapshots the main branch skips, and (2) missing assembly history: snapshots where the
 main branch is a SATELLITE whose FoF group's central is NOT in the tree.
 Uses the snapshot-catalog indices (GroupFirstSub vs SubfindID at the same
 snapshot); the tree's FirstSubhaloInFOFGroupID is not reliable in these
@@ -31,6 +31,11 @@ for path in sys.argv[1:]:
             break
         k = row[int(fp[k])]
     halo = path.split("_")[-1].replace(".hdf5", "")
+    mb_snaps = sorted(int(snap[k]) for k in mb)
+    gaps = sorted(set(range(mb_snaps[0], mb_snaps[-1] + 1)) - set(mb_snaps))
+    if gaps:
+        print(f"{halo:>8s}: main branch SKIPS snapshot(s) {gaps} -- imbh.py treats every host as the main "
+              f"progenitor there (no background potential; separations measured from each cluster's own host)")
     bad = [(int(snap[k]), m[k], gm[k]) for k in mb
            if gfs[k] != sfid[k] and (int(snap[k]), int(gfs[k])) not in in_tree]
     if not bad:
