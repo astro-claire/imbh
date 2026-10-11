@@ -288,8 +288,11 @@ def main():
             ax.axvline(len(ladder) - 0.25, color="0.7", lw=1)
         ax.grid(axis="y", color="0.9", lw=0.8)
         ax.set_axisbelow(True)
-    axes[0].legend(title=r"Stellar mass at $z=0$", frameon=False, title_fontsize=FONT_SIZE - 3)
     fig.tight_layout()
+    # one legend centred above all three panels (clear of the panel titles)
+    leg_handles, leg_labels = axes[0].get_legend_handles_labels()
+    fig.legend(leg_handles, leg_labels, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=len(leg_handles),
+               title=r"Stellar mass at $z=0$", frameon=False, title_fontsize=FONT_SIZE - 3)
     fig.savefig(f"{prefix}_summary.png", dpi=200, bbox_inches="tight")
     print(f"Saved {prefix}_summary.png")
     if not args.no_show:
