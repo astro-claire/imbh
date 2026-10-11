@@ -36,9 +36,9 @@ Clusters already at the center are left out of those percentiles.
 Mass bins default to DEFAULT_MASS_BINS; override with one --bin per bin:
 
     python plot_tde_radial_smoothed.py --data-dir /u/scratch/c/clairewi/imbh-output --logy \\
-        --bin ">1e11" 685512 697044 588075 467548 665702 \\
+        --bin ">1e11" 685512 697044 588075 665702 670354 \\
         --bin "1e10-1e11" 801308 753345 8 745415 826784 \\
-        --bin "1e9-1e10" 1235585 1117358 1136724 1044309 939095
+        --bin "1e9-1e10" 939095 1166615 1110727 1099576 1136724
 
     # different redshift windows, shape only, plus the median-vs-z figure
     python plot_tde_radial_smoothed.py --z-windows 20,12,9,7,0 --normalize --evolution
@@ -77,11 +77,11 @@ cosmo = FlatLambdaCDM(71, 0.27, Ob0=0.044, Tcmb0=2.726 * u.K)
 # (tag for file names, legend label, color, subhalo IDs) -- matches plot_tde_rates_smoothed.py
 DEFAULT_MASS_BINS = [
     ("gt1e11", r"$>10^{11}\,M_\odot$", "#0072B2",
-     ["685512", "697044", "588075", "467548", "665702"]),
+     ["685512", "697044", "588075", "665702", "670354"]),
     ("1e10-1e11", r"$10^{10}$–$10^{11}\,M_\odot$", "#D55E00",
-     ["801308", "753345", "8", "745415", "826784"]),
+     ["801308", "753345", "745415", "826784", "802209"]),
     ("1e9-1e10", r"$10^{9}$–$10^{10}\,M_\odot$", "#009E73",
-     ["1235585", "1117358", "1136724", "1044309", "939095"]),
+     ["939095", "1166615", "1110727", "1099576", "1136724"]),
 ]
 EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
 Z_MAX = 20

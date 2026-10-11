@@ -21,7 +21,7 @@ Steps (done separately for each mass bin):
 Mass bins default to the three in DEFAULT_MASS_BINS below. Override them with
 one --bin per bin, giving a label and the subhalo IDs:
 
-    --bin "gt1e11" 685512 697044 588075 467548 665702 \
+    --bin "gt1e11" 685512 697044 588075 665702 670354 \
     --bin "1e10-1e11" 801308 753345 8 745415 826784
 
 Example:
@@ -59,11 +59,11 @@ cosmo = FlatLambdaCDM(71, 0.27, Ob0=0.044, Tcmb0=2.726 * u.K)
 # Each entry: (short tag for file names, legend label, color, subhalo IDs)
 DEFAULT_MASS_BINS = [
     ("gt1e11", r"$>10^{11}\,M_\odot$", "#0072B2",
-     ["685512", "697044", "588075", "467548", "665702"]),
+     ["685512", "697044", "588075", "665702", "670354"]),
     ("1e10-1e11", r"$10^{10}$–$10^{11}\,M_\odot$", "#D55E00",
-     ["801308", "753345", "8", "745415", "826784"]),
+     ["801308", "753345", "745415", "826784", "802209"]),
     ("1e9-1e10", r"$10^{9}$–$10^{10}\,M_\odot$", "#009E73",
-     ["1235585", "1117358", "1136724", "1044309", "939095"]),
+     ["939095", "1166615", "1110727", "1099576", "1136724"]),
 ]
 # Colors for bins given on the command line (Okabe-Ito, colorblind-safe)
 EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]

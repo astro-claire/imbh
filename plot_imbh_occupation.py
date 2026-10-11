@@ -51,11 +51,11 @@ from run_naming import add_run_args, run_suffix, run_description
 # (tag, legend label, colour, subhalo IDs) -- same bins/colours as plot_tde_*_smoothed.py
 DEFAULT_MASS_BINS = [
     ("gt1e11", r"$>10^{11}\,M_\odot$", "#0072B2",
-     ["685512", "697044", "588075", "467548", "665702"]),
+     ["685512", "697044", "588075", "665702", "670354"]),
     ("1e10-1e11", r"$10^{10}$–$10^{11}\,M_\odot$", "#D55E00",
-     ["801308", "753345", "8", "745415", "826784"]),
+     ["801308", "753345", "745415", "826784", "802209"]),
     ("1e9-1e10", r"$10^{9}$–$10^{10}\,M_\odot$", "#009E73",
-     ["1235585", "1117358", "1136724", "1044309", "939095"]),
+     ["939095", "1166615", "1110727", "1099576", "1136724"]),
 ]
 EXTRA_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
 # second encoding so bins stay distinguishable in grayscale / for colour-blind readers
