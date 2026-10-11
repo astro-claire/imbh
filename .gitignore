@@ -234,3 +234,8 @@ plot_tde_rates.py
 imbh_config.py
 cluster_tracks/*
 run_analysis.sh
+apikey.txt
+*.csv
+*.png
+*.hdf5
+*.sh
