@@ -67,6 +67,7 @@ my %opt = (
     'radius-relation' => 'brown_gnedin21',
     'phase-space'     => 'analytic',
     'n-boost'         => '1.0',
+    'resolution-cuts' => 'auto',             # auto | on | off (see imbh.py --resolution-cuts)
     'n-scatter-dex'   => '',                 # not part of the names; accepted and ignored
     'wait-for-model'  => 0,
     'loss-cone'       => 'none',             # none | log | full | relax (see analysis.py)
@@ -79,7 +80,7 @@ GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
     'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'alpha=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
-    'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'wait-for-model!', 'dry-run!', 'help',
+    'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'resolution-cuts=s', 'wait-for-model!', 'dry-run!', 'help',
     'loss-cone=s', 'include-undepleted!', 'coulomb-log=s',
 ) or die "Bad options -- see the header of $0\n";
 if ($opt{help}) { system('sed', '-n', '2,31p', $0); exit 0; }
@@ -87,9 +88,10 @@ if ($opt{help}) { system('sed', '-n', '2,31p', $0); exit 0; }
 my %allowed = (
     'mode'            => [qw(default observational)],
     'host-mass-model' => [qw(own group)],
-    'n-relation'      => [qw(bf20 bf20_seed harris17_number harris17_mass)],
-    'mass-function'   => [qw(gclf icmf)],
-    'radius-relation' => [qw(brown_gnedin21 brown_gnedin21_young marks_kroupa12 const_surface_density)],
+    'n-relation'      => [qw(bf20 bf20_seed harris17_number harris17_mass simulation)],
+    'mass-function'   => [qw(gclf icmf simulation)],
+    'radius-relation' => [qw(brown_gnedin21 brown_gnedin21_young marks_kroupa12 const_surface_density simulation)],
+    'resolution-cuts' => [qw(auto on off)],
     'phase-space'     => [qw(analytic simulation)],
     'loss-cone'       => [qw(none log full relax)],
     'coulomb-log'     => [qw(bh enclosed)],
@@ -117,10 +119,15 @@ my $mjit = length $opt{'mass-jitter-dex'}   ? $opt{'mass-jitter-dex'}   : $opt{'
 my $rjit = length $opt{'radius-jitter-dex'} ? $opt{'radius-jitter-dex'} : $opt{'jitter-dex'};
 ($mjit, $rjit) = (sprintf('%g', $mjit), sprintf('%g', $rjit));
 my $has_jit = ($mjit > 0 || $rjit > 0);
-die "--jitter-dex / --mass-jitter-dex / --radius-jitter-dex only apply to --mode default\n"
-    if $obs && $has_jit;
+# in observational mode, jitter only acts on masses/radii drawn from the simulation
+die "--jitter-dex / --mass-jitter-dex / --radius-jitter-dex only apply to --mode default, or to "
+  . "--mode observational with --mass-function or --radius-relation simulation\n"
+    if $obs && $has_jit && $opt{'mass-function'} ne 'simulation' && $opt{'radius-relation'} ne 'simulation';
 my $jit_tag = !$has_jit ? '' : ($mjit eq $rjit ? "jit$mjit" : "jitM${mjit}R${rjit}");
-my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $jit_tag, $opt{label}));
+# non-default resolution cuts -- same tag as imbh.cut_tag / run_naming.cut_tag
+my $cuts_on = $opt{'resolution-cuts'} eq 'auto' ? !$obs : $opt{'resolution-cuts'} eq 'on';
+my $cut_tag = ($cuts_on xor !$obs) ? ($cuts_on ? 'zcut' : 'nozcut') : '';
+my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $cut_tag, $jit_tag, $opt{label}));
 my $mode_short = $obs ? 'obs' : 'def';
 
 # analysis-only tag (the model outputs don't depend on it). KEEP IN SYNC with

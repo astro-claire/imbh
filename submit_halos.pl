@@ -22,6 +22,14 @@
 #                       $OUTDIR/cluster_tracks_<ID>_<obs tag>[_<label>]/
 #   default mode with jitter: <SNAP>_jit<s>[_<label>] (or _jitM<m>R<r> if mass/radius widths differ)
 #   with <obs tag> = obs_<n-relation>_<mass-function>_<radius-relation>_<phase-space>_host<model>_boost<n-boost>
+#   --resolution-cuts on (observational) adds _zcut after it; off (default mode) adds _nozcut.
+#
+# Model comparison (one ingredient at a time; any of these can be 'simulation'):
+#   perl submit_halos.pl --mode observational --n-relation bf20_seed --radius-relation marks_kroupa12 --resolution-cuts on
+#   ... --phase-space simulation          (+ simulation positions/velocities)
+#   ... --radius-relation simulation      (+ simulation sizes at the same mass)
+#   ... --mass-function simulation        (+ simulation masses, jointly with sizes/orbits)
+#   ... --n-relation simulation           (+ simulation numbers: should reproduce the maximal model)
 # Without --label, default-mode names match what run_analysis.sh expects
 # (and will overwrite earlier default-mode outputs in $OUTDIR).
 
@@ -58,6 +66,7 @@ my %opt = (
     'radius-relation' => 'brown_gnedin21',   # brown_gnedin21 | brown_gnedin21_young | marks_kroupa12 | const_surface_density
     'phase-space'     => 'analytic',         # analytic | simulation
     'n-boost'         => '1.0',
+    'resolution-cuts' => 'auto',             # auto | on | off (see imbh.py --resolution-cuts)
     'n-scatter-dex'   => '',                 # empty = the relation's own default
     'dry-run'         => 0,
 );
@@ -66,16 +75,17 @@ GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
     'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
-    'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'dry-run!', 'help',
+    'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'resolution-cuts=s', 'dry-run!', 'help',
 ) or die "Bad options -- see the header of $0\n";
 if ($opt{help}) { system('sed', '-n', '2,28p', $0); exit 0; }
 
 my %allowed = (
     'mode'            => [qw(default observational)],
     'host-mass-model' => [qw(own group)],
-    'n-relation'      => [qw(bf20 bf20_seed harris17_number harris17_mass)],
-    'mass-function'   => [qw(gclf icmf)],
-    'radius-relation' => [qw(brown_gnedin21 brown_gnedin21_young marks_kroupa12 const_surface_density)],
+    'n-relation'      => [qw(bf20 bf20_seed harris17_number harris17_mass simulation)],
+    'mass-function'   => [qw(gclf icmf simulation)],
+    'radius-relation' => [qw(brown_gnedin21 brown_gnedin21_young marks_kroupa12 const_surface_density simulation)],
+    'resolution-cuts' => [qw(auto on off)],
     'phase-space'     => [qw(analytic simulation)],
 );
 for my $k (sort keys %allowed) {
@@ -99,10 +109,15 @@ my $mjit = length $opt{'mass-jitter-dex'}   ? $opt{'mass-jitter-dex'}   : $opt{'
 my $rjit = length $opt{'radius-jitter-dex'} ? $opt{'radius-jitter-dex'} : $opt{'jitter-dex'};
 ($mjit, $rjit) = (sprintf('%g', $mjit), sprintf('%g', $rjit));
 my $has_jit = ($mjit > 0 || $rjit > 0);
-die "--jitter-dex / --mass-jitter-dex / --radius-jitter-dex only apply to --mode default\n"
-    if $obs && $has_jit;
+# in observational mode, jitter only acts on masses/radii drawn from the simulation
+die "--jitter-dex / --mass-jitter-dex / --radius-jitter-dex only apply to --mode default, or to "
+  . "--mode observational with --mass-function or --radius-relation simulation\n"
+    if $obs && $has_jit && $opt{'mass-function'} ne 'simulation' && $opt{'radius-relation'} ne 'simulation';
 my $jit_tag = !$has_jit ? '' : ($mjit eq $rjit ? "jit$mjit" : "jitM${mjit}R${rjit}");
-my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $jit_tag, $opt{label}));
+# non-default resolution cuts -- same tag as imbh.cut_tag / run_naming.cut_tag
+my $cuts_on = $opt{'resolution-cuts'} eq 'auto' ? !$obs : $opt{'resolution-cuts'} eq 'on';
+my $cut_tag = ($cuts_on xor !$obs) ? ($cuts_on ? 'zcut' : 'nozcut') : '';
+my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $cut_tag, $jit_tag, $opt{label}));
 my $mode_short = $obs ? 'obs' : 'def';
 
 my $jobdir = "$opt{outdir}/jobscripts";
@@ -160,6 +175,7 @@ END_TEMPLATE
 my @halos = split ' ', $opt{halos};
 die "No halo IDs given\n" unless @halos;
 print "Mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ($has_jit ? " ($jit_tag)" : '')
+    . ($cut_tag ? " ($cut_tag)" : '')
     . ", host-mass-model: $opt{'host-mass-model'}"
     . ($opt{label} ? ", label: $opt{label}" : '') . "\n";
 print "Job scripts in $jobdir\n";
@@ -191,6 +207,7 @@ for my $id (@halos) {
         push @args, "--obs-n-scatter-dex $opt{'n-scatter-dex'}" if length $opt{'n-scatter-dex'};
     }
     push @args, "--sim-mass-jitter-dex $mjit --sim-radius-jitter-dex $rjit" if $has_jit;
+    push @args, "--resolution-cuts $opt{'resolution-cuts'}" if $opt{'resolution-cuts'} ne 'auto';
     push @args, "--seed $opt{seed}" if length $opt{seed};
     my $cmd = join(' ', @args);
 

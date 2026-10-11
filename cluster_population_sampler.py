@@ -334,6 +334,67 @@ class ClusterPopulationSampler:
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
+    def draw_number(self, subhalo_mass, cluster_factor=5):
+        """
+        Number of clusters for a host of mass subhalo_mass (Msun): pick one
+        calibration halo with the Gaussian kernel in log mass and take its
+        cluster count divided by cluster_factor, rounded down (the sigma_8
+        correction, see the paper). Used by draw_clusters and by the
+        observational sampler's n_relation='simulation'.
+        """
+        log_target = np.log10(subhalo_mass)
+        h_i0, h_i1, h_weights = self._windowed_weights(self.halo_log_mass, log_target)
+        total_weight = h_weights.sum()
+
+        if total_weight < self.min_effective_weight:
+            warnings.warn(
+                f"Query host mass {subhalo_mass:.3e} Msun (log10={log_target:.2f}) has very low "
+                f"kernel-weighted support in the calibration data (effective weight={total_weight:.2f} "
+                f"vs threshold {self.min_effective_weight}). This draw is likely extrapolating beyond "
+                f"what the calibration catalog resolves -- results may not be trustworthy.",
+                stacklevel=3,
+            )
+
+        if total_weight == 0:
+            nearest = np.searchsorted(self.halo_log_mass, log_target)
+            nearest = np.clip(nearest, 0, len(self.halo_log_mass) - 1)
+            return int(self.halo_n_clusters[nearest]/cluster_factor)
+        h_weights = h_weights / total_weight
+        chosen_local = self.rng.choice(h_i1 - h_i0, p=h_weights)
+        return int(self.halo_n_clusters[h_i0 + chosen_local]/cluster_factor)
+
+    def expected_number(self, subhalo_mass, cluster_factor=5):
+        """Kernel-weighted mean of floor(N_i / cluster_factor) -- the mean of draw_number (array-friendly)."""
+        masses = np.atleast_1d(np.asarray(subhalo_mass, dtype=float))
+        out = np.zeros(len(masses))
+        n_eff = np.floor(self.halo_n_clusters / cluster_factor)
+        for k, m in enumerate(masses):
+            if not m > 0:
+                continue
+            log_target = np.log10(m)
+            h_i0, h_i1, w = self._windowed_weights(self.halo_log_mass, log_target)
+            if w.sum() == 0:
+                nearest = int(np.clip(np.searchsorted(self.halo_log_mass, log_target),
+                                      0, len(self.halo_log_mass) - 1))
+                out[k] = n_eff[nearest]
+            else:
+                out[k] = np.sum(w * n_eff[h_i0:h_i1]) / w.sum()
+        return out if np.ndim(subhalo_mass) else out[0]
+
+    def cluster_pool(self, subhalo_mass):
+        """
+        (i0, i1, weights): the calibration clusters draw_clusters resamples from
+        for a host of this mass -- self.cl_*[i0:i1] -- with their normalized
+        kernel weights (falls back to the nearest clusters in host mass).
+        """
+        log_target = np.log10(subhalo_mass)
+        c_i0, c_i1, c_weights = self._windowed_weights(self.cl_log_host_mass, log_target)
+        if c_weights.sum() == 0:
+            nearest = np.searchsorted(self.cl_log_host_mass, log_target)
+            c_i0, c_i1 = max(nearest - 1, 0), min(nearest + 1, len(self.cl_log_host_mass))
+            c_weights = np.ones(c_i1 - c_i0)
+        return c_i0, c_i1, c_weights / c_weights.sum()
+
     def draw_clusters(self, subhalo_mass, subhalo_radius,cluster_factor = 5):
         """
         Drop-in-ish replacement for the draw_clusters() placeholder.
@@ -354,27 +415,7 @@ class ClusterPopulationSampler:
         happens here instead.
         """
         log_target = np.log10(subhalo_mass)
-
-        h_i0, h_i1, h_weights = self._windowed_weights(self.halo_log_mass, log_target)
-        total_weight = h_weights.sum()
-
-        if total_weight < self.min_effective_weight:
-            warnings.warn(
-                f"Query host mass {subhalo_mass:.3e} Msun (log10={log_target:.2f}) has very low "
-                f"kernel-weighted support in the calibration data (effective weight={total_weight:.2f} "
-                f"vs threshold {self.min_effective_weight}). This draw is likely extrapolating beyond "
-                f"what the calibration catalog resolves -- results may not be trustworthy.",
-                stacklevel=2,
-            )
-
-        if total_weight == 0:
-            nearest = np.searchsorted(self.halo_log_mass, log_target)
-            nearest = np.clip(nearest, 0, len(self.halo_log_mass) - 1)
-            n_draw = int(self.halo_n_clusters[nearest]/cluster_factor)
-        else:
-            h_weights = h_weights / total_weight
-            chosen_local = self.rng.choice(h_i1 - h_i0, p=h_weights)
-            n_draw = int(self.halo_n_clusters[h_i0 + chosen_local]/cluster_factor)
+        n_draw = self.draw_number(subhalo_mass, cluster_factor=cluster_factor)
 
         empty = {
             'cluster_mass': np.array([]) * u.Msun,
@@ -385,12 +426,7 @@ class ClusterPopulationSampler:
         if n_draw == 0:
             return empty
 
-        c_i0, c_i1, c_weights = self._windowed_weights(self.cl_log_host_mass, log_target)
-        if c_weights.sum() == 0:
-            nearest = np.searchsorted(self.cl_log_host_mass, log_target)
-            c_i0, c_i1 = max(nearest - 1, 0), min(nearest + 1, len(self.cl_log_host_mass))
-            c_weights = np.ones(c_i1 - c_i0)
-        c_weights = c_weights / c_weights.sum()
+        c_i0, c_i1, c_weights = self.cluster_pool(subhalo_mass)
 
         local_idx = self.rng.choice(c_i1 - c_i0, size=n_draw, replace=True, p=c_weights)
         idx = c_i0 + local_idx

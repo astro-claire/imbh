@@ -18,6 +18,9 @@ population from published empirical scaling relations:
      2021 for young massive clusters; Marks & Kroupa 2012 for birth radii
      of embedded clusters; or a constant-surface-density relation motivated
      by the z~10 "Cosmic Gems" clusters, Adamo et al. 2024).
+  (Each of 1-3 can also be set to 'simulation' -- draw that ingredient from
+  the high-res simulation catalog instead -- so the two cluster models can be
+  compared one ingredient at a time; see imbh.py --obs-* options.)
   4. WHERE / HOW FAST   -- phase-space initial conditions relative to the
      host. Observations don't constrain these for z>7 proto-halos, so two
      options are offered: 'analytic' (GC-system Sersic profile scaled to
@@ -104,6 +107,13 @@ N_RELATIONS = {
         kind='eta_M', eta_M=2.9e-5, default_scatter_dex=0.28,
         ref="Harris, Blakeslee & Harris 2017: eta_M = M_GCS/M_h = 2.9e-5 "
             "(rms 0.28 dex); N set by dividing by the mean cluster mass"),
+    # For the model comparison: the simulation-calibrated sampler's own number
+    # draw (one calibration halo picked by the host-mass kernel, its N / 5
+    # rounded down). Needs the ClusterPopulationSampler (simulation_sampler).
+    'simulation': dict(
+        kind='simulation', cluster_factor=5, default_scatter_dex=0.0,
+        ref="Simulation-calibrated: N of a kernel-selected calibration halo, "
+            "divided by 5 and rounded down (as ClusterPopulationSampler)"),
 }
 
 # ----------------------------------------------------------------------
@@ -120,6 +130,13 @@ MASS_FUNCTIONS = {
         ref="Initial cluster mass function dN/dM ~ M^-2 exp(-M/M_c) "
             "(e.g. Portegies Zwart et al. 2010; Krumholz et al. 2019). "
             "M_c is poorly constrained at high z -- treat as a free parameter"),
+    # For the model comparison: bootstrap masses from the simulation catalog
+    # with the host-mass kernel. The same catalog cluster also supplies the
+    # radius / phase space when those are 'simulation' too (joint draw).
+    'simulation': dict(
+        kind='simulation',
+        ref="Simulation-calibrated: masses bootstrapped from the high-res "
+            "simulation catalog (host-mass kernel), as ClusterPopulationSampler"),
 }
 
 # ----------------------------------------------------------------------
@@ -154,6 +171,17 @@ RADIUS_RELATIONS = {
         ref="Constant Sigma_e = 1e5 Msun/pc^2, motivated by the z~10.2 Cosmic "
             "Gems clusters (Adamo et al. 2024, Nature 632, 513: M~1e6 Msun, "
             "R_eff~1 pc). NOT a fitted relation -- scatter is a placeholder"),
+    # For the model comparison: the simulation's own mass-radius relation.
+    # With mass_function='simulation' the radius comes from the SAME catalog
+    # cluster as the mass; otherwise it is drawn from catalog clusters of
+    # similar mass (Gaussian kernel of width log_mass_bandwidth_dex in log M,
+    # times the host-mass kernel). Masses outside the catalog's range use the
+    # nearest catalog cluster with r scaled as (M/M_cat)^(1/3) (fixed density).
+    'simulation': dict(
+        kind='simulation', log_mass_bandwidth_dex=0.1, scatter_dex=0.0, projected=False,
+        ref="Simulation-calibrated: 3D half-mass radii of high-res simulation "
+            "clusters of similar mass (or of the same cluster, with mass_function="
+            "'simulation')"),
 }
 
 # ----------------------------------------------------------------------
@@ -224,7 +252,8 @@ class ObservationalClusterSampler:
                  mass_function_kwargs=None, radius_relation_kwargs=None,
                  sersic_n=DEFAULT_SERSIC_N, re_over_r200=DEFAULT_RE_OVER_R200,
                  rmax_over_r200=DEFAULT_RMAX_OVER_R200,
-                 host_concentration=4.0, phase_space_sampler=None, rng=None):
+                 host_concentration=4.0, phase_space_sampler=None, rng=None,
+                 simulation_sampler=None):
         """
         Parameters:
             n_relation (str): key of N_RELATIONS -- sets the expected number
@@ -247,7 +276,9 @@ class ObservationalClusterSampler:
                 draw -- pass the SAME value the orbit integration uses
                 (imbh.HOST_CONCENTRATION).
             phase_space_sampler (ClusterPopulationSampler or None): required
-                if phase_space='simulation'.
+                if phase_space='simulation' or any of n_relation /
+                mass_function / radius_relation is 'simulation'.
+            simulation_sampler: alias for phase_space_sampler.
             rng (np.random.Generator or None).
         """
         for name, value, table in (('n_relation', n_relation, N_RELATIONS),
@@ -257,8 +288,12 @@ class ObservationalClusterSampler:
                 raise ValueError(f"{name} must be one of {sorted(table)}, got {value!r}")
         if phase_space not in ('analytic', 'simulation'):
             raise ValueError(f"phase_space must be 'analytic' or 'simulation', got {phase_space!r}")
-        if phase_space == 'simulation' and phase_space_sampler is None:
-            raise ValueError("phase_space='simulation' needs phase_space_sampler= "
+        if phase_space_sampler is None:
+            phase_space_sampler = simulation_sampler
+        uses_simulation = (phase_space == 'simulation' or 'simulation' in
+                           (n_relation, mass_function, radius_relation))
+        if uses_simulation and phase_space_sampler is None:
+            raise ValueError("a 'simulation' ingredient needs phase_space_sampler= "
                              "(a loaded ClusterPopulationSampler)")
 
         self.n_relation = n_relation
@@ -277,6 +312,7 @@ class ObservationalClusterSampler:
         self.host_concentration = float(host_concentration)
         self.phase_space_sampler = phase_space_sampler
         self.rng = rng if rng is not None else np.random.default_rng()
+        self.n_radius_extrapolated = 0  # radius_relation='simulation': masses outside the catalog
 
         self._build_mass_function_table()
 
@@ -287,6 +323,11 @@ class ObservationalClusterSampler:
     # ------------------------------------------------------------------
     def _build_mass_function_table(self, n_grid=4001):
         p = self.mf_params
+        if p['kind'] == 'simulation':
+            # bootstrapped from the catalog; the unweighted catalog mean stands
+            # in for the mean mass (only used by the eta_M number relation)
+            self.mean_cluster_mass = float(np.mean(self.phase_space_sampler.cl_mass))
+            return
         logm = np.linspace(np.log10(p['m_min']), np.log10(p['m_max']), n_grid)
         m = 10**logm
         if p['kind'] == 'lognormal':
@@ -325,6 +366,30 @@ class ObservationalClusterSampler:
             r = r * 4.0 / 3.0
         return r
 
+    def _radius_from_simulation_given_mass(self, mass_msun, halo_mass):
+        """
+        3D half-mass radius (pc) for each mass, drawn from catalog clusters of
+        similar mass in this host's kernel-weighted pool (see RADIUS_RELATIONS
+        ['simulation']). Masses with no catalog cluster within ~5 bandwidths
+        take the nearest one's radius scaled by (M / M_cat)^(1/3).
+        """
+        s = self.phase_space_sampler
+        bw = self.rr_params['log_mass_bandwidth_dex']
+        c_i0, c_i1, w_host = s.cluster_pool(halo_mass)
+        pool_logm = np.log10(s.cl_mass[c_i0:c_i1])
+        pool_r_pc = s.cl_hmradius[c_i0:c_i1] * 1e3   # kpc -> pc
+        out = np.empty(len(mass_msun))
+        for k, m in enumerate(np.log10(mass_msun)):
+            dlog = pool_logm - m
+            w = w_host * np.exp(-0.5 * (dlog / bw) ** 2)
+            if np.min(np.abs(dlog)) > 5 * bw or not w.sum() > 0:
+                j = int(np.argmin(np.abs(dlog)))
+                out[k] = pool_r_pc[j] * 10 ** ((m - pool_logm[j]) / 3.0)
+                self.n_radius_extrapolated += 1
+            else:
+                out[k] = pool_r_pc[self.rng.choice(len(w), p=w / w.sum())]
+        return out
+
     # ------------------------------------------------------------------
     # Number of clusters
     # ------------------------------------------------------------------
@@ -339,12 +404,20 @@ class ObservationalClusterSampler:
                 lam = 10**(p['log_eta_N_a'] + p['log_eta_N_b'] * np.log10(m)) * m
             elif p['kind'] == 'eta_M':
                 lam = p['eta_M'] * m / self.mean_cluster_mass
+            elif p['kind'] == 'simulation':
+                lam = np.where(m > 0, self.phase_space_sampler.expected_number(
+                    np.where(m > 0, m, 1.0), cluster_factor=p['cluster_factor']), 0.0)
             else:
                 raise ValueError(f"unknown n_relation kind {p['kind']!r}")
         lam = np.where(m > 0, lam, 0.0)
         return self.n_boost * lam
 
     def _draw_number(self, halo_mass_msun):
+        if self.n_params['kind'] == 'simulation':
+            n = self.phase_space_sampler.draw_number(halo_mass_msun,
+                                                     cluster_factor=self.n_params['cluster_factor'])
+            # n_boost != 1: Poisson around the boosted count
+            return int(self.rng.poisson(self.n_boost * n)) if self.n_boost != 1 else int(n)
         lam = float(self.expected_number(halo_mass_msun))
         if lam <= 0:
             return 0
@@ -382,14 +455,18 @@ class ObservationalClusterSampler:
         calibrated sampler's cluster pool, kernel-weighted toward the query
         halo mass exactly as ClusterPopulationSampler.draw_clusters does.
         """
+        return self._phase_space_from_indices(self._draw_catalog_indices(n, halo_mass),
+                                              halo_mass, halo_radius)
+
+    def _draw_catalog_indices(self, n, halo_mass):
+        """n catalog-cluster indices, host-mass-kernel weighted (as ClusterPopulationSampler)."""
+        c_i0, c_i1, w = self.phase_space_sampler.cluster_pool(halo_mass)
+        return c_i0 + self.rng.choice(c_i1 - c_i0, size=n, replace=True, p=w)
+
+    def _phase_space_from_indices(self, idx, halo_mass, halo_radius):
+        """Positions/velocities of catalog clusters idx, rescaled to this host's R200 / v_circ."""
         s = self.phase_space_sampler
-        c_i0, c_i1, w = s._windowed_weights(s.cl_log_host_mass, np.log10(halo_mass))
-        if w.sum() == 0:
-            nearest = int(np.clip(np.searchsorted(s.cl_log_host_mass, np.log10(halo_mass)),
-                                  0, len(s.cl_log_host_mass) - 1))
-            c_i0, c_i1 = max(nearest - 1, 0), min(nearest + 1, len(s.cl_log_host_mass))
-            w = np.ones(c_i1 - c_i0)
-        idx = c_i0 + self.rng.choice(c_i1 - c_i0, size=n, replace=True, p=w / w.sum())
+        n = len(idx)
         v_circ = np.sqrt(G_KPC_MSUN_KMS * halo_mass / halo_radius)
         sep_mag = s.cl_dist_over_rvir[idx] * halo_radius
         vel_mag = s.cl_vel_over_vcirc[idx] * v_circ
@@ -428,10 +505,37 @@ class ObservationalClusterSampler:
                 'cluster_vel': np.zeros((0, 3)) * u.km / u.s,
             }
 
-        mass = self._sample_masses(n)
-        radius_pc = self.half_mass_radius_pc(mass)
+        sim = self.phase_space_sampler
+        mass_from_sim = self.mf_params['kind'] == 'simulation'
+        radius_from_sim = self.rr_params['kind'] == 'simulation'
+        idx = None
+        if mass_from_sim:
+            # one catalog cluster per drawn cluster supplies the mass and, if
+            # they are 'simulation' too, the radius and phase space (joint draw,
+            # so correlations are kept exactly as in ClusterPopulationSampler)
+            idx = self._draw_catalog_indices(n, subhalo_mass)
+            mass = sim.cl_mass[idx].astype(float)
+            m_jit = getattr(sim, 'mass_jitter_dex', 0.0)
+            if m_jit > 0:
+                mass = mass * 10 ** self.rng.normal(0.0, m_jit, size=n)
+        else:
+            mass = self._sample_masses(n)
+
+        if radius_from_sim:
+            if idx is not None:
+                radius_pc = sim.cl_hmradius[idx] * 1e3   # kpc -> pc
+            else:
+                radius_pc = self._radius_from_simulation_given_mass(mass, subhalo_mass)
+            r_jit = getattr(sim, 'radius_jitter_dex', 0.0)
+            if r_jit > 0:
+                radius_pc = radius_pc * 10 ** self.rng.normal(0.0, r_jit, size=n)
+        else:
+            radius_pc = self.half_mass_radius_pc(mass)
+
         if self.phase_space == 'analytic':
             sep, vel = self._phase_space_analytic(n, subhalo_mass, subhalo_radius)
+        elif idx is not None:
+            sep, vel = self._phase_space_from_indices(idx, subhalo_mass, subhalo_radius)
         else:
             sep, vel = self._phase_space_from_simulation(n, subhalo_mass, subhalo_radius)
 
@@ -447,8 +551,11 @@ class ObservationalClusterSampler:
         """Multi-line summary of every relation/parameter in use (printed by imbh.py)."""
         lines = [
             "ObservationalClusterSampler configuration:",
-            f"  number : {self.n_relation}  (n_boost={self.n_boost:g}, "
-            f"scatter={self.n_scatter_dex:g} dex, then Poisson)",
+            (f"  number : {self.n_relation}  (n_boost={self.n_boost:g}"
+             + (", Poisson around the boosted count)" if self.n_boost != 1 else ")")
+             if self.n_params['kind'] == 'simulation' else
+             f"  number : {self.n_relation}  (n_boost={self.n_boost:g}, "
+             f"scatter={self.n_scatter_dex:g} dex, then Poisson)"),
             f"           {self.n_params['ref']}",
             f"  mass   : {self.mass_function}  "
             + ", ".join(f"{k}={v:.4g}" for k, v in self.mf_params.items()
@@ -463,8 +570,16 @@ class ObservationalClusterSampler:
             + (f" (Sersic n={self.sersic_n:g}, R_e={self.re_over_r200:g} R200, "
                f"r_max={self.rmax_over_r200:g} R200, NFW c={self.host_concentration:g}, "
                f"isotropic bound velocities)" if self.phase_space == 'analytic'
-               else " (bootstrapped from the simulation-calibrated sampler)"),
+               else " (bootstrapped from the simulation-calibrated sampler"
+                    + (", jointly with the mass" if self.mf_params['kind'] == 'simulation' else "")
+                    + ")"),
         ]
+        sim = self.phase_space_sampler
+        if sim is not None and 'simulation' in (self.mf_params['kind'], self.rr_params['kind']):
+            lines.append(f"  simulation smoothed-bootstrap jitter: mass "
+                         f"{getattr(sim, 'mass_jitter_dex', 0.0):g} dex, radius "
+                         f"{getattr(sim, 'radius_jitter_dex', 0.0):g} dex "
+                         f"(applied to simulation-drawn masses/radii only)")
         return "\n".join(lines)
 
     def __getstate__(self):
@@ -503,6 +618,8 @@ def main():
           f"total M200 = {m_h.sum():.3e} Msun")
 
     for rel in N_RELATIONS:
+        if rel == 'simulation':
+            continue  # needs the simulation catalog; not part of this diagnostic
         s = ObservationalClusterSampler(n_relation=rel, mass_function=args.mass_function,
                                         radius_relation=args.radius_relation,
                                         rng=np.random.default_rng(args.seed))

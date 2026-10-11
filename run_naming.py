@@ -22,9 +22,10 @@ Also holds the plot-only --escaped selection (add_escaped_arg), whose suffix
 import os
 import re
 
-N_RELATIONS = ["bf20", "bf20_seed", "harris17_number", "harris17_mass"]
-MASS_FUNCTIONS = ["gclf", "icmf"]
-RADIUS_RELATIONS = ["brown_gnedin21", "brown_gnedin21_young", "marks_kroupa12", "const_surface_density"]
+N_RELATIONS = ["bf20", "bf20_seed", "harris17_number", "harris17_mass", "simulation"]
+MASS_FUNCTIONS = ["gclf", "icmf", "simulation"]
+RADIUS_RELATIONS = ["brown_gnedin21", "brown_gnedin21_young", "marks_kroupa12", "const_surface_density",
+                    "simulation"]
 PHASE_SPACES = ["analytic", "simulation"]
 HOST_MASS_MODELS = ["own", "group"]
 
@@ -42,6 +43,9 @@ def add_run_args(parser):
     g.add_argument("--radius-relation", choices=RADIUS_RELATIONS, default="brown_gnedin21")
     g.add_argument("--phase-space", choices=PHASE_SPACES, default="analytic")
     g.add_argument("--host-mass-model", choices=HOST_MASS_MODELS, default="own")
+    g.add_argument("--resolution-cuts", choices=["auto", "on", "off"], default="auto",
+                   help="As passed to submit_halos.pl (z>=7, M200c<1e9 seeding cuts; auto = on for "
+                        "the default mode, off for observational).")
     g.add_argument("--n-boost", default="1.0",
                    help="As passed to submit_halos.pl (used verbatim in the names, e.g. 1.0).")
     g.add_argument("--jitter-dex", type=float, default=0.0,
@@ -70,13 +74,26 @@ def _jitter_widths(args):
 
 
 def jitter_tag(args):
-    """'' / 'jit<s>' / 'jitM<m>R<r>' (default mode only). KEEP IN SYNC with imbh.jitter_tag."""
-    if args.mode == "observational":
+    """
+    '' / 'jit<s>' / 'jitM<m>R<r>'. KEEP IN SYNC with imbh.jitter_tag. Observational
+    mode only takes jitter with a 'simulation' mass function or radius relation.
+    """
+    if args.mode == "observational" and "simulation" not in (args.mass_function, args.radius_relation):
         return ""
     m, r = _jitter_widths(args)
     if m == 0 and r == 0:
         return ""
     return f"jit{m:g}" if m == r else f"jitM{m:g}R{r:g}"
+
+
+def cut_tag(args):
+    """'zcut' / 'nozcut' for a non-default --resolution-cuts, else ''. KEEP IN SYNC with imbh.cut_tag."""
+    obs = args.mode == "observational"
+    mode = getattr(args, "resolution_cuts", "auto")
+    on = (not obs) if mode == "auto" else (mode == "on")
+    if on == (not obs):
+        return ""
+    return "zcut" if on else "nozcut"
 
 
 def run_suffix(args):
@@ -87,6 +104,8 @@ def run_suffix(args):
     if args.mode == "observational":
         parts.append(f"obs_{args.n_relation}_{args.mass_function}_{args.radius_relation}_"
                      f"{args.phase_space}_host{args.host_mass_model}_boost{args.n_boost}")
+    if cut_tag(args):
+        parts.append(cut_tag(args))
     if jitter_tag(args):
         parts.append(jitter_tag(args))
     if args.label:
@@ -161,6 +180,8 @@ def run_description(args):
         bits.append(f"obs: {args.n_relation}, {args.mass_function}, {args.radius_relation}, "
                     f"{args.phase_space}, host {args.host_mass_model}"
                     + (f", boost {args.n_boost}" if args.n_boost not in ("1", "1.0") else ""))
+    if cut_tag(args):
+        bits.append("z>7, M<1e9 cuts" if cut_tag(args) == "zcut" else "no z/mass cuts")
     if jitter_tag(args):
         m, r = _jitter_widths(args)
         bits.append(f"jitter {m:g} dex" if m == r else f"jitter M {m:g} / R {r:g} dex")
