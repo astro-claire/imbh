@@ -66,7 +66,7 @@ DEFAULT_REVERSE = ("Maximal, empirical sizes",
                    f"{OBS} --n-relation simulation --mass-function simulation --radius-relation marks_kroupa12 "
                    f"--phase-space simulation --resolution-cuts on --jitter-dex 0.1")
 
-FONT_SIZE = 16
+FONT_SIZE = 22
 plt.rcParams.update({"font.size": FONT_SIZE, "axes.labelsize": FONT_SIZE, "legend.fontsize": FONT_SIZE - 3,
                      "xtick.labelsize": FONT_SIZE - 2, "ytick.labelsize": FONT_SIZE - 2})
 Z_MAX = 20
@@ -181,7 +181,7 @@ def main():
     dt = float(np.median(np.diff(t_ref)))
     z = age_to_redshift(t_ref)
     sl = slice(None, None, plot_step(dt, args.smooth_myr))
-    fig, axes = plt.subplots(1, len(mass_bins), figsize=(6 * len(mass_bins), 5.5), sharey=True)
+    fig, axes = plt.subplots(1, len(mass_bins), figsize=(6.5 * len(mass_bins), 6), sharey=True)
     ymax = []
     for ax, (tag, blabel, _, _) in zip(np.atleast_1d(axes), mass_bins):
         for run in present + ([reverse] if reverse and reverse.label in results else []):
@@ -209,8 +209,6 @@ def main():
                for i, r in enumerate(ladder) if r.label in results]
     if reverse and reverse.label in results:
         handles.append(Line2D([], [], color="0.15", lw=2.5, ls="--", label=reverse.label))
-    fig.suptitle(f"{sel_text}; smoothed over {args.smooth_myr:g} Myr; mean over each bin's halos",
-                 fontsize=FONT_SIZE)
     fig.tight_layout()
     fig.legend(handles=handles, loc="upper center", ncol=min(3, len(handles)), frameon=False,
                bbox_to_anchor=(0.5, 0.0))
@@ -266,7 +264,7 @@ def main():
     xpos = {lbl: i for i, lbl in enumerate(r.label for r in ladder)}
     if reverse:
         xpos[reverse.label] = len(ladder) + 0.5
-    fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 6.5))
+    fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 7.5))
     offsets = np.linspace(-0.15, 0.15, len(mass_bins))
     for ax, (key, title) in zip(axes, panels):
         for (tag, blabel, color, _), dx in zip(mass_bins, offsets):
@@ -291,8 +289,6 @@ def main():
         ax.grid(axis="y", color="0.9", lw=0.8)
         ax.set_axisbelow(True)
     axes[0].legend(title=r"Stellar mass at $z=0$", frameon=False, title_fontsize=FONT_SIZE - 3)
-    fig.suptitle(f"{sel_text}; points = bin mean, bars = halo range"
-                 + ("; diamond = reverse test" if reverse else ""), fontsize=FONT_SIZE)
     fig.tight_layout()
     fig.savefig(f"{prefix}_summary.png", dpi=200, bbox_inches="tight")
     print(f"Saved {prefix}_summary.png")

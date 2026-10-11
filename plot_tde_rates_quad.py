@@ -117,6 +117,8 @@ def main():
     p.add_argument("--kernel", choices=["boxcar", "gaussian"], default="boxcar")
     p.add_argument("--band", choices=["minmax", "percentile", "std"], default="minmax")
     p.add_argument("--logy", action="store_true", help="Log-scale y axes.")
+    p.add_argument("--separate-y", action="store_true",
+                   help="Give the top and bottom rows their own y range (default: all four panels share one).")
     p.add_argument("--output", default=None,
                    help="Output image (default: tde_rate_smoothed_quad_alpha<a>_<s>Myr_<left>_vs_<right>.png).")
     p.add_argument("--no-show", action="store_true")
@@ -149,7 +151,8 @@ def main():
     row_labels = [args.top_label if args.top_label is not None else default_labels[0],
                   args.bottom_label if args.bottom_label is not None else default_labels[1]]
     cache_dir = args.r200_cache_dir or args.data_dir
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10), sharex=True, sharey="row")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), sharex=True,
+                             sharey="row" if args.separate_y else True)
     row_hi = [[], []]  # positive band tops per row, for log y-limits
     band_desc = None
     for c, (col_label, rargs, _, ddir) in enumerate(columns):
@@ -203,14 +206,19 @@ def main():
         ax.set_xlim(Z_MAX, 0)  # redshift decreases left to right: time runs forward
         # for s in ("top", "right"):
         #     ax.spines[s].set_visible(False)
-    for r in range(2):
+    # y limits: one range for all four panels (default), or one per row with --separate-y
+    groups = [[0], [1]] if args.separate_y else [[0, 1]]
+    for rows_in_group in groups:
+        ax0 = axes[rows_in_group[0], 0]
         if args.logy:
-            axes[r, 0].set_yscale("log")
-            pos = np.concatenate(row_hi[r]) if row_hi[r] else np.array([])
+            ax0.set_yscale("log")
+            pos = [h for r in rows_in_group for h in row_hi[r]]
+            pos = np.concatenate(pos) if pos else np.array([])
             if pos.size:
-                axes[r, 0].set_ylim(max(pos.max() * 1e-4, pos.min()), pos.max() * 1.5)
+                ax0.set_ylim(max(pos.max() * 1e-4, pos.min()), pos.max() * 1.5)
         else:
-            axes[r, 0].set_ylim(bottom=0)
+            ax0.set_ylim(bottom=0)
+    for r in range(2):
         # row label on the right-hand edge of the row
         axes[r, 1].text(1.03, 0.5, row_labels[r], transform=axes[r, 1].transAxes, rotation=270,
                         ha="left", va="center", fontsize=FONT_SIZE + 2, )
