@@ -67,19 +67,25 @@ class Run:
         if not os.path.exists(path):
             return None
         df = pd.read_pickle(path) if path.endswith(".dat") else pd.read_csv(path)
-        status = df["status"].astype(str)
-        m_bh = pd.to_numeric(df["IMBH_mass_msun"], errors="coerce")
+        n = len(df)
+        # a halo that drew no clusters is saved by imbh.py as an EMPTY table with
+        # no columns at all (common for small galaxies in the conservative model);
+        # older outputs may also lack a column -- treat missing columns as unknown
+        col = lambda name: df[name] if name in df.columns else pd.Series([np.nan] * n, index=df.index)
+        status = col("status").astype(str)
+        m_bh = pd.to_numeric(col("IMBH_mass_msun"), errors="coerce")
         failed_trace = status == "trace_failed"
         imbh = m_bh >= IMBH_TDE_MIN_MSUN
+        med = lambda x: float(np.nanmedian(pd.to_numeric(x, errors="coerce"))) if x.notna().any() else np.nan
         return {
-            "n_clusters": int(len(df)),
+            "n_clusters": int(n),
             "n_trace_failed": int(failed_trace.sum()),
             "n_imbh_model_failed": int((m_bh.isna() & ~failed_trace).sum()),
             "n_imbh_ge500": int(imbh.sum()),
             "n_escaped_z0": int((status == "escaped").sum()),
-            "median_cluster_mass": float(np.nanmedian(df["cluster_mass_msun"])) if len(df) else np.nan,
-            "median_r_h_pc": float(np.nanmedian(df["cluster_radius_pc"])) if len(df) else np.nan,
-            "median_m_imbh_ge500": float(np.nanmedian(m_bh[imbh])) if imbh.any() else np.nan,
+            "median_cluster_mass": med(col("cluster_mass_msun")),
+            "median_r_h_pc": med(col("cluster_radius_pc")),
+            "median_m_imbh_ge500": med(m_bh[imbh]),
         }
 
 
