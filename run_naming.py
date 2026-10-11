@@ -57,6 +57,8 @@ def add_run_args(parser):
                         "(as passed to submit_analysis.pl; default none = original prescription).")
     g.add_argument("--include-undepleted", action="store_true",
                    help="The analysis run used --include-undepleted.")
+    g.add_argument("--coulomb-log", choices=["bh", "enclosed"], default="bh",
+                   help="analysis.py --coulomb-log the TDE rates were computed with (default bh).")
     return parser
 
 
@@ -100,10 +102,15 @@ def loss_cone_tag(args):
     return f"lc{mode}" + ("U" if getattr(args, "include_undepleted", False) else "")
 
 
+def coulomb_log_tag(args):
+    """'' for --coulomb-log bh (default), 'clenc' for enclosed. KEEP IN SYNC with submit_analysis.pl."""
+    return "clenc" if getattr(args, "coulomb_log", "bh") == "enclosed" else ""
+
+
 def analysis_suffix(args):
-    """run_suffix plus the analysis-only loss-cone tag: names the analysis<suffix>/ folder."""
-    lc = loss_cone_tag(args)
-    return run_suffix(args) + (f"_{lc}" if lc else "")
+    """run_suffix plus the analysis-only tags (loss cone, Coulomb log): names the analysis<suffix>/ folder."""
+    tags = [t for t in (loss_cone_tag(args), coulomb_log_tag(args)) if t]
+    return run_suffix(args) + "".join(f"_{t}" for t in tags)
 
 
 def analysis_dir(data_dir, suffix):
@@ -162,4 +169,6 @@ def run_description(args):
     if loss_cone_tag(args):
         bits.append(f"loss cone: {args.loss_cone}"
                     + (" + undepleted" if getattr(args, "include_undepleted", False) else ""))
+    if coulomb_log_tag(args):
+        bits.append("enclosed-mass Coulomb log")
     return "; ".join(bits)

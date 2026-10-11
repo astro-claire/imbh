@@ -22,6 +22,8 @@
 #                        none (default, original) | log | full | relax
 #   --include-undepleted with --loss-cone log/full/relax: also count shells
 #                        that are not depleted within the cluster's lifetime
+#   --coulomb-log MODE   Coulomb log inside the sphere of influence passed to
+#                        analysis.py: bh (default) | enclosed (original choice)
 #
 # Reads, per halo (same names as submit_halos.pl):
 #   $OUTDIR/cluster_output_<ID>_<SNAP><suffix>.dat
@@ -30,9 +32,10 @@
 # tde_contributors_...csv) into:
 #   default mode, no label:  $OUTDIR                (same as run_analysis.sh)
 #   otherwise:               $OUTDIR/analysis<suffix>/
-# where <suffix> = [_<obs tag>][_<jitter tag>][_<label>][_lc<MODE>[U]], so different
-# configurations never overwrite each other's analysis files. (_lc<MODE> is added
-# for any --loss-cone other than none; U marks --include-undepleted.)
+# where <suffix> = [_<obs tag>][_<jitter tag>][_<label>][_lc<MODE>[U]][_clenc], so
+# different configurations never overwrite each other's analysis files. (_lc<MODE>
+# is added for any --loss-cone other than none; U marks --include-undepleted;
+# _clenc marks --coulomb-log enclosed.)
 
 use strict;
 use warnings;
@@ -68,6 +71,7 @@ my %opt = (
     'wait-for-model'  => 0,
     'loss-cone'       => 'none',             # none | log | full | relax (see analysis.py)
     'include-undepleted' => 0,
+    'coulomb-log'     => 'bh',               # bh | enclosed (see analysis.py)
     'dry-run'         => 0,
 );
 
@@ -76,7 +80,7 @@ GetOptions(\%opt,
     'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'alpha=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
     'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'wait-for-model!', 'dry-run!', 'help',
-    'loss-cone=s', 'include-undepleted!',
+    'loss-cone=s', 'include-undepleted!', 'coulomb-log=s',
 ) or die "Bad options -- see the header of $0\n";
 if ($opt{help}) { system('sed', '-n', '2,31p', $0); exit 0; }
 
@@ -88,6 +92,7 @@ my %allowed = (
     'radius-relation' => [qw(brown_gnedin21 brown_gnedin21_young marks_kroupa12 const_surface_density)],
     'phase-space'     => [qw(analytic simulation)],
     'loss-cone'       => [qw(none log full relax)],
+    'coulomb-log'     => [qw(bh enclosed)],
 );
 for my $k (sort keys %allowed) {
     die "--$k must be one of: @{$allowed{$k}} (got '$opt{$k}')\n"
@@ -124,9 +129,11 @@ die "--include-undepleted needs --loss-cone log, full or relax\n"
     if $opt{'include-undepleted'} && $opt{'loss-cone'} eq 'none';
 my $lc_tag = $opt{'loss-cone'} eq 'none' ? ''
            : "lc$opt{'loss-cone'}" . ($opt{'include-undepleted'} ? 'U' : '');
-my $asuffix = $suffix . (length $lc_tag ? "_$lc_tag" : '');
-my $lc_args = $opt{'loss-cone'} eq 'none' ? ''
-            : " --loss-cone $opt{'loss-cone'}" . ($opt{'include-undepleted'} ? ' --include-undepleted' : '');
+my $cl_tag = $opt{'coulomb-log'} eq 'enclosed' ? 'clenc' : '';
+my $asuffix = $suffix . join('', map { "_$_" } grep { length } ($lc_tag, $cl_tag));
+my $lc_args = ($opt{'loss-cone'} eq 'none' ? ''
+            : " --loss-cone $opt{'loss-cone'}" . ($opt{'include-undepleted'} ? ' --include-undepleted' : ''))
+            . " --coulomb-log $opt{'coulomb-log'}";
 
 my $analysis_dir = length($asuffix) ? "$opt{outdir}/analysis$asuffix" : $opt{outdir};
 my $jobdir = "$opt{outdir}/jobscripts";
@@ -193,7 +200,8 @@ die "No halo IDs given\n" unless @halos;
 print "Analysis for mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ($has_jit ? " ($jit_tag)" : '')
     . ", host-mass-model: $opt{'host-mass-model'}" . ($opt{label} ? ", label: $opt{label}" : '')
     . ", alpha: $opt{alpha}, loss cone: $opt{'loss-cone'}"
-    . ($opt{'include-undepleted'} ? ' (+undepleted)' : '') . "\n";
+    . ($opt{'include-undepleted'} ? ' (+undepleted)' : '')
+    . ", Coulomb log: $opt{'coulomb-log'}\n";
 print "Analysis outputs -> $analysis_dir\n";
 print "Job scripts in $jobdir\n";
 

@@ -76,6 +76,17 @@ TRH_COULOMB_GAMMA = 0.2
 # monotonic once the loss-cone terms are included.
 # INCLUDE_UNDEPLETED: also let shells with t_dep > t_life contribute, at rate
 # dM / t_dep for the whole lifetime (a partial, steady supply).
+# Coulomb logarithm for two-body relaxation INSIDE the IMBH's sphere of
+# influence (all TDE quantities; not the cluster half-mass t_rh, which keeps
+# ln(0.2 N)):
+#  * 'bh'       : ln Lambda = ln[M_BH / ((1+alpha) m_*)]. Inside r_infl the
+#                 potential is the BH's: b_max ~ r and b_90 ~ G m_*/sigma^2
+#                 = (1+alpha) r m_*/M_BH, so Lambda is independent of r.
+#  * 'enclosed' : ln Lambda = ln[0.2 M_*(<r) / m_*] (the original choice; the
+#                 critical radius used M_*(<r_h)). Reproduces the paper draft.
+COULOMB_LOG = 'bh'
+COULOMB_LOG_MODES = ('bh', 'enclosed')
+
 LOSS_CONE = 'none'
 LOSS_CONE_MODES = ('none', 'log', 'full', 'relax')
 N_SHELLS = 30
@@ -130,7 +141,8 @@ def half_mass_relaxation_time_gyr(m_star_msun, r_h_pc, m_mean_msun=1.0, gamma=TR
 
 
 def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
-                       loss_cone=None, n_shells=None, include_undepleted=None):
+                       loss_cone=None, n_shells=None, include_undepleted=None,
+                       coulomb_log_mode=None):
     """
     Returns (mass_lost_bins, t_relax_bin, t_cutoff_gyr, t_delay_gyr), or four
     Nones if this cluster produces no TDEs.
@@ -144,6 +156,12 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
     loss_cone = LOSS_CONE if loss_cone is None else loss_cone
     n_shells = N_SHELLS if n_shells is None else n_shells
     include_undepleted = INCLUDE_UNDEPLETED if include_undepleted is None else include_undepleted
+    coulomb_log_mode = COULOMB_LOG if coulomb_log_mode is None else coulomb_log_mode
+    if coulomb_log_mode not in COULOMB_LOG_MODES:
+        raise ValueError(f"coulomb_log_mode must be one of {COULOMB_LOG_MODES}, got {coulomb_log_mode!r}")
+    # fixed ln Lambda for the 'bh' choice (None -> each function's 'enclosed' default)
+    lnL = (coulomb_log_bh(float(df['IMBH_mass_msun'][idx]), alpha)
+           if coulomb_log_mode == 'bh' else None)
     if loss_cone not in LOSS_CONE_MODES:
         raise ValueError(f"loss_cone must be one of {LOSS_CONE_MODES}, got {loss_cone!r}")
     stellar_radius = stellar_radius_approximation(1* u.Msun)
@@ -203,14 +221,14 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
             mass_lost_bins, t_dep_bin = depletion_shells(
                 m_imbh, df['r0_pc'][idx], rho0_star, alpha, inner_pc, outer_pc, t_cutoff_gyr,
                 mode=loss_cone, n_shells=n_shells, include_undepleted=include_undepleted,
-                rstar_pc=stellar_radius.to('pc').value)
+                rstar_pc=stellar_radius.to('pc').value, coulomb_log_mode=coulomb_log_mode)
             if len(mass_lost_bins) == 0:
                 return None, None, None, None
             return mass_lost_bins, t_dep_bin, t_cutoff_gyr, t_delay_gyr
 
         r = calc_cutoff_radius(t_cutoff_gyr, df['IMBH_mass_msun'][idx],
                                 df['r0_pc'][idx], rho0_star, alpha,
-                                df['cluster_radius_pc'][idx])
+                                df['cluster_radius_pc'][idx], coulomb_log=lnL)
         # print(r)
         # r_orbital_inner = calc_orbital_relaxation_radius(df['IMBH_mass_msun'][idx],df['r0_pc'][idx],
                                                     #  rho0_star, alpha,df['cluster_radius_pc'][idx] )
@@ -255,7 +273,7 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
                 # M_star_removed_msun = M_r_outer - M_r_inner
                 M_star_removed_msun= sum(mass_lost_bins)
                 #Using the outer t_relax (could take bin middle but leave that as #TODO)
-                t_relax_bin = [calc_relaxation_time(sigma_bins[i],rho_bins[i], mass_bins[i]) for i in range(1,Nbins) ]
+                t_relax_bin = [calc_relaxation_time(sigma_bins[i],rho_bins[i], mass_bins[i], coulomb_log=lnL) for i in range(1,Nbins) ]
             else:
                 M_star_removed_msun = 0. 
                 mass_lost_bins = [0*u.Msun for i in range(Nbins-1)]
@@ -286,7 +304,7 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
                 # M_star_removed_msun = M_r_outer - M_r_inner
                 M_star_removed_msun= sum(mass_lost_bins)
                 #Using the outer t_relax (could take bin middle but leave that as #TODO)
-                t_relax_bin = [calc_relaxation_time(sigma_bins[i],rho_bins[i], mass_bins[i]) for i in range(1,Nbins) ]
+                t_relax_bin = [calc_relaxation_time(sigma_bins[i],rho_bins[i], mass_bins[i], coulomb_log=lnL) for i in range(1,Nbins) ]
             else:
                 M_star_removed_msun = 0. 
                 mass_lost_bins = [0*u.Msun for i in range(Nbins-1)]
@@ -299,18 +317,25 @@ def timescale_analysis(df, idx, alpha, subtract_imbh=None, trh_delay=None,
 
 
 
-        cluster_relaxation_time_gyr = calc_relaxation_time(sigma_r_outer,rho_r_outer, M_r_outer)
+        cluster_relaxation_time_gyr = calc_relaxation_time(sigma_r_outer,rho_r_outer, M_r_outer, coulomb_log=lnL)
         tde_rate = M_star_removed_msun/cluster_relaxation_time_gyr / u.Gyr
 
         return np.array(mass_lost_bins*u.Msun),np.array(t_relax_bin), t_cutoff_gyr, t_delay_gyr
 
-def depletion_time_gyr(r_pc, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar=1.0):
+def coulomb_log_bh(imbh_mass, alpha, Mstar=1.0):
+    """ln Lambda = ln[M_BH / ((1+alpha) m_*)] inside the sphere of influence (see COULOMB_LOG)."""
+    return float(np.log(imbh_mass / ((1. + alpha) * Mstar)))
+
+
+def depletion_time_gyr(r_pc, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar=1.0,
+                       coulomb_log_mode=None):
     """
     Time (Gyr) to deplete the stars at radius r_pc (array) around the IMBH.
 
-        t_relax = 0.34 sigma^3 / (G^2 rho m ln Lambda)   (as calc_relaxation_time,
-                  ln Lambda = ln(0.2 M(<r)/m), floored at 1 so the innermost
-                  few-star shells can't give a zero/negative time)
+        t_relax = 0.34 sigma^3 / (G^2 rho m ln Lambda)   (as calc_relaxation_time;
+                  ln Lambda per COULOMB_LOG -- 'bh': ln[M_BH/((1+alpha) m)],
+                  'enclosed': ln(0.2 M(<r)/m) -- floored at 1 so it can never
+                  give a zero/negative time)
         r_T     = R_* (M_BH/m)^(1/3);   R_lc = J_lc^2/J_c^2 ~ 2 r_T / a,  a ~ r
         'relax' : t_dep = t_relax
         'log'   : t_dep = t_relax * ln(1/R_lc)
@@ -320,7 +345,11 @@ def depletion_time_gyr(r_pc, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar=1
     """
     r_pc = np.atleast_1d(np.asarray(r_pc, dtype=float))
     sigma, rho, M = calc_structural_props(r_pc, imbh_mass, rho0, r0, alpha)
-    coulomb_log = np.maximum(np.log(0.2 * M.to(u.Msun).value / Mstar), 1.0)
+    coulomb_log_mode = COULOMB_LOG if coulomb_log_mode is None else coulomb_log_mode
+    if coulomb_log_mode == 'bh':
+        coulomb_log = np.full_like(r_pc, max(coulomb_log_bh(imbh_mass, alpha, Mstar), 1.0))
+    else:
+        coulomb_log = np.maximum(np.log(0.2 * M.to(u.Msun).value / Mstar), 1.0)
     t_relax = (0.34 * sigma**3 / G**2 / rho / (Mstar * u.Msun) / coulomb_log).to(u.Gyr).value
     r_T = rstar_pc * (imbh_mass / Mstar) ** (1. / 3.)
     R_lc = np.minimum(2 * r_T / r_pc, 1.0)
@@ -340,7 +369,7 @@ def depletion_time_gyr(r_pc, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar=1
 
 def depletion_shells(imbh_mass, r0, rho0, alpha, r_in_pc, r_out_pc, t_life_gyr,
                      mode='log', n_shells=N_SHELLS, include_undepleted=False, rstar_pc=None,
-                     Mstar=1.0):
+                     Mstar=1.0, coulomb_log_mode=None):
     """
     Split [r_in, r_out] into n_shells log-spaced shells and return
     (mass_lost_msun, t_dep_gyr), one entry per contributing shell:
@@ -364,7 +393,8 @@ def depletion_shells(imbh_mass, r0, rho0, alpha, r_in_pc, r_out_pc, t_life_gyr,
     m_edges = calc_structural_props(edges, imbh_mass, rho0, r0, alpha)[2].to(u.Msun).value
     dM = np.diff(m_edges)
     r_mid = np.sqrt(edges[:-1] * edges[1:])
-    t_dep, _, _ = depletion_time_gyr(r_mid, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar)
+    t_dep, _, _ = depletion_time_gyr(r_mid, imbh_mass, rho0, r0, alpha, mode, rstar_pc, Mstar,
+                                     coulomb_log_mode=coulomb_log_mode)
     keep = (dM > 0) & np.isfinite(t_dep) & (t_dep > 0)
     if not include_undepleted:
         keep &= t_dep < t_life_gyr
@@ -391,8 +421,10 @@ def calc_structural_props(r,imbh_mass, rho0, r0, alpha):
     M_r = 4 * np.pi * rho0 * r**(3-alpha) / (3-alpha)/ r0**(-alpha)
     return sigma_r, rho_r, M_r
 
-def calc_relaxation_time(sigma_r, rho_r, M_r, Mstar = 1*u.Msun):
-    coulomb_log = np.log(M_r /Mstar * 0.2)
+def calc_relaxation_time(sigma_r, rho_r, M_r, Mstar = 1*u.Msun, coulomb_log=None):
+    """Local relaxation time (Gyr). coulomb_log=None -> ln(0.2 M_r/m) (the 'enclosed' choice)."""
+    if coulomb_log is None:
+        coulomb_log = np.log(M_r /Mstar * 0.2)
     return (0.34 * sigma_r**3 / G**2 /rho_r / Mstar/ coulomb_log).to('Gyr').value
 
 def calc_min_enclosed_radius(Mstar, r0, rho0, alpha):
@@ -430,7 +462,8 @@ def calc_min_enclosed_radius(Mstar, r0, rho0, alpha):
 
     return ((Mstar * (3-alpha) * r0**(-alpha) / (4 * np.pi * rho0))**(1/(3-alpha))).to('pc')
 
-def calc_cutoff_radius(t_cutoff_gyr, imbh_mass, r0, rho0, alpha, rtotal, Mstar=1*u.Msun):
+def calc_cutoff_radius(t_cutoff_gyr, imbh_mass, r0, rho0, alpha, rtotal, Mstar=1*u.Msun,
+                       coulomb_log=None):
     """
     Solve t_cutoff = C * r^(alpha - 3/2) for r.
     Valid for alpha != 1.5 (see guard below); direction of the
@@ -449,7 +482,9 @@ def calc_cutoff_radius(t_cutoff_gyr, imbh_mass, r0, rho0, alpha, rtotal, Mstar=1
     r0 = r0 * u.pc
     t_cutoff_gyr = t_cutoff_gyr * u.Gyr
     M_r = 4 * np.pi * rho0 * rtotal**(3-alpha) / (3-alpha) / r0**(-alpha)
-    coulomb_log = np.log(M_r / Mstar * 0.2)
+    if coulomb_log is None:
+        # 'enclosed' choice: evaluated with M(<rtotal) = M(<r_h)
+        coulomb_log = np.log(M_r / Mstar * 0.2)
     numerator = 0.34 * imbh_mass**(3./2.)
     denominator = t_cutoff_gyr * G**(0.5) * (1+alpha)**(3./2.) * rho0 * Mstar * coulomb_log * r0**alpha
     exponent = 2. / (3. - 2.*alpha)
@@ -580,7 +615,7 @@ def _burst_bins(t_start_yr, t_end_yr, t0_yr, dt_yr, n_bins):
 def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun,
                   resolution = 1e5*u.yr, track_dir=None, radial_edges_kpc=None,
                   subtract_imbh=None, trh_delay=None, loss_cone=None, n_shells=None,
-                  include_undepleted=None):
+                  include_undepleted=None, coulomb_log_mode=None):
     """
     Returns (tde_rate_array_msunyr, mass_trelax_array_msun, mean_radius_kpc,
     n_clusters_with_tde, contributing_rows, radial):
@@ -689,7 +724,8 @@ def run_clusters(df, alpha, tscale_array_yr, tde_rate_array_msunyr, mass_trelax_
             halo_formation_time = cosmo.age(df[formation_z_col][clusteridx])
             mass_lost_bins,t_relax_bin, t_cutoff_gyr, t_delay_gyr = timescale_analysis(
                 df, clusteridx, alpha, subtract_imbh=subtract_imbh, trh_delay=trh_delay,
-                loss_cone=loss_cone, n_shells=n_shells, include_undepleted=include_undepleted)
+                loss_cone=loss_cone, n_shells=n_shells, include_undepleted=include_undepleted,
+                coulomb_log_mode=coulomb_log_mode)
             if t_cutoff_gyr is not None: 
                 # TDEs start t_delay_gyr (trh_delay half-mass relaxation times)
                 # after the IMBH forms -- see timescale_analysis
@@ -857,6 +893,10 @@ def main():
     parser.add_argument("--include-undepleted", action="store_true",
                          help="With --loss-cone log/full/relax: let shells with t_dep > t_life "
                               "contribute dM/t_dep for the whole lifetime (default: only depleted shells).")
+    parser.add_argument("--coulomb-log", choices=COULOMB_LOG_MODES, default=COULOMB_LOG,
+                         help="Coulomb logarithm inside the sphere of influence (see COULOMB_LOG): "
+                              "'bh' = ln[M_BH/((1+alpha) m_*)] (default); 'enclosed' = ln[0.2 M_*(<r)/m_*], "
+                              "the original choice (reproduces the paper draft with --loss-cone none).")
     args = parser.parse_args()
 
     subhalo_id = args.subhalo_id or infer_subhalo_id(args.input_path)
@@ -870,7 +910,8 @@ def main():
           f"TDE onset delayed by {args.trh_delay:g} half-mass relaxation time(s)")
     print(f"Loss-cone prescription: {args.loss_cone}"
           + (f" ({args.n_shells} shells{', undepleted shells included' if args.include_undepleted else ''})"
-             if args.loss_cone != 'none' else ""))
+             if args.loss_cone != 'none' else "")
+          + f"; Coulomb log: {args.coulomb_log}")
     df = load_data_file(args.input_path)
     print(df.columns)
     tscale_array_yr, tde_rate_array_msunyr, mass_trelax_array_msun = set_up_timebins(1e5*u.yr)
@@ -881,7 +922,7 @@ def main():
         resolution=1e5*u.yr, track_dir=args.track_dir, radial_edges_kpc=radial_edges_kpc,
         subtract_imbh=not args.no_subtract_imbh, trh_delay=args.trh_delay,
         loss_cone=args.loss_cone, n_shells=args.n_shells,
-        include_undepleted=args.include_undepleted,
+        include_undepleted=args.include_undepleted, coulomb_log_mode=args.coulomb_log,
     )
     output_df = pd.DataFrame({
         'time': tscale_array_yr[:-2],
