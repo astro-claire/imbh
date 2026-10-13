@@ -38,6 +38,12 @@ R_STOP_FRAC = 0.01
 # short-circuit below for why that's a real numerical hazard, not just a
 # theoretical one).
 _MIN_SOFT_R0_FRAC = 1e-4
+# Inspiral capture: an orbit is ended as 'merged' once |r| < INSPIRAL_CAPTURE_FRAC * r_stop.
+# 1.0 (default) = exactly at r_stop, as before. The force is softened at r_soft = r_stop,
+# so dynamical friction stalls just outside r_stop; a value slightly above 1 (e.g. 2)
+# counts clusters that have settled there as merged instead of leaving them hovering.
+# Per-call override: integrate_orbit(..., inspiral_capture_frac=...).
+INSPIRAL_CAPTURE_FRAC = 1.0
 
 
 class NFWHost:
@@ -199,8 +205,17 @@ class _RhsStepLimitExceeded(RuntimeError):
     pass
 
 
+def _background_accel(bg_host, bg_offset, r_vec, r_soft):
+    """Acceleration (kpc/Gyr^2) at r_vec (host frame) from a background NFW centred at bg_offset."""
+    r_bg_vec = r_vec - bg_offset
+    r_bg_actual = np.linalg.norm(r_bg_vec)
+    r_bg = max(r_bg_actual, r_soft)
+    r_bg_hat = r_bg_vec / r_bg_actual if r_bg_actual > 1e-12 else np.zeros(3)
+    return -_G * bg_host.mass_enclosed(r_bg) / r_bg**2 * r_bg_hat
+
+
 def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate,
-         extra_bgs, call_budget):
+         extra_bgs, a_ref, call_budget):
     call_budget[0] += 1
     if call_budget[0] > MAX_RHS_CALLS_PER_SOLVE:
         raise _RhsStepLimitExceeded(
@@ -260,12 +275,7 @@ def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hu
     # itself sits within, whose confining gravity we'd otherwise be
     # missing entirely (see trace_cluster_to_snapshot in imbh.py).
     if bg_host is not None:
-        r_bg_vec = r_vec - bg_offset
-        r_bg_actual = np.linalg.norm(r_bg_vec)
-        r_bg = max(r_bg_actual, r_soft)
-        Menc_bg = bg_host.mass_enclosed(r_bg)
-        r_bg_hat = r_bg_vec / r_bg_actual if r_bg_actual > 1e-12 else np.zeros(3)
-        a_total = a_total - _G * Menc_bg / r_bg**2 * r_bg_hat
+        a_total = a_total + _background_accel(bg_host, bg_offset, r_vec, r_soft)
 
     # Optional EXTRA backgrounds (same treatment: gravity only) -- e.g. the
     # FoF group a satellite host is orbiting inside, when that group isn't
@@ -273,11 +283,16 @@ def _rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hu
     # extra_bgs is a sequence of (NFWHost, offset_kpc ndarray) or None.
     if extra_bgs:
         for x_host, x_offset in extra_bgs:
-            r_x_vec = r_vec - x_offset
-            r_x_actual = np.linalg.norm(r_x_vec)
-            r_x = max(r_x_actual, r_soft)
-            r_x_hat = r_x_vec / r_x_actual if r_x_actual > 1e-12 else np.zeros(3)
-            a_total = a_total - _G * x_host.mass_enclosed(r_x) / r_x**2 * r_x_hat
+            a_total = a_total + _background_accel(x_host, x_offset, r_vec, r_soft)
+
+    # TIDAL backgrounds (frame_model='fixed' in imbh.py): the integration frame is the
+    # host's, and the host itself falls freely in the same background field, so only the
+    # DIFFERENTIAL (tidal) pull acts on the cluster: subtract the backgrounds' acceleration
+    # at the host's centre (a_ref, constant over one integrate_orbit call). None = legacy:
+    # the full background pull, with the host's acceleration instead entering through the
+    # snapshot-to-snapshot velocity reframe in imbh.py.
+    if a_ref is not None:
+        a_total = a_total - a_ref
 
     # Last-resort safety net: NFWHost and _chandrasekhar_xfactor are both
     # now guarded against the known degenerate-host (M200/R200<=0) source
@@ -411,7 +426,8 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
                      t_max=50 * u.Gyr, r_stop_frac=R_STOP_FRAC, escape_frac=3.0,
                      background_host=None, background_offset=None,
                      hubble_rate=0.0 / u.Gyr, record_dt=None,
-                     allow_start_inside_stop=False, extra_backgrounds=None):
+                     allow_start_inside_stop=False, extra_backgrounds=None,
+                     tidal_backgrounds=False, inspiral_capture_frac=None):
     """
     Like sink_time(), but returns the full final STATE (position and
     velocity relative to the host) at whatever time the integration
@@ -535,6 +551,19 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
         extra_bgs = tuple((x_host, x_offset.to(u.kpc).value) for x_host, x_offset in extra_backgrounds)
     record_dt_gyr = record_dt.to(u.Gyr).value if record_dt is not None else None
 
+    # tidal_backgrounds: subtract the backgrounds' pull at the host's centre (see _rhs)
+    a_ref = None
+    if tidal_backgrounds and (background_host is not None or extra_bgs):
+        a_ref = np.zeros(3)
+        origin = np.zeros(3)
+        if background_host is not None:
+            a_ref += _background_accel(background_host, bg_offset_kpc, origin, r_stop)
+        for x_host, x_offset in (extra_bgs or ()):
+            a_ref += _background_accel(x_host, x_offset, origin, r_stop)
+    # orbit ends as 'merged' below r_capture (= r_stop unless inspiral_capture_frac > 1)
+    capture = INSPIRAL_CAPTURE_FRAC if inspiral_capture_frac is None else float(inspiral_capture_frac)
+    r_capture = capture * r_stop
+
     # If we're ALREADY at/inside the merge radius, OR already beyond the
     # escape radius, at t=0 -- short-circuit here rather than relying on
     # solve_ivp's crossing-detection events -- those events only fire on a
@@ -552,7 +581,7 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     # directions from the starting point to build a finite-difference
     # Jacobian.
     r0_mag = np.linalg.norm(r0)
-    if r0_mag <= r_stop and not allow_start_inside_stop:
+    if r0_mag <= r_capture and not allow_start_inside_stop:
         traj = None
         if record_dt_gyr is not None:
             r0_from_center = (np.linalg.norm(r0 - bg_offset_kpc) if bg_offset_kpc is not None
@@ -585,10 +614,10 @@ def integrate_orbit(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
         return "escaped", 0 * u.Gyr, r0_vec.to(u.kpc), v0_vec.to(u.km / u.s), 0, None, None, traj
 
     y0 = np.concatenate([r0, v0])
-    events = [_make_stop_event(r_stop), _make_escape_event(r_escape), _make_pericenter_event()]
+    events = [_make_stop_event(r_capture), _make_escape_event(r_escape), _make_pericenter_event()]
 
     sol = _solve_ivp_robust(
-        (m_msun, host, coulomb_log, r_stop, background_host, bg_offset_kpc, hubble_rate_gyr, extra_bgs),
+        (m_msun, host, coulomb_log, r_stop, background_host, bg_offset_kpc, hubble_rate_gyr, extra_bgs, a_ref),
         (0, t_max_gyr), y0, events,
     )
 
@@ -662,7 +691,7 @@ def sink_time(m_cluster, r0_vec, v0_vec, host, coulomb_log=None,
     events = [_make_stop_event(r_stop), _make_escape_event(r_escape)]
 
     sol = _solve_ivp_robust(
-        (m_msun, host, coulomb_log, r_stop, None, None, 0.0, None),
+        (m_msun, host, coulomb_log, r_stop, None, None, 0.0, None, None),
         (0, t_max_gyr), y0, events,
     )
 

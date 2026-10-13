@@ -36,7 +36,7 @@ from observational_cluster_sampler import (ObservationalClusterSampler, N_RELATI
 
  
 # dynamical friction orbit integration (separate module, kept alongside this script)
-from dynamical_friction import NFWHost, integrate_orbit, R_STOP_FRAC
+from dynamical_friction import NFWHost, integrate_orbit, R_STOP_FRAC, _background_accel
 # raw merger-tree navigator, for following a cluster's host across mergers
 from tree_navigator import MergerTreeNavigator, HOST_MASS_MODELS
 #timescales stuff
@@ -54,6 +54,21 @@ alpha = 1.2
 # are less concentrated), possibly per-halo from a mass-concentration-
 # redshift relation rather than one fixed number for every subhalo.
 HOST_CONCENTRATION = 4.0
+# How a cluster's host-relative state is carried from one snapshot (host) to the next:
+#  'fixed'  (default): the orbit is integrated in the host's own frame, which moves and
+#           accelerates WITH the host. On a continuation of the same host (no merger) the
+#           cluster's host-relative position/velocity are kept as integrated; at a real merger
+#           they are moved into the new host's frame with the old host's position carried to
+#           the new snapshot's time (tree_navigator.relative_state_matched). Background halos
+#           (main progenitor, satellite group) act as TIDAL fields -- their pull at the host's
+#           centre is subtracted (dynamical_friction.integrate_orbit tidal_backgrounds).
+#  'legacy' : the pre-Oct-2026 behaviour, kept only to reproduce old runs. It added the host's
+#           full displacement between snapshots (x_old - x_new) and its velocity change to the
+#           cluster at EVERY snapshot, i.e. treated the cluster as standing still while its host
+#           moved (kpc per snapshot at high z), and applied the full (non-tidal) background
+#           pull. Clusters were thrown out of their hosts almost immediately.
+FRAME_MODELS = ("fixed", "legacy")
+FRAME_MODEL = "fixed"
 # conversion factor for turning NFWHost.potential()'s internal
 # (kpc/Gyr)^2 units into the more readable (km/s)^2, for the
 # energy-based boundedness diagnostic in trace_cluster_to_snapshot's
@@ -175,6 +190,20 @@ def observational_uses_simulation(obs_kwargs):
     return (obs_kwargs.get("phase_space", "analytic") == "simulation"
             or "simulation" in (obs_kwargs.get("n_relation"), obs_kwargs.get("mass_function"),
                                 obs_kwargs.get("radius_relation")))
+
+
+def frame_tag(frame_model=FRAME_MODEL, inspiral_capture_frac=1.0):
+    """
+    Output-name tag for the orbit-integration choices: '' for the defaults ('fixed' frame,
+    capture at r_stop), else 'legacyframe' and/or 'cap<x>'. KEEP IN SYNC with
+    run_naming.frame_tag and the naming block of submit_halos.pl.
+    """
+    parts = []
+    if frame_model == "legacy":
+        parts.append("legacyframe")
+    if float(inspiral_capture_frac) != 1.0:
+        parts.append(f"cap{float(inspiral_capture_frac):g}")
+    return "_".join(parts)
 
 
 def jitter_tag(mass_jitter_dex=0.0, radius_jitter_dex=0.0):
@@ -305,7 +334,7 @@ def draw_formation_age(navigator, start_snap, rng, mode="uniform"):
 
 
 def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentration,
-                                   bg_host=None, bg_offset=None, extra_bgs=None):
+                                   bg_host=None, bg_offset=None, extra_bgs=None, tidal=False):
     """
     Total specific orbital energy (KE + potential), in (km/s)^2, for the
     given position/velocity relative to a host built fresh here from
@@ -325,16 +354,26 @@ def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentra
     r_actual_kpc = np.linalg.norm(r_vec.to(u.kpc).value)
     v_actual_kms = np.linalg.norm(v_vec.to(u.km / u.s).value)
     phi_local_kms2 = host.potential(r_actual_kpc) * _KPCGYR_TO_KMS ** 2
+    r_kpc_vec = r_vec.to(u.kpc).value
+
+    def phi_background(b_host, b_offset):
+        """Background potential at the cluster, (kpc/Gyr)^2; with tidal=True the TIDAL potential
+        (relative to the host's centre, minus the uniform pull the host shares)."""
+        off = b_offset.to(u.kpc).value
+        phi = b_host.potential(np.linalg.norm(r_kpc_vec - off))
+        if tidal:
+            phi -= b_host.potential(np.linalg.norm(off))
+            a0 = _background_accel(b_host, off, np.zeros(3), 0.0)
+            phi += float(np.dot(a0, r_kpc_vec))      # -a0.r term of the tidal potential
+        return phi
+
+    phi_bg_kms2 = 0.0
     if bg_host is not None:
-        r_bg_kpc = np.linalg.norm((r_vec - bg_offset).to(u.kpc).value)
-        phi_bg_kms2 = bg_host.potential(r_bg_kpc) * _KPCGYR_TO_KMS ** 2
-    else:
-        phi_bg_kms2 = 0.0
+        phi_bg_kms2 = phi_background(bg_host, bg_offset) * _KPCGYR_TO_KMS ** 2
     # extra backgrounds (e.g. a satellite host's own FoF group) are folded
     # into the background term: list of (NFWHost, offset Quantity) or None
     for x_host, x_offset in (extra_bgs or ()):
-        r_x_kpc = np.linalg.norm((r_vec - x_offset).to(u.kpc).value)
-        phi_bg_kms2 += x_host.potential(r_x_kpc) * _KPCGYR_TO_KMS ** 2
+        phi_bg_kms2 += phi_background(x_host, x_offset) * _KPCGYR_TO_KMS ** 2
     ke_kms2 = 0.5 * v_actual_kms ** 2
     e_total_kms2 = ke_kms2 + phi_local_kms2 + phi_bg_kms2
     return e_total_kms2, ke_kms2, phi_local_kms2, phi_bg_kms2
@@ -571,7 +610,8 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
                                      max_leg_duration, hubble_start, hubble_end,
                                      escape_frac=np.inf, record_dt=None, min_bg_substeps=1,
                                      allow_start_inside_stop=False,
-                                     grp_bg_start=None, grp_bg_end=None):
+                                     grp_bg_start=None, grp_bg_end=None,
+                                     tidal_backgrounds=False, inspiral_capture_frac=None):
     """
     Subdivide a leg into shorter sub-steps rather than treating a
     potentially Gyr-long gap as a single static host/single solve_ivp call
@@ -669,6 +709,7 @@ def _integrate_leg_with_subdivision(cluster_mass, r_vec, v_vec, mass_start, radi
             background_host=bg_host_k, background_offset=bg_offset_k, hubble_rate=hubble_k,
             record_dt=record_dt, allow_start_inside_stop=allow_start_inside_stop,
             extra_backgrounds=extra_k,
+            tidal_backgrounds=tidal_backgrounds, inspiral_capture_frac=inspiral_capture_frac,
         )
         if traj_sub is not None:
             t_sub, r_sub = traj_sub
@@ -704,7 +745,8 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                                navigator, concentration=HOST_CONCENTRATION, max_steps=MAX_STEPS,
                                final_escape_frac=3.0, max_leg_duration=1.0 * u.Gyr,
                                min_host_mass_msun=1e8, verbose=False, record_dt=None,
-                               allow_formation_inside_r_stop=True, formation_age=None):
+                               allow_formation_inside_r_stop=True, formation_age=None,
+                               frame_model=FRAME_MODEL, inspiral_capture_frac=None):
     """
     Follow one cluster's dynamical-friction evolution, advancing ONE
     SNAPSHOT AT A TIME along its current host's tree branch, until it
@@ -871,6 +913,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
     def make_result(status, host_id, r, v, r_over_rvir, steps):
         final_energy_kms2, _, _, _ = _compute_specific_energy_kms2(
             r, v, mass_msun, radius_kpc, concentration, bg_host, bg_offset, extra_bgs=grp_extra,
+            tidal=(frame_model == "fixed"),
         )
         result = {
             'status': status,
@@ -1035,7 +1078,16 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         subdivided = (t_leg_max > max_leg_duration) or bg_active
         rel_pos_full = rel_vel_full = None
         if next_id is not None:
-            rel_pos_full, rel_vel_full = navigator.relative_state(current_id, next_id)
+            if frame_model == "legacy":
+                rel_pos_full, rel_vel_full = navigator.relative_state(current_id, next_id)
+            elif is_primary:
+                # same host, next snapshot: the cluster moved and accelerated WITH its host,
+                # so its host-relative state carries over unchanged
+                rel_pos_full = np.zeros(3) * u.kpc
+                rel_vel_full = np.zeros(3) * u.km / u.s
+            else:
+                # real merger: into the new host's frame, at matching times
+                rel_pos_full, rel_vel_full = navigator.relative_state_matched(current_id, next_id)
 
         if verbose:
             if bg_host is not None:
@@ -1065,7 +1117,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             # this doesn't get confused by a wide but bound eccentric orbit.
             e_total_kms2, ke_kms2, phi_local_kms2, phi_bg_kms2 = _compute_specific_energy_kms2(
                 r_vec, v_vec, mass_msun, radius_kpc, concentration, bg_host, bg_offset,
-                extra_bgs=grp_extra,
+                extra_bgs=grp_extra, tidal=(frame_model == "fixed"),
             )
             bound_str = "BOUND" if e_total_kms2 < 0 else "UNBOUND"
             print(f"          energy: KE={ke_kms2:.2f}, Phi_local={phi_local_kms2:.2f}, "
@@ -1107,6 +1159,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                     max_leg_duration, hubble_start, hubble_end, record_dt=record_dt,
                     min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
                     grp_bg_start=grp_bg, grp_bg_end=grp_bg_end,
+                    tidal_backgrounds=(frame_model == "fixed"), inspiral_capture_frac=inspiral_capture_frac,
                 )
             else:
                 # 'output'-capped (including the true final step): no next
@@ -1124,6 +1177,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                     max_leg_duration, hubble_start, hubble_start, escape_frac=escape_frac, record_dt=record_dt,
                     min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
                     grp_bg_start=grp_bg, grp_bg_end=grp_bg_end,
+                    tidal_backgrounds=(frame_model == "fixed"), inspiral_capture_frac=inspiral_capture_frac,
                 )
         else:
             # only reached when NOT subdivided, i.e. t_leg_max <= max_leg_duration
@@ -1136,6 +1190,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 background_host=bg_host, background_offset=bg_offset, hubble_rate=hubble_start,
                 record_dt=record_dt, allow_start_inside_stop=allow_start_inside_stop,
                 extra_backgrounds=grp_extra,
+                tidal_backgrounds=(frame_model == "fixed"), inspiral_capture_frac=inspiral_capture_frac,
             )
         current_age = current_age + elapsed
         n_pericenters += n_peri
@@ -1254,7 +1309,8 @@ def save_radius_track(track_time_gyr, track_radius_kpc, halo_idx, cluster_idx, t
 def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                       record_dt=None, track_dir=None, track_min_mass=TRACK_MIN_IMBH_MASS_MSUN,
                       formation_inside_r_stop_mode='pin_to_host_center',
-                      formation_time_mode='uniform', rng=None):
+                      formation_time_mode='uniform', rng=None,
+                      frame_model=FRAME_MODEL, inspiral_capture_frac=None):
     """
     Parameters (new ones only -- see the rest of the module for the others):
         formation_time_mode: 'uniform' (default) or 'snapshot' -- how each
@@ -1404,6 +1460,7 @@ def iterate_subhalos(df, goodidx, navigator, target_age, debug_trace=False,
                     verbose=debug_trace, record_dt=record_dt,
                     allow_formation_inside_r_stop=(formation_inside_r_stop_mode == 'integrate'),
                     formation_age=formation_age,
+                    frame_model=frame_model, inspiral_capture_frac=inspiral_capture_frac,
                 )
             if trace_err is not None:
                 print(f"    WARNING: orbit trace failed/timed out ({trace_err}) -- "
@@ -1700,6 +1757,16 @@ def main():
                          help=f"Directory to save --save-radius-tracks output into (default: "
                               f"'{TRACK_OUTPUT_DIRNAME}' next to the input CSV). Pass this same "
                               "path to analysis.py's --track-dir.")
+    parser.add_argument("--frame-model", choices=FRAME_MODELS, default=FRAME_MODEL,
+                         help="How a cluster's host-relative position/velocity are carried between "
+                              "snapshots: 'fixed' (default; host-frame integration, reframe only at "
+                              "real mergers and time-matched, tidal backgrounds) or 'legacy' "
+                              "(pre-Oct-2026 behaviour, only to reproduce old runs). See FRAME_MODEL.")
+    parser.add_argument("--inspiral-capture-frac", type=float, default=1.0,
+                         help="End an orbit as 'inspiraled' once it is within this many r_stop "
+                              "(= R_STOP_FRAC*R_vir) of its host's centre (default 1 = at r_stop). "
+                              "The force is softened at r_stop, so clusters can stall just outside it; "
+                              "e.g. 2 counts those as inspiraled. Tagged 'cap<x>' in the output name.")
     parser.add_argument("--formed-inside-rstop-mode", choices=["pin_to_host_center", "integrate", "instant_merge"],
                          default="pin_to_host_center",
                          help="How to handle a cluster whose drawn initial separation already lands "
@@ -1819,6 +1886,7 @@ def main():
                                     host_mass_model=args.host_mass_model,
                                     fill_main_branch_gaps=not args.no_fill_main_branch_gaps)
     print(f"host_mass_model = {args.host_mass_model!r}")
+    print(f"frame_model = {args.frame_model!r}, inspiral capture at {args.inspiral_capture_frac:g} r_stop")
     target_age = navigator.age_at_snap(args.output_snap)
     print(f"Output snapshot {args.output_snap} -> cosmic age {target_age:.4f}")
 
@@ -1870,7 +1938,9 @@ def main():
                                         record_dt=record_dt, track_dir=track_dir,
                                         track_min_mass=args.track_min_mass,
                                         formation_inside_r_stop_mode=args.formed_inside_rstop_mode,
-                                        formation_time_mode=args.formation_time_draw, rng=rng)
+                                        formation_time_mode=args.formation_time_draw, rng=rng,
+                                        frame_model=args.frame_model,
+                                        inspiral_capture_frac=args.inspiral_capture_frac)
     summarize_status(output_clusters)
     if getattr(cluster_sampler, "n_radius_extrapolated", 0):
         print(f"radius_relation='simulation': {cluster_sampler.n_radius_extrapolated} cluster(s) had a mass "
@@ -1887,6 +1957,8 @@ def main():
         mode_tag += f"_{ctag}" if ctag else ""
         jtag = jitter_tag(mass_jit, radius_jit)
         mode_tag += f"_{jtag}" if jtag else ""
+        ftag = frame_tag(args.frame_model, args.inspiral_capture_frac)
+        mode_tag += f"_{ftag}" if ftag else ""
         save_path = os.path.join(os.path.dirname(args.csv_path) or ".",
                                   f"cluster_output_{tree_id}_snap{args.output_snap}{mode_tag}.{ext}")
         print(f"--save-path not given, using: {save_path}")

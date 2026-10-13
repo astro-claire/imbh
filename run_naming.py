@@ -55,6 +55,11 @@ def add_run_args(parser):
                    help="Override --jitter-dex for cluster mass only.")
     g.add_argument("--radius-jitter-dex", type=float, default=None,
                    help="Override --jitter-dex for cluster radius only.")
+    g.add_argument("--frame-model", choices=["fixed", "legacy"], default="fixed",
+                   help="imbh.py --frame-model of the run (default fixed; 'legacy' = runs made "
+                        "before the Oct-2026 reframe fix, tagged 'legacyframe').")
+    g.add_argument("--inspiral-capture-frac", type=float, default=1.0,
+                   help="imbh.py --inspiral-capture-frac of the run (default 1; else tagged 'cap<x>').")
     g.add_argument("--label", default="")
     g.add_argument("--loss-cone", choices=["none", "log", "full", "relax"], default="none",
                    help="analysis.py --loss-cone mode the TDE rates were computed with "
@@ -96,6 +101,17 @@ def cut_tag(args):
     return "zcut" if on else "nozcut"
 
 
+def frame_tag(args):
+    """'' / 'legacyframe' / 'cap<x>' / 'legacyframe_cap<x>'. KEEP IN SYNC with imbh.frame_tag."""
+    parts = []
+    if getattr(args, "frame_model", "fixed") == "legacy":
+        parts.append("legacyframe")
+    cap = float(getattr(args, "inspiral_capture_frac", 1.0))
+    if cap != 1.0:
+        parts.append(f"cap{cap:g}")
+    return "_".join(parts)
+
+
 def run_suffix(args):
     """'' for an unlabelled default-mode run, else '_<obs tag>[_<label>]' / '_<label>'."""
     if args.label and re.search(r"[^\w.\-]", args.label):
@@ -108,6 +124,8 @@ def run_suffix(args):
         parts.append(cut_tag(args))
     if jitter_tag(args):
         parts.append(jitter_tag(args))
+    if frame_tag(args):
+        parts.append(frame_tag(args))
     if args.label:
         parts.append(args.label)
     return "".join(f"_{p}" for p in parts)

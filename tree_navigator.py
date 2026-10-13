@@ -430,3 +430,22 @@ class MergerTreeNavigator:
         rel_vel_kms = vel_old_phys - vel_new_phys
 
         return rel_pos_kpc * u.kpc, rel_vel_kms * u.km / u.s
+
+    def relative_state_matched(self, old_id, new_id):
+        """
+        Like relative_state, but TIME-MATCHED when old_id and new_id sit at different
+        snapshots (a merger: old_id at snap n, its descendant new_id at snap n+1):
+        old_id's position is first carried forward to new_id's time with its own
+        velocity, x_old + v_old*dt, so the result is old_id's position relative to
+        new_id at the SAME moment. Use this to move a cluster that moved WITH its
+        old host into the new host's frame (imbh.py frame_model='fixed');
+        relative_state alone treats the cluster as if it had stayed put while its
+        old host moved. Identical to relative_state for same-snapshot calls.
+        """
+        rel_pos, rel_vel = self.relative_state(old_id, new_id)
+        snap_old, snap_new = self.snap_of(old_id), self.snap_of(new_id)
+        if snap_old == snap_new:
+            return rel_pos, rel_vel
+        dt = self.age_at_snap(snap_new) - self.age_at_snap(snap_old)
+        vel_old = np.asarray(self.data["SubhaloVel"][self._row(old_id)], dtype=float) * u.km / u.s
+        return (rel_pos + (vel_old * dt).to(u.kpc)), rel_vel

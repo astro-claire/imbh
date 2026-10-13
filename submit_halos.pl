@@ -76,6 +76,9 @@ my %opt = (
     'n-boost'         => '1.0',
     'resolution-cuts' => 'auto',             # auto | on | off (see imbh.py --resolution-cuts)
     'n-scatter-dex'   => '',                 # empty = the relation's own default
+    # orbit integration (see imbh.py --frame-model / --inspiral-capture-frac)
+    'frame-model'     => 'fixed',            # fixed | legacy (legacy only to reproduce pre-Oct-2026 runs)
+    'inspiral-capture-frac' => '1',          # orbit ends as inspiraled within this many r_stop
     'dry-run'         => 0,
 );
 
@@ -83,7 +86,8 @@ GetOptions(\%opt,
     'model-dir=s', 'outdir=s', 'venv=s', 'snap=i', 'halos=s', 'mode=s',
     'host-mass-model=s', 'label=s', 'jitter-dex=s', 'mass-jitter-dex=s', 'radius-jitter-dex=s', 'seed=s', 'seeds=s', 'h_rt=s', 'h_data=s',
     'radius-tracks!', 'n-relation=s', 'mass-function=s', 'radius-relation=s',
-    'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'resolution-cuts=s', 'dry-run!', 'help',
+    'phase-space=s', 'n-boost=s', 'n-scatter-dex=s', 'resolution-cuts=s', 'frame-model=s',
+    'inspiral-capture-frac=s', 'dry-run!', 'help',
 ) or die "Bad options -- see the header of $0\n";
 if ($opt{help}) { system('sed', '-n', '2,40p', $0); exit 0; }
 
@@ -149,7 +153,14 @@ my $jit_tag = !$has_jit ? '' : ($mjit eq $rjit ? "jit$mjit" : "jitM${mjit}R${rji
 # non-default resolution cuts -- same tag as imbh.cut_tag / run_naming.cut_tag
 my $cuts_on = $opt{'resolution-cuts'} eq 'auto' ? !$obs : $opt{'resolution-cuts'} eq 'on';
 my $cut_tag = ($cuts_on xor !$obs) ? ($cuts_on ? 'zcut' : 'nozcut') : '';
-my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $cut_tag, $jit_tag, $opt{label}));
+# orbit-integration choices -- same tag as imbh.frame_tag / run_naming.frame_tag
+die "--frame-model must be fixed or legacy\n" unless $opt{'frame-model'} =~ /^(?:fixed|legacy)$/;
+die "--inspiral-capture-frac must be a positive number\n"
+    unless $opt{'inspiral-capture-frac'} =~ /^[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?$/ && $opt{'inspiral-capture-frac'} > 0;
+my $cap = sprintf('%g', $opt{'inspiral-capture-frac'});
+my $frame_tag = join('_', grep { length } ($opt{'frame-model'} eq 'legacy' ? 'legacyframe' : '',
+                                            $cap ne '1' ? "cap$cap" : ''));
+my $suffix = join('', map { "_$_" } grep { length } ($obs_tag, $cut_tag, $jit_tag, $frame_tag, $opt{label}));
 my $mode_short = $obs ? 'obs' : 'def';
 
 my $jobdir = "$opt{outdir}/jobscripts";
@@ -207,7 +218,7 @@ END_TEMPLATE
 my @halos = split ' ', $opt{halos};
 die "No halo IDs given\n" unless @halos;
 print "Mode: $opt{mode}" . ($obs ? " ($obs_tag)" : '') . ($has_jit ? " ($jit_tag)" : '')
-    . ($cut_tag ? " ($cut_tag)" : '')
+    . ($cut_tag ? " ($cut_tag)" : '') . ($frame_tag ? " ($frame_tag)" : '')
     . ", host-mass-model: $opt{'host-mass-model'}"
     . ($opt{label} ? ", label: $opt{label}" : '') . "\n";
 print "Job scripts in $jobdir\n";
@@ -225,6 +236,8 @@ for my $id (@halos) {
         "python imbh.py subhalo_formation_$id.csv --output-snap $opt{snap}",
         "--save-path $opt{outdir}/cluster_output_${id}_$opt{snap}$suffix.dat",
         "--host-mass-model $opt{'host-mass-model'}",
+        "--frame-model $opt{'frame-model'}",
+        "--inspiral-capture-frac $cap",
     );
     push @args, "--save-radius-tracks --track-dir $opt{outdir}/cluster_tracks_$id$suffix"
         if $opt{'radius-tracks'};

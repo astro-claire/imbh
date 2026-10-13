@@ -38,6 +38,7 @@ it on Hoffman2, e.g.:
   python debug_orbits.py --data-dir /u/scratch/c/clairewi/imbh-output --halos 685512 939095 --n 5
   python debug_orbits.py --data-dir ... --model "--jitter-dex 0.1" --halos 685512 --n 5
   python debug_orbits.py --data-dir ... --halos 685512 --rows 12 345 678
+  python debug_orbits.py --data-dir ... --frame-model legacy     # reproduce runs made before the fix
 """
 import argparse
 import contextlib
@@ -146,62 +147,6 @@ def plot_cluster(steps, title, path):
     plt.close(fig)
 
 
-KPC_PER_KMS_GYR = (1 * u.km / u.s * u.Gyr).to(u.kpc).value
-
-
-def patch_relative_state(nav, same_host_unchanged=False):
-    """Proposed fix (test only): relative_state(old, new) between DIFFERENT snapshots returns
-    x_old(t_new) - x_new(t_new), extrapolating the old host's position with its own velocity, so
-    a cluster that moves WITH its host is not left behind by the host's displacement. Same-snapshot
-    calls (background offsets) are unchanged."""
-    orig = nav.relative_state
-
-    def fixed(old_id, new_id):
-        rel_pos, rel_vel = orig(old_id, new_id)
-        s_old, s_new = nav.snap_of(old_id), nav.snap_of(new_id)
-        if s_old == s_new:
-            return rel_pos, rel_vel
-        if same_host_unchanged:
-            nxt, is_primary = nav.step_forward(old_id)
-            if nxt == new_id and is_primary:
-                return 0 * rel_pos, 0 * rel_vel
-        dt = (nav.age_at_snap(s_new) - nav.age_at_snap(s_old)).to(u.Gyr).value
-        v_old = np.asarray(nav.data["SubhaloVel"][nav._row(old_id)], dtype=float)  # physical km/s
-        return rel_pos + v_old * dt * KPC_PER_KMS_GYR * u.kpc, rel_vel
-
-    nav.relative_state = fixed
-
-
-def patch_tidal_backgrounds():
-    """Proposed fix (test only): in dynamical_friction._rhs, subtract each background's acceleration
-    at the host's centre (r = 0), so backgrounds only add their TIDAL (differential) pull."""
-    import dynamical_friction as dfm
-    if getattr(dfm._rhs, "_tidal_patched", False):
-        return
-    orig = dfm._rhs
-
-    def accel(host, offset):
-        d = -np.asarray(offset, dtype=float)          # host centre relative to the background centre
-        r = np.linalg.norm(d)
-        if r <= 0:
-            return np.zeros(3)
-        return -dfm._G * host.mass_enclosed(r) / r ** 2 * d / r
-
-    def rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate,
-            extra_bgs, call_budget):
-        dy = np.array(orig(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset,
-                           hubble_rate, extra_bgs, call_budget), dtype=float)
-        if bg_host is not None:
-            dy[3:] -= accel(bg_host, bg_offset)
-        if extra_bgs:
-            for x_host, x_offset in extra_bgs:
-                dy[3:] -= accel(x_host, x_offset)
-        return dy
-
-    rhs._tidal_patched = True
-    dfm._rhs = rhs
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default=".", help="Where cluster_output_<ID>_99<suffix>.dat live.")
@@ -220,15 +165,11 @@ def main():
     p.add_argument("--mbh-min", type=float, default=500.0)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out-dir", default="orbit_debug")
-    p.add_argument("--fix-reframe", choices=["none", "position", "full", "tidal"], default="none",
-                   help="TEST of proposed fixes to the snapshot-to-snapshot reframe (monkeypatched here "
-                        "only; imbh.py is not changed). 'position': account for the host's own motion "
-                        "during the leg (x_old + v_old*dt - x_new instead of x_old - x_new). 'full': "
-                        "'position', and on a continuation of the SAME host (no merger) leave the "
-                        "cluster's host-relative position and velocity unchanged -- the cluster shares "
-                        "its host's acceleration -- so only real mergers reframe it. 'tidal': 'full', "
-                        "and the background potentials act as TIDAL fields (their pull at the host's "
-                        "centre is subtracted), since the host is no longer accelerated toward them.")
+    p.add_argument("--frame-model", choices=["fixed", "legacy"], default="fixed",
+                   help="imbh.py --frame-model to re-run with (default fixed; 'legacy' reproduces runs "
+                        "made before the Oct-2026 reframe fix).")
+    p.add_argument("--inspiral-capture-frac", type=float, default=1.0,
+                   help="imbh.py --inspiral-capture-frac to re-run with (default 1).")
     args = p.parse_args()
 
     import imbh   # needs the timescales package
@@ -258,10 +199,6 @@ def main():
         nav = MergerTreeNavigator(tree, args.snap_redshift_path, box_size_ckpc_h=35000.0,
                                   host_mass_model=args.host_mass_model)
         target_age = nav.age_at_snap(args.snap)
-        if args.fix_reframe != "none":
-            patch_relative_state(nav, same_host_unchanged=(args.fix_reframe in ("full", "tidal")))
-        if args.fix_reframe == "tidal":
-            patch_tidal_backgrounds()
 
         for row in picks:
             c = df.iloc[int(row)]
@@ -279,7 +216,9 @@ def main():
             try:
                 with contextlib.redirect_stdout(buf):
                     trace = imbh.trace_cluster_to_snapshot(m_cl, r0_vec, v0_vec, start_id, target_age, nav,
-                                                           verbose=True, formation_age=formation_age)
+                                                           verbose=True, formation_age=formation_age,
+                                                           frame_model=args.frame_model,
+                                                           inspiral_capture_frac=args.inspiral_capture_frac)
                 err = None
             except Exception as e:   # keep going; the log shows how far it got
                 trace, err = None, repr(e)
