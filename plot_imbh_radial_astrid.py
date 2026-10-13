@@ -295,6 +295,9 @@ def build_parser(description, default_output):
     p.add_argument("--nbins", type=int, default=None,
                    help="Number of histogram bins per panel (overrides --bin-width; each panel's "
                         "range is split into this many equal bins).")
+    p.add_argument("--noise-floor", type=float, default=None,
+                   help="Grey horizontal line marking our noise floor. Default: one IMBH in one bin, "
+                        "1 / (N_galaxies x bin width) per galaxy per dex; give a value to override, 0 for none.")
     p.add_argument("--max-r200", type=float, default=None,
                    help="Only keep BHs within this many R200 of the central (ours and ASTRID's), e.g. 3.")
     p.add_argument("--output", default=default_output)
@@ -379,8 +382,17 @@ def compute_edges(models, astrid, args, max_r200=None):
     return lr, lx
 
 
+def noise_floor(models, edges, value=None):
+    """Per galaxy per dex value of ONE IMBH in one bin: 1 / (N_galaxies * bin width). With value,
+    that value instead (<= 0: no line)."""
+    if value is not None:
+        return value if value > 0 else None
+    n = min([v for _, _, _, ngal in models for v in ngal.values()] or [0])
+    return 1.0 / (n * float(np.median(np.diff(edges)))) if n else None
+
+
 def draw_pair(ax_r, ax_x, models, astrid, lr_edges, lx_edges, mass_bins=DEFAULT_MASS_BINS,
-              annotate=True, triangles=True):
+              annotate=True, triangles=True, floor_value=None):
     """Histograms in r (ax_r) and r/R200 (ax_x), plus the inspiral-radius shading and the R200 line.
     Returns every plotted (positive) value, for setting y limits."""
     values = []
@@ -406,6 +418,12 @@ def draw_pair(ax_r, ax_x, models, astrid, lr_edges, lx_edges, mass_bins=DEFAULT_
                 ax.stairs(h, edges, color=color, lw=2.5, ls=ls, baseline=None)
                 values.append(h)
 
+    # our noise floor: one IMBH in a bin
+    for ax, edges in ((ax_r, lr_edges), (ax_x, lx_edges)):
+        f = noise_floor(models, edges, floor_value)
+        if f:
+            ax.axhline(f, color="0.55", lw=1.5, zorder=1)
+
     # region where our orbits are ended as 'inspiraled' (no wandering IMBHs by construction)
     lstop = np.log10(R_STOP_FRAC)
     ax_x.axvspan(-10, lstop, color="0.85", lw=0, zorder=0)
@@ -413,8 +431,6 @@ def draw_pair(ax_r, ax_x, models, astrid, lr_edges, lx_edges, mass_bins=DEFAULT_
     if annotate:
         ax_x.text((lx_edges[0] + lstop) / 2, 0.97, "inspiral\nradius", color="0.35", ha="center", va="top",
                   fontsize=FONT_SIZE - 6, transform=ax_x.get_xaxis_transform())
-        ax_x.text(0.03, 0.97, r"$R_{200}$", color="0.4", fontsize=FONT_SIZE - 4, va="top",
-                  transform=ax_x.get_xaxis_transform())
     if triangles:   # the same radius in kpc, at each bin's median R200 (from our galaxies)
         for tag, _, color, _ in mass_bins:
             r200s = pd.concat([df.loc[df["mass_bin"] == tag, ["halo", "r200_kpc"]] for _, _, df, _ in models])
@@ -426,7 +442,7 @@ def draw_pair(ax_r, ax_x, models, astrid, lr_edges, lx_edges, mass_bins=DEFAULT_
     return v[np.isfinite(v) & (v > 0)]
 
 
-def legend_handles(models, astrid, args, triangles=True):
+def legend_handles(models, astrid, args, triangles=True, edges=None):
     e = int(np.floor(np.log10(args.astrid_mbh_max)))
     mtxt = rf"{args.astrid_mbh_max / 10 ** e:.1f}\times10^{{{e}}}"
     style = []
@@ -436,6 +452,13 @@ def legend_handles(models, astrid, args, triangles=True):
     for label, ls, _, _ in models:
         style.append(Line2D([], [], color="0.2", lw=2.5, ls=ls,
                             label=rf"{label}, $M_{{\rm BH}}\geq{args.mbh_min:g}\,M_\odot$"))
+    if edges is not None:
+        f = noise_floor(models, edges, args.noise_floor)
+        if f:
+            n = min([v for _, _, _, ngal in models for v in ngal.values()] or [0])
+            style.append(Line2D([], [], color="0.55", lw=1.5,
+                                label=f"one IMBH per bin ({n} galaxies)" if args.noise_floor is None
+                                else f"noise floor ({f:g})"))
     if triangles:
         style.append(Line2D([], [], color="0.3", marker="v", ms=10, ls="none",
                             label=rf"${R_STOP_FRAC:g}\,R_{{200}}$ (median per bin)"))
@@ -459,7 +482,7 @@ def main():
     lr_edges, lx_edges = compute_edges(models, astrid, args, args.max_r200)
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    draw_pair(axes[0], axes[1], models, astrid, lr_edges, lx_edges)
+    draw_pair(axes[0], axes[1], models, astrid, lr_edges, lx_edges, floor_value=args.noise_floor)
     log_ticks(axes[0], lr_edges)
     log_ticks(axes[1], lx_edges)
     axes[0].set_xlabel(r"$r_{\rm BH}$ (kpc)")
@@ -469,7 +492,7 @@ def main():
         ax.set_yscale("log")
     fig.tight_layout()
     cut_title = rf"only $r_{{\rm BH}}<{args.max_r200:g}\,R_{{200}}$" if args.max_r200 is not None else None
-    add_legends(fig, *legend_handles(models, astrid, args), style_title=cut_title)
+    add_legends(fig, *legend_handles(models, astrid, args, edges=lx_edges), style_title=cut_title)
     fig.savefig(args.output, bbox_inches="tight", dpi=200)
     print(f"\nSaved {args.output}")
     if not args.no_show:

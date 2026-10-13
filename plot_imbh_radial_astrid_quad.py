@@ -49,9 +49,10 @@ def main():
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 11), sharex="col", sharey=True,
                              gridspec_kw={"wspace": 0, "hspace": 0})
-    v_top = draw_pair(axes[0, 0], axes[0, 1], models, astrid, lr_edges, lx_edges)
+    v_top = draw_pair(axes[0, 0], axes[0, 1], models, astrid, lr_edges, lx_edges,
+                      floor_value=args.noise_floor)
     v_bot = draw_pair(axes[1, 0], axes[1, 1], cut_models, cut_astrid, lr_edges, lx_cut,
-                      annotate=False, triangles=False)
+                      annotate=False, triangles=False, floor_value=args.noise_floor)
 
     axes[1, 1].axvline(np.log10(args.max_r200), color="0.4", lw=1.5, ls="--")   # the cut
     axes[0, 0].set_yscale("log")
@@ -68,7 +69,7 @@ def main():
         axes[r, 1].text(1.03, 0.5, lab, transform=axes[r, 1].transAxes, rotation=270,
                         ha="left", va="center", fontsize=FONT_SIZE + 2)
 
-    add_legends(fig, *legend_handles(models, astrid, args), y=0.895)
+    add_legends(fig, *legend_handles(models, astrid, args, edges=lx_edges), y=0.895)
     fig.savefig(args.output, bbox_inches="tight", dpi=200)
     print(f"\nSaved {args.output}")
     if not args.no_show:
