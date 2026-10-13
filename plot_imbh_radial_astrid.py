@@ -36,6 +36,11 @@ small files to another machine and re-run there to plot from the cache
 instead splits each panel's range into N equal bins. Counts are always per dex,
 so the normalization doesn't change with the binning.
 
+--mbh-max M drops our IMBHs of M_BH >= M; --match-astrid-mass keeps only our
+IMBHs in the mass range of ASTRID's plotted BHs (from the lightest of them up to
+--astrid-mbh-max), so both curves count black holes of the same masses. The
+positions cache is unchanged (it always holds every IMBH >= --mbh-min).
+
 --max-r200 X keeps only BHs within X * R200 of the central (ours and ASTRID's),
 e.g. --max-r200 3 to compare like with like (ASTRID's BHs are FoF-group members,
 while ours include escaped IMBHs at any distance).
@@ -77,6 +82,7 @@ LINESTYLES = ["-", "--", ":", "-."]
 DLOG = 0.2           # default bin width in dex (as in the notebook); see --bin-width / --nbins
 Z0_TOL_GYR = 0.02    # a track must end within this of the output snapshot's age
 NUCLEAR, WANDERING, UNKNOWN, BEYOND_CUT = "nuclear", "wandering", "unknown", "beyond_cut"
+OUTSIDE_MASS = "outside_mass"   # an IMBH outside the plotted mass range (--mbh-max / --match-astrid-mass)
 try:   # the radius at which imbh.py ends an orbit as 'inspiraled' (in units of the host's R200)
     from dynamical_friction import R_STOP_FRAC
 except Exception:
@@ -281,6 +287,10 @@ def build_parser(description, default_output):
     p.add_argument("--snap", type=int, default=99)
     p.add_argument("--mbh-min", type=float, default=500.0,
                    help="Minimum IMBH mass (default 500 Msun; radius tracks exist only above 500).")
+    p.add_argument("--mbh-max", type=float, default=None,
+                   help="Only plot our IMBHs below this mass (Msun).")
+    p.add_argument("--match-astrid-mass", action="store_true",
+                   help="Only plot our IMBHs in the mass range of the plotted ASTRID BHs.")
     p.add_argument("--tree-dir", default="tng_download")
     p.add_argument("--snap-redshift-path", default="tng_download/snapshot_redshifts.json")
     p.add_argument("--cache-dir", default=".", help="Where the z=0 position CSVs are read/written.")
@@ -318,7 +328,33 @@ def load_inputs(args):
             continue
         models.append((label, ls, df, ngal))
     astrid = None if args.no_astrid else load_astrid(args.astrid_dir, args.astrid_prefix, args.astrid_mbh_max)
+
+    # optional mass range for OUR IMBHs (the cache always holds every IMBH >= --mbh-min)
+    args.mass_lo, args.mass_hi = args.mbh_min, args.mbh_max
+    if args.match_astrid_mass:
+        if astrid is None:
+            raise SystemExit("--match-astrid-mass needs the ASTRID data (drop --no-astrid).")
+        args.mass_lo = max(args.mbh_min, float(astrid[0]["bh_mass"].min()))
+        args.mass_hi = args.astrid_mbh_max if args.mbh_max is None else min(args.mbh_max, args.astrid_mbh_max)
+    if args.mass_lo > args.mbh_min or args.mass_hi is not None:
+        hi_txt = f"{args.mass_hi:.3g}" if args.mass_hi is not None else "inf"
+        print(f"\nOur IMBHs restricted to {args.mass_lo:.3g} <= M_BH < {hi_txt} Msun:")
+        for label, _, df, _ in models:
+            m = df["imbh_mass_msun"]
+            out = df["location"].isin([WANDERING, NUCLEAR, UNKNOWN]) & (
+                (m < args.mass_lo) | ((m >= args.mass_hi) if args.mass_hi is not None else False))
+            df.loc[out, "location"] = OUTSIDE_MASS
+            kept = (df["location"] == WANDERING).sum()
+            print(f"  {label}: {out.sum()} outside the range, {kept} wandering IMBHs left")
     return models, astrid
+
+
+def mass_tex(x):
+    """500 -> '500', 44154 -> '4.4\\times10^{4}'."""
+    if x < 1e4:
+        return f"{x:g}"
+    e = int(np.floor(np.log10(x)))
+    return rf"{x / 10 ** e:.1f}\times10^{{{e}}}"
 
 
 def apply_cut(models, astrid, max_r200):
@@ -449,9 +485,11 @@ def legend_handles(models, astrid, args, triangles=True, edges=None):
     if astrid:
         style.append(Patch(facecolor="0.6", alpha=0.4, edgecolor="0.4",
                            label=rf"ASTRID, $M_{{\rm BH}}<{mtxt}\,M_\odot$"))
+    lo, hi = getattr(args, "mass_lo", args.mbh_min), getattr(args, "mass_hi", None)
+    mrange = (rf"{mass_tex(lo)}\leq M_{{\rm BH}}/M_\odot<{mass_tex(hi)}" if hi is not None
+              else rf"M_{{\rm BH}}\geq{mass_tex(lo)}\,M_\odot")
     for label, ls, _, _ in models:
-        style.append(Line2D([], [], color="0.2", lw=2.5, ls=ls,
-                            label=rf"{label}, $M_{{\rm BH}}\geq{args.mbh_min:g}\,M_\odot$"))
+        style.append(Line2D([], [], color="0.2", lw=2.5, ls=ls, label=rf"{label}, ${mrange}$"))
     if edges is not None:
         f = noise_floor(models, edges, args.noise_floor)
         if f:
@@ -477,10 +515,11 @@ def add_legends(fig, color_handles, style_handles, style_title=None, gap=0.01, y
 def nice_ylim(values):
     """Log y limits around the data whose edges never sit on a decade (no clashing tick labels)."""
     lo, hi = np.log10(values.min()) - 0.2, np.log10(values.max()) + 0.3
-    if abs(lo - round(lo)) < 0.12:
-        lo -= 0.15
-    if abs(hi - round(hi)) < 0.12:
-        hi += 0.15
+    gap = 0.3   # the first/last decade tick is at least this far (dex) inside the axis
+    if np.ceil(lo) - lo < gap:
+        lo = np.ceil(lo) - gap
+    if hi - np.floor(hi) < gap:
+        hi = np.floor(hi) + gap
     return 10 ** lo, 10 ** hi
 
 
