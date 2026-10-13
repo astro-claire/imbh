@@ -19,17 +19,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from plot_imbh_radial_astrid import (build_parser, load_inputs, apply_cut, print_summary, compute_edges,
-                                     draw_pair, legend_handles, add_legends, log_ticks, FONT_SIZE)
-
-
-def nice_ylim(values):
-    """Log y limits around the data whose edges never sit on a decade (no clashing tick labels)."""
-    lo, hi = np.log10(values.min()) - 0.2, np.log10(values.max()) + 0.3
-    if abs(lo - round(lo)) < 0.12:
-        lo -= 0.15
-    if abs(hi - round(hi)) < 0.12:
-        hi += 0.15
-    return 10 ** lo, 10 ** hi
+                                     draw_pair, legend_handles, add_legends, log_ticks, nice_ylim, FONT_SIZE)
 
 
 def main():
@@ -57,8 +47,8 @@ def main():
     axes[1, 1].axvline(np.log10(args.max_r200), color="0.4", lw=1.5, ls="--")   # the cut
     axes[0, 0].set_yscale("log")
     axes[0, 0].set_ylim(*nice_ylim(np.concatenate([v_top, v_bot])))
-    log_ticks(axes[1, 0], lr_edges, margin=0.15)
-    log_ticks(axes[1, 1], lx_edges, margin=0.15)
+    log_ticks(axes[1, 0], lr_edges, margin=0.35)
+    log_ticks(axes[1, 1], lx_edges, margin=0.35)
     for ax in axes.flat:
         ax.tick_params(which="both", direction="in", top=True, right=True)
     axes[1, 0].set_xlabel(r"$r_{\rm BH}$ (kpc)")

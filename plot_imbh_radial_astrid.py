@@ -474,6 +474,16 @@ def add_legends(fig, color_handles, style_handles, style_title=None, gap=0.01, y
                frameon=False, title=style_title)
 
 
+def nice_ylim(values):
+    """Log y limits around the data whose edges never sit on a decade (no clashing tick labels)."""
+    lo, hi = np.log10(values.min()) - 0.2, np.log10(values.max()) + 0.3
+    if abs(lo - round(lo)) < 0.12:
+        lo -= 0.15
+    if abs(hi - round(hi)) < 0.12:
+        hi += 0.15
+    return 10 ** lo, 10 ** hi
+
+
 def main():
     args = build_parser(__doc__, "imbh_radial_z0_astrid.pdf").parse_args()
     models, astrid = load_inputs(args)
@@ -481,18 +491,21 @@ def main():
     print_summary(models, astrid)
     lr_edges, lx_edges = compute_edges(models, astrid, args, args.max_r200)
 
-    fig, axes = plt.subplots(1, 2, figsize=(17, 7))
-    draw_pair(axes[0], axes[1], models, astrid, lr_edges, lx_edges, floor_value=args.noise_floor)
-    log_ticks(axes[0], lr_edges)
-    log_ticks(axes[1], lx_edges)
+    # panels touch, one shared y axis
+    fig, axes = plt.subplots(1, 2, figsize=(17, 7), sharey=True, gridspec_kw={"wspace": 0})
+    vals = draw_pair(axes[0], axes[1], models, astrid, lr_edges, lx_edges, floor_value=args.noise_floor)
+    axes[0].set_yscale("log")
+    if len(vals):
+        axes[0].set_ylim(*nice_ylim(vals))
+    log_ticks(axes[0], lr_edges, margin=0.35)   # no tick labels on the shared edge
+    log_ticks(axes[1], lx_edges, margin=0.35)
+    for ax in axes:
+        ax.tick_params(which="both", direction="in", top=True, right=True)
     axes[0].set_xlabel(r"$r_{\rm BH}$ (kpc)")
     axes[1].set_xlabel(r"$r_{\rm BH}\,/\,R_{200}$")
     axes[0].set_ylabel("BHs per galaxy per dex")
-    for ax in axes:
-        ax.set_yscale("log")
-    fig.tight_layout()
     cut_title = rf"only $r_{{\rm BH}}<{args.max_r200:g}\,R_{{200}}$" if args.max_r200 is not None else None
-    add_legends(fig, *legend_handles(models, astrid, args, edges=lx_edges), style_title=cut_title)
+    add_legends(fig, *legend_handles(models, astrid, args, edges=lx_edges), style_title=cut_title, y=0.9)
     fig.savefig(args.output, bbox_inches="tight", dpi=200)
     print(f"\nSaved {args.output}")
     if not args.no_show:
