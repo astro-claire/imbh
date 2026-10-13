@@ -260,15 +260,21 @@ def edges_covering(arrays, lo, hi, width=DLOG, nbins=None, top=None):
     return np.arange(lo, hi + width / 2, width)
 
 
-def log_ticks(ax, edges):
+def log_ticks(ax, edges, margin=0.0):
+    """Decade ticks labelled in linear units; with margin (dex), skip ticks that close to an edge
+    (so labels of touching panels don't collide)."""
     ticks = np.arange(np.ceil(edges[0]), np.floor(edges[-1]) + 1)
+    ticks = ticks[(ticks - edges[0] >= margin) & (edges[-1] - ticks >= margin)]
     ax.set_xticks(ticks)
     ax.set_xticklabels([f"{10 ** t:g}" for t in ticks])
     ax.set_xlim(edges[0], edges[-1])
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+# ---------------------------------------------------------------------------
+# building blocks shared with plot_imbh_radial_astrid_quad.py
+# ---------------------------------------------------------------------------
+def build_parser(description, default_output):
+    p = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default=".", help="imbh.py output directory ($OUTDIR).")
     p.add_argument("--model", nargs=2, action="append", metavar=("LABEL", "FLAGS"),
                    help="A model to plot (repeatable; replaces the default maximal + conservative).")
@@ -291,39 +297,47 @@ def main():
                         "range is split into this many equal bins).")
     p.add_argument("--max-r200", type=float, default=None,
                    help="Only keep BHs within this many R200 of the central (ours and ASTRID's), e.g. 3.")
-    p.add_argument("--output", default="imbh_radial_z0_astrid.pdf")
+    p.add_argument("--output", default=default_output)
     p.add_argument("--no-show", action="store_true")
-    args = p.parse_args()
+    return p
+
+
+def load_inputs(args):
+    """(models, astrid): models = [(label, linestyle, positions df, {bin: n_galaxies})]."""
     if args.mbh_min < 500:
         print("WARNING: radius tracks are only saved for IMBHs >= 500 Msun; lighter ones will be 'unknown'.")
-
-    mass_bins = DEFAULT_MASS_BINS
     models = []
     for (label, flags), ls in zip(args.model or DEFAULT_MODELS, LINESTYLES * 4):
         run = Run(label, flags, args.data_dir, args.snap)
-        df, ngal = model_positions(run, mass_bins, args)
+        df, ngal = model_positions(run, DEFAULT_MASS_BINS, args)
         if df is None:
             print(f"WARNING: no output for model '{label}' -- skipped")
             continue
         models.append((label, ls, df, ngal))
+    astrid = None if args.no_astrid else load_astrid(args.astrid_dir, args.astrid_prefix, args.astrid_mbh_max)
+    return models, astrid
 
-    astrid = None
-    if not args.no_astrid:
-        astrid = load_astrid(args.astrid_dir, args.astrid_prefix, args.astrid_mbh_max)
 
-    # ---------- optional distance cut ----------
-    if args.max_r200 is not None:
-        for label, _, df, ngal in models:
-            far = (df["location"] == WANDERING) & (df["r_kpc"] / df["r200_kpc"] > args.max_r200)
-            df.loc[far, "location"] = BEYOND_CUT
-            print(f"  --max-r200 {args.max_r200:g}: dropped {far.sum()} of {label}'s wandering IMBHs")
-        if astrid:
-            wand, r200a, ngal_a = astrid
-            keep = wand["dist_kpc"] / r200a <= args.max_r200
-            print(f"  --max-r200 {args.max_r200:g}: dropped {np.sum(~keep)} of {len(wand)} ASTRID BHs")
-            astrid = (wand[keep], r200a[keep], ngal_a)
+def apply_cut(models, astrid, max_r200):
+    """Copies of (models, astrid) keeping only BHs within max_r200 * R200 (None = no cut)."""
+    if max_r200 is None:
+        return models, astrid
+    out = []
+    for label, ls, df, ngal in models:
+        df = df.copy()
+        far = (df["location"] == WANDERING) & (df["r_kpc"] / df["r200_kpc"] > max_r200)
+        df.loc[far, "location"] = BEYOND_CUT
+        print(f"  r < {max_r200:g} R200: dropped {far.sum()} of {label}'s wandering IMBHs")
+        out.append((label, ls, df, ngal))
+    if astrid:
+        wand, r200a, ngal_a = astrid
+        keep = wand["dist_kpc"] / r200a <= max_r200
+        print(f"  r < {max_r200:g} R200: dropped {np.sum(~keep)} of {len(wand)} ASTRID BHs")
+        astrid = (wand[keep], r200a[keep], ngal_a)
+    return out, astrid
 
-    # ---------- summary ----------
+
+def print_summary(models, astrid, mass_bins=DEFAULT_MASS_BINS):
     print(f"\n{'model':14s} {'bin':10s} {'gal':>4s} {'IMBH/gal':>9s} {'wander':>7s} {'nuclear':>8s} "
           f"{'unknown':>8s} {'median r':>9s} {'>R200':>6s} {'>3R200':>7s}   (per galaxy; r in kpc)")
     for label, _, df, ngal in models:
@@ -334,7 +348,8 @@ def main():
                 continue
             w = d[d["location"] == WANDERING]
             x = w["r_kpc"] / w["r200_kpc"]
-            print(f"{label[:14]:14s} {tag:10s} {n:4d} {d['location'].isin([WANDERING, NUCLEAR, UNKNOWN, BEYOND_CUT]).sum() / n:9.1f} "
+            print(f"{label[:14]:14s} {tag:10s} {n:4d} "
+                  f"{d['location'].isin([WANDERING, NUCLEAR, UNKNOWN, BEYOND_CUT]).sum() / n:9.1f} "
                   f"{len(w) / n:7.1f} {(d['location'] == NUCLEAR).sum() / n:8.1f} "
                   f"{(d['location'] == UNKNOWN).sum() / n:8.1f} {np.nanmedian(w['r_kpc']) if len(w) else np.nan:9.1f} "
                   f"{np.mean(x > 1) if len(w) else np.nan:6.2f} {np.mean(x > 3) if len(w) else np.nan:7.2f}")
@@ -347,7 +362,9 @@ def main():
             print(f"{'ASTRID':14s} {tag:10s} {ngal_a[b]:4d} {'':9s} {s.sum() / ngal_a[b]:7.1f} {'':8s} {'':8s} "
                   f"{np.median(wand['dist_kpc'][s]):9.1f} {np.mean(x > 1):6.2f} {np.mean(x > 3):7.2f}")
 
-    # ---------- bins covering everything ----------
+
+def compute_edges(models, astrid, args, max_r200=None):
+    """(r edges, r/R200 edges) in log10, covering all plotted BHs."""
     r_all, x_all = [], []
     for _, _, df, _ in models:
         w = df[df["location"] == WANDERING]
@@ -356,48 +373,93 @@ def main():
     if astrid:
         r_all.append(np.asarray(astrid[0]["dist_kpc"], float))
         x_all.append(np.asarray(astrid[0]["dist_kpc"] / astrid[1], float))
-    width = args.bin_width
-    lr_edges = edges_covering(r_all, -1.0, 3.2, width, args.nbins)
-    lx_edges = edges_covering(x_all, -3.0, 1.0, width, args.nbins,
-                              top=None if args.max_r200 is None else np.log10(args.max_r200))
+    lr = edges_covering(r_all, -1.0, 3.2, args.bin_width, args.nbins)
+    lx = edges_covering(x_all, -3.0, 1.0, args.bin_width, args.nbins,
+                        top=None if max_r200 is None else np.log10(max_r200))
+    return lr, lx
 
 
-    # ---------- figure ----------
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    for tag, blabel, color, _ in mass_bins:
+def draw_pair(ax_r, ax_x, models, astrid, lr_edges, lx_edges, mass_bins=DEFAULT_MASS_BINS,
+              annotate=True, triangles=True):
+    """Histograms in r (ax_r) and r/R200 (ax_x), plus the inspiral-radius shading and the R200 line.
+    Returns every plotted (positive) value, for setting y limits."""
+    values = []
+    for tag, _, color, _ in mass_bins:
         if astrid:
             wand, r200a, ngal_a = astrid
             b = ASTRID_MASSBIN[tag]
             s = wand["massbin"] == b
-            for ax, vals, edges in ((axes[0], wand["dist_kpc"][s], lr_edges),
-                                    (axes[1], wand["dist_kpc"][s] / r200a[s], lx_edges)):
+            for ax, vals, edges in ((ax_r, wand["dist_kpc"][s], lr_edges),
+                                    (ax_x, wand["dist_kpc"][s] / r200a[s], lx_edges)):
                 h = per_dex(vals, edges, ngal_a[b])
                 ax.stairs(np.nan_to_num(h), edges, fill=True, color=color, alpha=0.15, lw=0)
                 ax.stairs(h, edges, color=color, lw=1.0, alpha=0.6, baseline=None)
+                values.append(h)
         for label, ls, df, ngal in models:
             w = df[(df["mass_bin"] == tag) & (df["location"] == WANDERING)]
             n = ngal.get(tag, 0)
             if not n:
                 continue
-            for ax, vals, edges in ((axes[0], w["r_kpc"], lr_edges),
-                                    (axes[1], w["r_kpc"] / w["r200_kpc"], lx_edges)):
-                ax.stairs(per_dex(vals, edges, n), edges, color=color, lw=2.5, ls=ls, baseline=None)
+            for ax, vals, edges in ((ax_r, w["r_kpc"], lr_edges),
+                                    (ax_x, w["r_kpc"] / w["r200_kpc"], lx_edges)):
+                h = per_dex(vals, edges, n)
+                ax.stairs(h, edges, color=color, lw=2.5, ls=ls, baseline=None)
+                values.append(h)
 
     # region where our orbits are ended as 'inspiraled' (no wandering IMBHs by construction)
     lstop = np.log10(R_STOP_FRAC)
-    axes[1].axvspan(lx_edges[0], lstop, color="0.85", lw=0, zorder=0)
-    axes[1].text((lx_edges[0] + lstop) / 2, 0.97, "inspiral\nradius", color="0.35", ha="center", va="top",
-                 fontsize=FONT_SIZE - 6, transform=axes[1].get_xaxis_transform())
-    # the same radius in kpc, at each bin's median R200 (from our galaxies)
-    for tag, _, color, _ in mass_bins:
-        r200s = pd.concat([df.loc[df["mass_bin"] == tag, ["halo", "r200_kpc"]] for _, _, df, _ in models])
-        r200s = r200s.dropna().drop_duplicates("halo")["r200_kpc"]
-        if len(r200s):
-            axes[0].plot(np.log10(R_STOP_FRAC * np.median(r200s)), 1.0, marker="v", ms=12, color=color,
-                         transform=axes[0].get_xaxis_transform(), clip_on=False, zorder=5)
-    axes[1].axvline(0, color="0.4", lw=2, ls=":")
-    axes[1].text(0.03, 0.97, r"$R_{200}$", color="0.4", fontsize=FONT_SIZE - 4, va="top",
-                 transform=axes[1].get_xaxis_transform())
+    ax_x.axvspan(-10, lstop, color="0.85", lw=0, zorder=0)
+    ax_x.axvline(0, color="0.4", lw=2, ls=":")
+    if annotate:
+        ax_x.text((lx_edges[0] + lstop) / 2, 0.97, "inspiral\nradius", color="0.35", ha="center", va="top",
+                  fontsize=FONT_SIZE - 6, transform=ax_x.get_xaxis_transform())
+        ax_x.text(0.03, 0.97, r"$R_{200}$", color="0.4", fontsize=FONT_SIZE - 4, va="top",
+                  transform=ax_x.get_xaxis_transform())
+    if triangles:   # the same radius in kpc, at each bin's median R200 (from our galaxies)
+        for tag, _, color, _ in mass_bins:
+            r200s = pd.concat([df.loc[df["mass_bin"] == tag, ["halo", "r200_kpc"]] for _, _, df, _ in models])
+            r200s = r200s.dropna().drop_duplicates("halo")["r200_kpc"]
+            if len(r200s):
+                ax_r.plot(np.log10(R_STOP_FRAC * np.median(r200s)), 1.0, marker="v", ms=12, color=color,
+                          transform=ax_r.get_xaxis_transform(), clip_on=False, zorder=5)
+    v = np.concatenate([np.ravel(a) for a in values]) if values else np.array([])
+    return v[np.isfinite(v) & (v > 0)]
+
+
+def legend_handles(models, astrid, args, triangles=True):
+    e = int(np.floor(np.log10(args.astrid_mbh_max)))
+    mtxt = rf"{args.astrid_mbh_max / 10 ** e:.1f}\times10^{{{e}}}"
+    style = []
+    if astrid:
+        style.append(Patch(facecolor="0.6", alpha=0.4, edgecolor="0.4",
+                           label=rf"ASTRID, $M_{{\rm BH}}<{mtxt}\,M_\odot$"))
+    for label, ls, _, _ in models:
+        style.append(Line2D([], [], color="0.2", lw=2.5, ls=ls,
+                            label=rf"{label}, $M_{{\rm BH}}\geq{args.mbh_min:g}\,M_\odot$"))
+    if triangles:
+        style.append(Line2D([], [], color="0.3", marker="v", ms=10, ls="none",
+                            label=rf"${R_STOP_FRAC:g}\,R_{{200}}$ (median per bin)"))
+    colors = [Line2D([], [], color=c, lw=4, label=l) for _, l, c, _ in DEFAULT_MASS_BINS]
+    return colors, style
+
+
+def add_legends(fig, color_handles, style_handles, style_title=None, gap=0.01, y=1.0):
+    """The two legends side by side, centred above the figure."""
+    fig.legend(handles=color_handles, loc="lower right", bbox_to_anchor=(0.5 - gap, y), ncol=1,
+               frameon=False, title=r"Host stellar mass at $z=0$")
+    fig.legend(handles=style_handles, loc="lower left", bbox_to_anchor=(0.5 + gap, y), ncol=1,
+               frameon=False, title=style_title)
+
+
+def main():
+    args = build_parser(__doc__, "imbh_radial_z0_astrid.pdf").parse_args()
+    models, astrid = load_inputs(args)
+    models, astrid = apply_cut(models, astrid, args.max_r200)
+    print_summary(models, astrid)
+    lr_edges, lx_edges = compute_edges(models, astrid, args, args.max_r200)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    draw_pair(axes[0], axes[1], models, astrid, lr_edges, lx_edges)
     log_ticks(axes[0], lr_edges)
     log_ticks(axes[1], lx_edges)
     axes[0].set_xlabel(r"$r_{\rm BH}$ (kpc)")
@@ -405,25 +467,9 @@ def main():
     axes[0].set_ylabel("BHs per galaxy per dex")
     for ax in axes:
         ax.set_yscale("log")
-
-    e = int(np.floor(np.log10(args.astrid_mbh_max)))
-    mtxt = rf"{args.astrid_mbh_max / 10 ** e:.1f}\times10^{{{e}}}"
-    style_handles = []
-    if astrid:
-        style_handles.append(Patch(facecolor="0.6", alpha=0.4, edgecolor="0.4",
-                                   label=rf"ASTRID, $M_{{\rm BH}}<{mtxt}\,M_\odot$"))
-    for label, ls, _, _ in models:
-        style_handles.append(Line2D([], [], color="0.2", lw=2.5, ls=ls,
-                                    label=rf"{label}, $M_{{\rm BH}}\geq{args.mbh_min:g}\,M_\odot$"))
-    style_handles.append(Line2D([], [], color="0.3", marker="v", ms=10, ls="none",
-                                label=rf"${R_STOP_FRAC:g}\,R_{{200}}$ (median per bin)"))
-    color_handles = [Line2D([], [], color=c, lw=4, label=l) for _, l, c, _ in mass_bins]
     fig.tight_layout()
-    fig.legend(handles=color_handles, loc="lower left", bbox_to_anchor=(0.06, 1.0), ncol=1,
-               frameon=False, title=r"Host stellar mass at $z=0$")
     cut_title = rf"only $r_{{\rm BH}}<{args.max_r200:g}\,R_{{200}}$" if args.max_r200 is not None else None
-    fig.legend(handles=style_handles, loc="lower right", bbox_to_anchor=(0.98, 1.0), ncol=1, frameon=False,
-               title=cut_title)
+    add_legends(fig, *legend_handles(models, astrid, args), style_title=cut_title)
     fig.savefig(args.output, bbox_inches="tight", dpi=200)
     print(f"\nSaved {args.output}")
     if not args.no_show:
