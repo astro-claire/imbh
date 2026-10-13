@@ -241,3 +241,6 @@ apikey.txt
 *.hdf5
 *.sh
 apikey.txt
+ASTRID/ellip* 
+*.tex
+*.pdf
