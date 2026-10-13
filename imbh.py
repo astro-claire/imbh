@@ -67,6 +67,11 @@ HOST_CONCENTRATION = 4.0
 #           cluster at EVERY snapshot, i.e. treated the cluster as standing still while its host
 #           moved (kpc per snapshot at high z), and applied the full (non-tidal) background
 #           pull. Clusters were thrown out of their hosts almost immediately.
+# 'fixed' only: a cluster that is OUTSIDE REHOST_MIN_RVIR * R_vir of a host that is not the
+# main branch AND not bound to it (KE + Phi_host > 0) is re-assigned, at the next snapshot, to
+# the main-branch progenitor (same-snapshot reframe). Integrating it in the frame of a small
+# host it has left would imprint that host's unmodelled accelerations on it.
+REHOST_MIN_RVIR = 1.0
 FRAME_MODELS = ("fixed", "legacy")
 FRAME_MODEL = "fixed"
 # conversion factor for turning NFWHost.potential()'s internal
@@ -941,6 +946,27 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 
     for step in range(max_steps):
         mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
+
+        # ('fixed') re-host a cluster that has left a non-main-branch host and is unbound
+        # from it: move it into the main-branch progenitor's frame (same snapshot)
+        if frame_model == "fixed" and step > 0:
+            mb_id = navigator.main_branch_id_at_snap(snap)
+            r_now = float(np.linalg.norm(r_vec.to(u.kpc).value))
+            if mb_id is not None and mb_id != current_id and r_now > REHOST_MIN_RVIR * radius_kpc:
+                _, ke_loc, phi_loc, _ = _compute_specific_energy_kms2(
+                    r_vec, v_vec, mass_msun, radius_kpc, concentration)
+                if ke_loc + phi_loc > 0:
+                    rel_pos_mb, rel_vel_mb = navigator.relative_state(current_id, mb_id)
+                    if verbose:
+                        print(f"[step {step}] RE-HOST: unbound at {r_now:.3f} kpc "
+                              f"({r_now / radius_kpc:.2f} R_vir) of {current_id} -> main branch {mb_id}",
+                              flush=True)
+                    r_vec = r_vec + rel_pos_mb
+                    v_vec = v_vec + rel_vel_mb
+                    current_id = mb_id
+                    n_hops += 1
+                    mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
+
         hubble_start = navigator.hubble_rate_at_snap(snap)
 
         # BACKGROUND potential: the larger, still-assembling structure this
@@ -1089,6 +1115,28 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                 # real merger: into the new host's frame, at matching times
                 rel_pos_full, rel_vel_full = navigator.relative_state_matched(current_id, next_id)
 
+        # MERGER LEG ('fixed'): the old and new hosts are DIFFERENT objects, so the leg is
+        # integrated entirely in the OLD host (its own mass/radius, no interpolation toward
+        # the new host's) and the cluster is moved into the new host's frame in one go at
+        # the end. ('legacy' instead grew the old host's potential into the new one's while
+        # sliding the cluster across in sub-steps, which injected spurious energy -- clusters
+        # sitting at a small host's centre could be flung out to Mpc distances.) The main-
+        # branch background's end state is taken relative to the old host carried forward to
+        # the next snapshot; the satellite-group background is held at its start value.
+        merger_leg = (frame_model == "fixed") and (next_id is not None) and (not is_primary)
+        sub_rel_pos, sub_rel_vel = rel_pos_full, rel_vel_full
+        if merger_leg:
+            next_mass_msun, next_radius_kpc = mass_msun, radius_kpc
+            sub_rel_pos = np.zeros(3) * u.kpc
+            sub_rel_vel = np.zeros(3) * u.km / u.s
+            main_end = navigator.main_branch_id_at_snap(next_snap)
+            if bg_offset is not None and main_end is not None and main_end != current_id:
+                bg_mass_end_msun, bg_radius_end_kpc, _ = navigator.host_properties(main_end)
+                bg_offset_end = -navigator.relative_state_matched(current_id, main_end)[0]
+            else:
+                bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end = bg_mass_msun, bg_radius_kpc, bg_offset
+            grp_bg_end = grp_bg
+
         if verbose:
             if bg_host is not None:
                 bg_str = f"bg_mass={bg_mass_msun:.3e} Msun, bg_offset={np.linalg.norm(bg_offset.to(u.kpc).value):.3f} kpc"
@@ -1154,7 +1202,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             if capped_by == 'step':
                 status, elapsed, r_vec, v_vec, n_peri, roche_this, t_roche_this, leg_traj = _integrate_leg_with_subdivision(
                     cluster_mass, r_vec, v_vec, mass_msun, radius_kpc, next_mass_msun, next_radius_kpc,
-                    rel_pos_full, rel_vel_full, t_leg_max, concentration,
+                    sub_rel_pos, sub_rel_vel, t_leg_max, concentration,
                     bg_mass_msun, bg_radius_kpc, bg_offset, bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end,
                     max_leg_duration, hubble_start, hubble_end, record_dt=record_dt,
                     min_bg_substeps=BG_MIN_SUBSTEPS, allow_start_inside_stop=allow_start_inside_stop,
@@ -1221,8 +1269,9 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
 
         # status == "ongoing"
         if capped_by == 'step':
-            if not subdivided:
-                # subdivision (if used) already applied the reframe incrementally
+            if (not subdivided) or merger_leg:
+                # subdivision (if used) already applied the reframe incrementally --
+                # except on a 'fixed' merger leg, which reframes in one go here
                 r_vec = r_vec + rel_pos_full
                 v_vec = v_vec + rel_vel_full
             if verbose:

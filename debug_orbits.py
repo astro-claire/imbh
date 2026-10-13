@@ -240,7 +240,7 @@ def main():
                    "original_status": c.status, "rerun_status": trace["status"] if trace else f"error {err}",
                    "original_total_time": c.total_time_gyr,
                    "rerun_total_time": trace["total_time_gyr"] if trace else np.nan,
-                   "n_steps": len(steps), **info}
+                   "n_steps": len(steps), "n_rehost": text.count("RE-HOST"), **info}
             summary.append(rec)
             print(f"    re-run: {rec['rerun_status']}; left host at step {info['first_outside_step']} "
                   f"({info['exit_mechanism']}); first unbound step {info['first_unbound_step']}")
