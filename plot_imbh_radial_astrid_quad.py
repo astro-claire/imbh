@@ -47,7 +47,7 @@ def main():
     lr_edges, lx_edges = compute_edges(models, astrid, args)             # top row sets the x range
     _, lx_cut = compute_edges(cut_models, cut_astrid, args, args.max_r200)
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11), sharex="col", sharey=True,
+    fig, axes = plt.subplots(2, 2, figsize=(17, 13), sharex="col", sharey=True,
                              gridspec_kw={"wspace": 0, "hspace": 0})
     v_top = draw_pair(axes[0, 0], axes[0, 1], models, astrid, lr_edges, lx_edges,
                       floor_value=args.noise_floor)
@@ -63,7 +63,7 @@ def main():
         ax.tick_params(which="both", direction="in", top=True, right=True)
     axes[1, 0].set_xlabel(r"$r_{\rm BH}$ (kpc)")
     axes[1, 1].set_xlabel(r"$r_{\rm BH}\,/\,R_{200}$")
-    fig.supylabel("BHs per galaxy per dex", x=0.06, fontsize=FONT_SIZE + 2)
+    fig.supylabel("BHs per galaxy per dex", x=0.015, fontsize=FONT_SIZE + 2)
     row_labels = ["All BHs", rf"$r_{{\rm BH}}<{args.max_r200:g}\,R_{{200}}$"]
     for r, lab in enumerate(row_labels):
         axes[r, 1].text(1.03, 0.5, lab, transform=axes[r, 1].transAxes, rotation=270,

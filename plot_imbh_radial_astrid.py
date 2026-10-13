@@ -82,7 +82,7 @@ try:   # the radius at which imbh.py ends an orbit as 'inspiraled' (in units of 
 except Exception:
     R_STOP_FRAC = 0.01
 
-FONT_SIZE = 20
+FONT_SIZE = 26
 plt.rcParams.update({
     "font.size": FONT_SIZE, "axes.labelsize": FONT_SIZE + 2,
     "xtick.labelsize": FONT_SIZE - 2, "ytick.labelsize": FONT_SIZE - 2,
@@ -481,7 +481,7 @@ def main():
     print_summary(models, astrid)
     lr_edges, lx_edges = compute_edges(models, astrid, args, args.max_r200)
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(17, 7))
     draw_pair(axes[0], axes[1], models, astrid, lr_edges, lx_edges, floor_value=args.noise_floor)
     log_ticks(axes[0], lr_edges)
     log_ticks(axes[1], lx_edges)
