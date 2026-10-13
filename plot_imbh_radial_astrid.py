@@ -32,6 +32,10 @@ are cached in <cache-dir>/imbh_z0_positions<suffix>_mbh<min>.csv; copy those
 small files to another machine and re-run there to plot from the cache
 (the .dat / tracks / trees are then not needed). --refresh rebuilds them.
 
+--bin-width W sets the histogram bin width in dex (default 0.2); --nbins N
+instead splits each panel's range into N equal bins. Counts are always per dex,
+so the normalization doesn't change with the binning.
+
 --max-r200 X keeps only BHs within X * R200 of the central (ours and ASTRID's),
 e.g. --max-r200 3 to compare like with like (ASTRID's BHs are FoF-group members,
 while ours include escaped IMBHs at any distance).
@@ -70,7 +74,7 @@ DEFAULT_MODELS = [
     ("Conservative", "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12"),
 ]
 LINESTYLES = ["-", "--", ":", "-."]
-DLOG = 0.2           # bin width in dex (as in the notebook)
+DLOG = 0.2           # default bin width in dex (as in the notebook); see --bin-width / --nbins
 Z0_TOL_GYR = 0.02    # a track must end within this of the output snapshot's age
 NUCLEAR, WANDERING, UNKNOWN, BEYOND_CUT = "nuclear", "wandering", "unknown", "beyond_cut"
 try:   # the radius at which imbh.py ends an orbit as 'inspiraled' (in units of the host's R200)
@@ -236,16 +240,24 @@ def per_dex(values, edges, ngal):
     v = np.asarray(values, float)
     v = v[np.isfinite(v) & (v > 0)]
     n, _ = np.histogram(np.log10(v), bins=edges)
-    out = n / max(ngal, 1) / DLOG
+    out = n / max(ngal, 1) / np.diff(edges)     # per dex, whatever the bin width
     return np.where(n > 0, out, np.nan)
 
 
-def edges_covering(arrays, lo, hi):
-    """Bin edges (width DLOG) spanning at least [lo, hi] and all the data."""
+def edges_covering(arrays, lo, hi, width=DLOG, nbins=None, top=None):
+    """
+    Bin edges in log10 spanning at least [lo, hi] and all the data. Either fixed-width bins
+    (width dex, snapped to multiples of width) or, with nbins, exactly nbins equal bins over
+    that range. With top (log10 of a cut), the edges end exactly at top instead.
+    """
     vals = np.concatenate([np.log10(a[np.isfinite(a) & (a > 0)]) for a in arrays if len(a)] or [[lo]])
-    lo = min(lo, np.floor(vals.min() / DLOG) * DLOG)
-    hi = max(hi, np.ceil(vals.max() / DLOG) * DLOG)
-    return np.arange(lo, hi + DLOG / 2, DLOG)
+    lo = min(lo, np.floor(vals.min() / width) * width)
+    hi = max(hi, np.ceil(vals.max() / width) * width) if top is None else top
+    if nbins is not None:
+        return np.linspace(lo, hi, nbins + 1)
+    if top is not None:   # count down from the cut so the last bin isn't only partly filled
+        return top - width * np.arange(int(np.ceil((top - lo) / width - 1e-9)), -1, -1)
+    return np.arange(lo, hi + width / 2, width)
 
 
 def log_ticks(ax, edges):
@@ -272,6 +284,11 @@ def main():
     p.add_argument("--astrid-mbh-max", type=float, default=3e5 / H_ASTRID,
                    help="ASTRID wandering-BH mass cut in Msun (default 3e5/h, as in the notebook).")
     p.add_argument("--no-astrid", action="store_true")
+    p.add_argument("--bin-width", type=float, default=DLOG,
+                   help=f"Histogram bin width in dex (default {DLOG}, as in the ASTRID notebook).")
+    p.add_argument("--nbins", type=int, default=None,
+                   help="Number of histogram bins per panel (overrides --bin-width; each panel's "
+                        "range is split into this many equal bins).")
     p.add_argument("--max-r200", type=float, default=None,
                    help="Only keep BHs within this many R200 of the central (ours and ASTRID's), e.g. 3.")
     p.add_argument("--output", default="imbh_radial_z0_astrid.pdf")
@@ -339,12 +356,11 @@ def main():
     if astrid:
         r_all.append(np.asarray(astrid[0]["dist_kpc"], float))
         x_all.append(np.asarray(astrid[0]["dist_kpc"] / astrid[1], float))
-    lr_edges = edges_covering(r_all, -1.0, 3.2)
-    lx_edges = edges_covering(x_all, -3.0, 1.0)
-    if args.max_r200 is not None:
-        # end the r/R200 bins exactly at the cut, so the last bin isn't only partly filled
-        top = np.log10(args.max_r200)
-        lx_edges = top - DLOG * np.arange(int(np.ceil((top - lx_edges[0]) / DLOG - 1e-9)), -1, -1)
+    width = args.bin_width
+    lr_edges = edges_covering(r_all, -1.0, 3.2, width, args.nbins)
+    lx_edges = edges_covering(x_all, -3.0, 1.0, width, args.nbins,
+                              top=None if args.max_r200 is None else np.log10(args.max_r200))
+
 
     # ---------- figure ----------
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
