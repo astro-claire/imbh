@@ -63,7 +63,7 @@ def main():
         ax.tick_params(which="both", direction="in", top=True, right=True)
     axes[1, 0].set_xlabel(r"$r_{\rm BH}$ (kpc)")
     axes[1, 1].set_xlabel(r"$r_{\rm BH}\,/\,R_{200}$")
-    fig.supylabel("BHs per galaxy per dex", x=0.015, fontsize=FONT_SIZE + 2)
+    fig.supylabel(r"$N_{\rm WBH}$ (gal$^{-1}$ dex$^{-1}$)", x=0.04, fontsize=FONT_SIZE + 4)
     row_labels = ["All BHs", rf"$r_{{\rm BH}}<{args.max_r200:g}\,R_{{200}}$"]
     for r, lab in enumerate(row_labels):
         axes[r, 1].text(1.03, 0.5, lab, transform=axes[r, 1].transAxes, rotation=270,
