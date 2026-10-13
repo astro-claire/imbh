@@ -172,6 +172,36 @@ def patch_relative_state(nav, same_host_unchanged=False):
     nav.relative_state = fixed
 
 
+def patch_tidal_backgrounds():
+    """Proposed fix (test only): in dynamical_friction._rhs, subtract each background's acceleration
+    at the host's centre (r = 0), so backgrounds only add their TIDAL (differential) pull."""
+    import dynamical_friction as dfm
+    if getattr(dfm._rhs, "_tidal_patched", False):
+        return
+    orig = dfm._rhs
+
+    def accel(host, offset):
+        d = -np.asarray(offset, dtype=float)          # host centre relative to the background centre
+        r = np.linalg.norm(d)
+        if r <= 0:
+            return np.zeros(3)
+        return -dfm._G * host.mass_enclosed(r) / r ** 2 * d / r
+
+    def rhs(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset, hubble_rate,
+            extra_bgs, call_budget):
+        dy = np.array(orig(t, y, m_cluster_msun, host, coulomb_log, r_soft, bg_host, bg_offset,
+                           hubble_rate, extra_bgs, call_budget), dtype=float)
+        if bg_host is not None:
+            dy[3:] -= accel(bg_host, bg_offset)
+        if extra_bgs:
+            for x_host, x_offset in extra_bgs:
+                dy[3:] -= accel(x_host, x_offset)
+        return dy
+
+    rhs._tidal_patched = True
+    dfm._rhs = rhs
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default=".", help="Where cluster_output_<ID>_99<suffix>.dat live.")
@@ -190,13 +220,15 @@ def main():
     p.add_argument("--mbh-min", type=float, default=500.0)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out-dir", default="orbit_debug")
-    p.add_argument("--fix-reframe", choices=["none", "position", "full"], default="none",
+    p.add_argument("--fix-reframe", choices=["none", "position", "full", "tidal"], default="none",
                    help="TEST of proposed fixes to the snapshot-to-snapshot reframe (monkeypatched here "
                         "only; imbh.py is not changed). 'position': account for the host's own motion "
                         "during the leg (x_old + v_old*dt - x_new instead of x_old - x_new). 'full': "
                         "'position', and on a continuation of the SAME host (no merger) leave the "
                         "cluster's host-relative position and velocity unchanged -- the cluster shares "
-                        "its host's acceleration -- so only real mergers reframe it.")
+                        "its host's acceleration -- so only real mergers reframe it. 'tidal': 'full', "
+                        "and the background potentials act as TIDAL fields (their pull at the host's "
+                        "centre is subtracted), since the host is no longer accelerated toward them.")
     args = p.parse_args()
 
     import imbh   # needs the timescales package
@@ -227,7 +259,9 @@ def main():
                                   host_mass_model=args.host_mass_model)
         target_age = nav.age_at_snap(args.snap)
         if args.fix_reframe != "none":
-            patch_relative_state(nav, same_host_unchanged=(args.fix_reframe == "full"))
+            patch_relative_state(nav, same_host_unchanged=(args.fix_reframe in ("full", "tidal")))
+        if args.fix_reframe == "tidal":
+            patch_tidal_backgrounds()
 
         for row in picks:
             c = df.iloc[int(row)]
