@@ -1,0 +1,370 @@
+"""
+Radial distribution of IMBHs at z = 0 in our 15 TNG50 galaxies, overplotted on
+the wandering black holes of ASTRID's quenched, dispersion-dominated centrals
+(the 2-panel figure of ASTRID/wandering_bh_radial_2panel.ipynb):
+
+  left   number of BHs per galaxy per dex of distance r from the central galaxy
+  right  the same per dex of r / R200 (R200c of the central at z = 0)
+
+one colour per z = 0 stellar-mass bin; ASTRID shaded, each of our models as a
+line (default: maximal solid, conservative dashed).
+
+Where our IMBHs are at z = 0 (from imbh.py's per-cluster table):
+  pinned / outskirts / escaped  -- traced to z = 0; r is the last point of the
+      cluster's radius track (separation from the central galaxy, i.e. the
+      tree root's main branch; see imbh.save_radius_track). Tracks exist for
+      IMBHs >= 500 Msun, so --mbh-min must be >= 500.
+  inspiraled -- the trace stops when the cluster sinks to the centre of its
+      host; the IMBH is then followed forward with that host through the
+      merger tree to z = 0 (as for pinned clusters).
+An IMBH that ends at the centre of the central galaxy itself (pinned in the
+main branch, or inspiraled into a host that is or becomes the main branch) is counted as NUCLEAR and left out: ASTRID's
+wandering sample likewise excludes the most massive (central) BH of each
+galaxy. IMBHs whose z = 0 position can't be determined (missing track, tree
+ends early) are counted as UNKNOWN and left out; both counts are printed.
+Only IMBHs with M_BH >= --mbh-min that finished forming before their trace
+ended (IMBH_final_formation_time_gyr < total_time_gyr, as in analysis.py) are
+used.
+
+The positions need the cluster tables, radius tracks and merger trees, so run
+the first pass where those live (e.g. Hoffman2). Each model's z = 0 positions
+are cached in <cache-dir>/imbh_z0_positions<suffix>_mbh<min>.csv; copy those
+small files to another machine and re-run there to plot from the cache
+(the .dat / tracks / trees are then not needed). --refresh rebuilds them.
+
+ASTRID selection (same as the notebook): galaxies with dispersion_dominated;
+BHs with dispersion_dominated, rank_mass_in_gal > 0 (not the galaxy's most
+massive BH) and bh_mass < --astrid-mbh-max (default 3e5/h Msun).
+
+Examples:
+  python plot_imbh_radial_astrid.py --data-dir /u/scratch/c/clairewi/imbh-output
+  python plot_imbh_radial_astrid.py --cache-dir z0_positions          # plot from cached CSVs
+  python plot_imbh_radial_astrid.py --data-dir ... --model "Maximal, seed 1" "--jitter-dex 0.1 --label seed1"
+"""
+import argparse
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+from rate_runs import Run, DEFAULT_MASS_BINS
+
+H_ASTRID = 0.6774
+ASTRID_MASSBIN = {"1e9-1e10": 1, "1e10-1e11": 2, "gt1e11": 3}   # our bin tag -> ASTRID 'massbin'
+DEFAULT_MODELS = [
+    ("Maximal", "--jitter-dex 0.1"),
+    ("Conservative", "--mode observational --n-relation bf20_seed --radius-relation marks_kroupa12"),
+]
+LINESTYLES = ["-", "--", ":", "-."]
+DLOG = 0.2           # bin width in dex (as in the notebook)
+Z0_TOL_GYR = 0.02    # a track must end within this of the output snapshot's age
+NUCLEAR, WANDERING, UNKNOWN = "nuclear", "wandering", "unknown"
+
+FONT_SIZE = 20
+plt.rcParams.update({
+    "font.size": FONT_SIZE, "axes.labelsize": FONT_SIZE + 2,
+    "xtick.labelsize": FONT_SIZE - 2, "ytick.labelsize": FONT_SIZE - 2,
+    "legend.fontsize": FONT_SIZE - 4, "legend.title_fontsize": FONT_SIZE - 4,
+    "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True,
+    "axes.linewidth": 1.5,
+})
+
+
+# ---------------------------------------------------------------------------
+# our IMBHs at z = 0
+# ---------------------------------------------------------------------------
+def last_track_point(path):
+    """(time_since_formation_gyr, separation_kpc) of the last row of a radius track."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 4096))
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    t, r = lines[-1].decode().split(",")[:2]
+    return float(t), float(r)        # raises ValueError if only the header is there
+
+
+def load_navigator(halo_id, tree_dir, snap_redshift_path):
+    from tree_navigator import MergerTreeNavigator   # needs h5py; only when building positions
+    tree_path = os.path.join(tree_dir, f"sublink_full_{halo_id}.hdf5")
+    if not os.path.exists(tree_path):
+        raise FileNotFoundError(f"merger tree {tree_path} not found (set --tree-dir)")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return MergerTreeNavigator(tree_path, snap_redshift_path, box_size_ckpc_h=35000.0)
+
+
+def on_main_branch(nav, subhalo_id):
+    """True if subhalo_id is the root's main-branch progenitor at its own snapshot. (A pinned
+    cluster's final_subhalo_id is its host at the last snapshot BEFORE the output one, e.g.
+    snap 98, so comparing with the z=0 root itself would miss it.)"""
+    sid = int(subhalo_id)
+    return nav.is_virtual(sid) or nav.main_branch_id_at_snap(nav.snap_of(sid)) == sid
+
+
+def follow_to_snap(nav, subhalo_id, root_id, snap):
+    """Where a subhalo (an inspiraled cluster's host) ends up at `snap`: (location, r_kpc)."""
+    sid = int(subhalo_id)
+    if nav.is_virtual(sid):              # a stand-in main-branch row: it is the main branch
+        return NUCLEAR, 0.0
+    while True:
+        nxt, _ = nav.step_forward(sid)
+        if nxt is None:
+            break
+        sid = nxt
+    if sid == root_id:
+        return NUCLEAR, 0.0
+    if nav.snap_of(sid) != snap:         # tree stops before the output snapshot
+        return UNKNOWN, np.nan
+    rel_pos, _ = nav.relative_state(sid, root_id)
+    return WANDERING, float(np.linalg.norm(rel_pos.to("kpc").value))
+
+
+def halo_positions(run, halo_id, tree_dir, snap_redshift_path, mbh_min):
+    """One row per IMBH >= mbh_min in this halo: status, mass, location, r_kpc, r200_kpc."""
+    path = run.cluster_output_path(halo_id)
+    if not os.path.exists(path):
+        return None
+    df = pd.read_pickle(path)
+    cols = ["halo", "status", "imbh_mass_msun", "location", "r_kpc", "r200_kpc"]
+    if df.empty or "IMBH_mass_msun" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    m_bh = pd.to_numeric(df["IMBH_mass_msun"], errors="coerce")
+    sel = m_bh >= mbh_min
+    if "IMBH_final_formation_time_gyr" in df.columns:
+        sel &= df["IMBH_final_formation_time_gyr"] < df["total_time_gyr"]
+    df = df[sel]
+
+    nav = load_navigator(halo_id, tree_dir, snap_redshift_path)
+    root_id = nav.main_branch_id_at_snap(run.snap)
+    r200 = nav.host_properties(root_id)[1]
+    t_out = nav.age_at_snap(run.snap).to("Gyr").value
+    track_dir = os.path.join(run.data_dir, f"cluster_tracks_{halo_id}{run.model_suffix}")
+
+    rows = []
+    for _, c in df.iterrows():
+        status = str(c["status"])
+        loc, r = UNKNOWN, np.nan
+        if status == "inspiraled":
+            loc, r = follow_to_snap(nav, c["final_subhalo_id"], root_id, run.snap)
+        elif status in ("pinned", "outskirts", "escaped"):
+            if status == "pinned" and on_main_branch(nav, c["final_subhalo_id"]):
+                loc, r = NUCLEAR, 0.0
+            else:
+                tpath = c.get("radius_track_path")
+                if isinstance(tpath, str) and tpath and not os.path.exists(tpath):
+                    tpath = os.path.join(track_dir, os.path.basename(tpath))
+                if isinstance(tpath, str) and tpath and os.path.exists(tpath):
+                    try:
+                        t_last, r_last = last_track_point(tpath)
+                        if abs(c["cluster_formation_age_gyr"] + t_last - t_out) < Z0_TOL_GYR:
+                            loc, r = WANDERING, r_last
+                    except (ValueError, IndexError):
+                        pass
+        rows.append((halo_id, status, float(c["IMBH_mass_msun"]), loc, r, r200))
+    return pd.DataFrame(rows, columns=cols)
+
+
+def model_positions(run, mass_bins, args):
+    """All halos of one model, from the cache if present; adds 'mass_bin'. Also returns
+    {bin_tag: number of galaxies with output}."""
+    os.makedirs(args.cache_dir, exist_ok=True)
+    cache = os.path.join(args.cache_dir,
+                         f"imbh_z0_positions{run.model_suffix or '_default'}_mbh{args.mbh_min:g}.csv")
+    if os.path.exists(cache) and not args.refresh:
+        df = pd.read_csv(cache, dtype={"halo": str})
+        print(f"  {run.label}: read {cache}")
+    else:
+        parts = []
+        for tag, _, _, ids in mass_bins:
+            for hid in ids:
+                p = halo_positions(run, hid, args.tree_dir, args.snap_redshift_path, args.mbh_min)
+                if p is None:
+                    print(f"    {run.label}: no cluster output for {hid} -- skipped")
+                    continue
+                p["mass_bin"] = tag
+                # a halo with no IMBHs still counts as a galaxy: keep a placeholder row
+                parts.append(p if len(p) else pd.DataFrame(
+                    [{"halo": hid, "mass_bin": tag, "location": "none"}]))
+        if not parts:
+            return None, {}
+        df = pd.concat(parts, ignore_index=True)
+        df.to_csv(cache, index=False)
+        print(f"  {run.label}: wrote {cache}")
+    ngal = df.groupby("mass_bin")["halo"].nunique().to_dict()
+    return df, ngal
+
+
+# ---------------------------------------------------------------------------
+# ASTRID
+# ---------------------------------------------------------------------------
+def load_astrid(astrid_dir, prefix, mbh_max):
+    load = lambda what: np.load(os.path.join(astrid_dir, f"{prefix}_{what}.npy"))
+    cat, bhs, halo = load("catalog"), load("bhs"), load("halo_r200")
+    gal = cat[cat["dispersion_dominated"]]
+    wand = bhs[bhs["dispersion_dominated"] & (bhs["rank_mass_in_gal"] > 0) & (bhs["bh_mass"] < mbh_max)]
+    order = np.argsort(halo["subidx"])
+    idx = order[np.searchsorted(halo["subidx"], wand["gal_subidx"], sorter=order)]
+    r200 = halo["r200_kpc"][idx]
+    ngal = {b: int(np.sum(gal["massbin"] == b)) for b in (1, 2, 3)}
+    return wand, r200, ngal
+
+
+# ---------------------------------------------------------------------------
+# plotting
+# ---------------------------------------------------------------------------
+def per_dex(values, edges, ngal):
+    """Histogram of log10(values) as number per galaxy per dex; empty bins -> NaN (gaps on log axes)."""
+    v = np.asarray(values, float)
+    v = v[np.isfinite(v) & (v > 0)]
+    n, _ = np.histogram(np.log10(v), bins=edges)
+    out = n / max(ngal, 1) / DLOG
+    return np.where(n > 0, out, np.nan)
+
+
+def edges_covering(arrays, lo, hi):
+    """Bin edges (width DLOG) spanning at least [lo, hi] and all the data."""
+    vals = np.concatenate([np.log10(a[np.isfinite(a) & (a > 0)]) for a in arrays if len(a)] or [[lo]])
+    lo = min(lo, np.floor(vals.min() / DLOG) * DLOG)
+    hi = max(hi, np.ceil(vals.max() / DLOG) * DLOG)
+    return np.arange(lo, hi + DLOG / 2, DLOG)
+
+
+def log_ticks(ax, edges):
+    ticks = np.arange(np.ceil(edges[0]), np.floor(edges[-1]) + 1)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{10 ** t:g}" for t in ticks])
+    ax.set_xlim(edges[0], edges[-1])
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data-dir", default=".", help="imbh.py output directory ($OUTDIR).")
+    p.add_argument("--model", nargs=2, action="append", metavar=("LABEL", "FLAGS"),
+                   help="A model to plot (repeatable; replaces the default maximal + conservative).")
+    p.add_argument("--snap", type=int, default=99)
+    p.add_argument("--mbh-min", type=float, default=500.0,
+                   help="Minimum IMBH mass (default 500 Msun; radius tracks exist only above 500).")
+    p.add_argument("--tree-dir", default="tng_download")
+    p.add_argument("--snap-redshift-path", default="tng_download/snapshot_redshifts.json")
+    p.add_argument("--cache-dir", default=".", help="Where the z=0 position CSVs are read/written.")
+    p.add_argument("--refresh", action="store_true", help="Rebuild the position CSVs from the run output.")
+    p.add_argument("--astrid-dir", default="ASTRID")
+    p.add_argument("--astrid-prefix", default="ellip_centrals_z0_PIG817_sfr200")
+    p.add_argument("--astrid-mbh-max", type=float, default=3e5 / H_ASTRID,
+                   help="ASTRID wandering-BH mass cut in Msun (default 3e5/h, as in the notebook).")
+    p.add_argument("--no-astrid", action="store_true")
+    p.add_argument("--output", default="imbh_radial_z0_astrid.pdf")
+    p.add_argument("--no-show", action="store_true")
+    args = p.parse_args()
+    if args.mbh_min < 500:
+        print("WARNING: radius tracks are only saved for IMBHs >= 500 Msun; lighter ones will be 'unknown'.")
+
+    mass_bins = DEFAULT_MASS_BINS
+    models = []
+    for (label, flags), ls in zip(args.model or DEFAULT_MODELS, LINESTYLES * 4):
+        run = Run(label, flags, args.data_dir, args.snap)
+        df, ngal = model_positions(run, mass_bins, args)
+        if df is None:
+            print(f"WARNING: no output for model '{label}' -- skipped")
+            continue
+        models.append((label, ls, df, ngal))
+
+    astrid = None
+    if not args.no_astrid:
+        astrid = load_astrid(args.astrid_dir, args.astrid_prefix, args.astrid_mbh_max)
+
+    # ---------- summary ----------
+    print(f"\n{'model':14s} {'bin':10s} {'gal':>4s} {'IMBH/gal':>9s} {'wander':>7s} {'nuclear':>8s} "
+          f"{'unknown':>8s} {'median r':>9s} {'>R200':>6s} {'>3R200':>7s}   (per galaxy; r in kpc)")
+    for label, _, df, ngal in models:
+        for tag, _, _, _ in mass_bins:
+            d = df[df["mass_bin"] == tag]
+            n = ngal.get(tag, 0)
+            if not n:
+                continue
+            w = d[d["location"] == WANDERING]
+            x = w["r_kpc"] / w["r200_kpc"]
+            print(f"{label[:14]:14s} {tag:10s} {n:4d} {d['location'].isin([WANDERING, NUCLEAR, UNKNOWN]).sum() / n:9.1f} "
+                  f"{len(w) / n:7.1f} {(d['location'] == NUCLEAR).sum() / n:8.1f} "
+                  f"{(d['location'] == UNKNOWN).sum() / n:8.1f} {np.nanmedian(w['r_kpc']) if len(w) else np.nan:9.1f} "
+                  f"{np.mean(x > 1) if len(w) else np.nan:6.2f} {np.mean(x > 3) if len(w) else np.nan:7.2f}")
+    if astrid:
+        wand, r200a, ngal_a = astrid
+        for tag, _, _, _ in mass_bins:
+            b = ASTRID_MASSBIN[tag]
+            s = wand["massbin"] == b
+            x = wand["dist_kpc"][s] / r200a[s]
+            print(f"{'ASTRID':14s} {tag:10s} {ngal_a[b]:4d} {'':9s} {s.sum() / ngal_a[b]:7.1f} {'':8s} {'':8s} "
+                  f"{np.median(wand['dist_kpc'][s]):9.1f} {np.mean(x > 1):6.2f} {np.mean(x > 3):7.2f}")
+
+    # ---------- bins covering everything ----------
+    r_all, x_all = [], []
+    for _, _, df, _ in models:
+        w = df[df["location"] == WANDERING]
+        r_all.append(w["r_kpc"].to_numpy(float))
+        x_all.append((w["r_kpc"] / w["r200_kpc"]).to_numpy(float))
+    if astrid:
+        r_all.append(np.asarray(astrid[0]["dist_kpc"], float))
+        x_all.append(np.asarray(astrid[0]["dist_kpc"] / astrid[1], float))
+    lr_edges = edges_covering(r_all, -1.0, 3.2)
+    lx_edges = edges_covering(x_all, -3.0, 1.0)
+
+    # ---------- figure ----------
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    for tag, blabel, color, _ in mass_bins:
+        if astrid:
+            wand, r200a, ngal_a = astrid
+            b = ASTRID_MASSBIN[tag]
+            s = wand["massbin"] == b
+            for ax, vals, edges in ((axes[0], wand["dist_kpc"][s], lr_edges),
+                                    (axes[1], wand["dist_kpc"][s] / r200a[s], lx_edges)):
+                h = per_dex(vals, edges, ngal_a[b])
+                ax.stairs(np.nan_to_num(h), edges, fill=True, color=color, alpha=0.15, lw=0)
+                ax.stairs(h, edges, color=color, lw=1.0, alpha=0.6, baseline=None)
+        for label, ls, df, ngal in models:
+            w = df[(df["mass_bin"] == tag) & (df["location"] == WANDERING)]
+            n = ngal.get(tag, 0)
+            if not n:
+                continue
+            for ax, vals, edges in ((axes[0], w["r_kpc"], lr_edges),
+                                    (axes[1], w["r_kpc"] / w["r200_kpc"], lx_edges)):
+                ax.stairs(per_dex(vals, edges, n), edges, color=color, lw=2.5, ls=ls, baseline=None)
+
+    axes[1].axvline(0, color="0.4", lw=2, ls=":")
+    axes[1].text(0.03, 0.97, r"$R_{200}$", color="0.4", fontsize=FONT_SIZE - 4, va="top",
+                 transform=axes[1].get_xaxis_transform())
+    log_ticks(axes[0], lr_edges)
+    log_ticks(axes[1], lx_edges)
+    axes[0].set_xlabel(r"$r_{\rm BH}$ (kpc)")
+    axes[1].set_xlabel(r"$r_{\rm BH}\,/\,R_{200}$")
+    axes[0].set_ylabel("BHs per galaxy per dex")
+    for ax in axes:
+        ax.set_yscale("log")
+
+    e = int(np.floor(np.log10(args.astrid_mbh_max)))
+    mtxt = rf"{args.astrid_mbh_max / 10 ** e:.1f}\times10^{{{e}}}"
+    style_handles = []
+    if astrid:
+        style_handles.append(Patch(facecolor="0.6", alpha=0.4, edgecolor="0.4",
+                                   label=rf"ASTRID, $M_{{\rm BH}}<{mtxt}\,M_\odot$"))
+    for label, ls, _, _ in models:
+        style_handles.append(Line2D([], [], color="0.2", lw=2.5, ls=ls,
+                                    label=rf"{label}, $M_{{\rm BH}}\geq{args.mbh_min:g}\,M_\odot$"))
+    color_handles = [Line2D([], [], color=c, lw=4, label=l) for _, l, c, _ in mass_bins]
+    fig.tight_layout()
+    fig.legend(handles=color_handles, loc="lower left", bbox_to_anchor=(0.06, 1.0), ncol=1,
+               frameon=False, title=r"Host stellar mass at $z=0$")
+    fig.legend(handles=style_handles, loc="lower right", bbox_to_anchor=(0.98, 1.0), ncol=1, frameon=False)
+    fig.savefig(args.output, bbox_inches="tight", dpi=200)
+    print(f"\nSaved {args.output}")
+    if not args.no_show:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
