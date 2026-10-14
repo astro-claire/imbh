@@ -193,10 +193,11 @@ class MergerTreeNavigator:
         box = self.box_size_ckpc_h
         new = {k: [] for k in self.data}
         next_id = int(np.max(self.data["SubhaloID"])) + 1
+        real = dict(lookup)   # bracket every gap with REAL rows (consecutive gaps: not the stand-ins just made)
         for gap in self._main_branch_gaps(lookup):
-            s0 = max(s for s in lookup if s < gap)
-            s1 = min(s for s in lookup if s > gap)
-            i0, i1 = self._row(lookup[s0]), self._row(lookup[s1])
+            s0 = max(s for s in real if s < gap)
+            s1 = min(s for s in real if s > gap)
+            i0, i1 = self._row(real[s0]), self._row(real[s1])
             t0, t1, t = (self.age_at_snap(x).value for x in (s0, s1, gap))
             w = (t - t0) / (t1 - t0)
 
