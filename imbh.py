@@ -72,6 +72,14 @@ HOST_CONCENTRATION = 4.0
 # the main-branch progenitor (same-snapshot reframe). Integrating it in the frame of a small
 # host it has left would imprint that host's unmodelled accelerations on it.
 REHOST_MIN_RVIR = 1.0
+# 'fixed' only: a "primary" SubLink continuation is NOT treated as the same host when the host's
+# mass changes by more than this factor between snapshots -- a central/satellite identity swap on
+# the branch (e.g. the main progenitor briefly tracked as a small satellite during a major merger),
+# or a subhalo switching between its own mass and its FoF group's M200 as it becomes/stops being a
+# central. Such steps are handled like mergers: integrated in the old host, then a time-matched
+# reframe. (Central/satellite flips WITHOUT a big mass change are left alone: for tiny halos they
+# are frequent and the reframe would only add their noisy velocity differences.)
+SWAP_MASS_RATIO = 5.0
 FRAME_MODELS = ("fixed", "legacy")
 FRAME_MODEL = "fixed"
 # conversion factor for turning NFWHost.potential()'s internal
@@ -1103,16 +1111,22 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
                      or (grp_bg is not None) or (grp_bg_end is not None))
         subdivided = (t_leg_max > max_leg_duration) or bg_active
         rel_pos_full = rel_vel_full = None
+        host_swap = False
+        if frame_model == "fixed" and next_id is not None and is_primary:
+            ratio = next_mass_msun / mass_msun if mass_msun > 0 else np.inf
+            host_swap = ratio > SWAP_MASS_RATIO or ratio < 1.0 / SWAP_MASS_RATIO
+            swap_masses = (mass_msun, next_mass_msun)
         if next_id is not None:
             if frame_model == "legacy":
                 rel_pos_full, rel_vel_full = navigator.relative_state(current_id, next_id)
-            elif is_primary:
+            elif is_primary and not host_swap:
                 # same host, next snapshot: the cluster moved and accelerated WITH its host,
                 # so its host-relative state carries over unchanged
                 rel_pos_full = np.zeros(3) * u.kpc
                 rel_vel_full = np.zeros(3) * u.km / u.s
             else:
-                # real merger: into the new host's frame, at matching times
+                # real merger (or a central/satellite swap or big mass jump on the same
+                # branch): into the new host's frame, at matching times
                 rel_pos_full, rel_vel_full = navigator.relative_state_matched(current_id, next_id)
 
         # MERGER LEG ('fixed'): the old and new hosts are DIFFERENT objects, so the leg is
@@ -1123,7 +1137,7 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
         # sitting at a small host's centre could be flung out to Mpc distances.) The main-
         # branch background's end state is taken relative to the old host carried forward to
         # the next snapshot; the satellite-group background is held at its start value.
-        merger_leg = (frame_model == "fixed") and (next_id is not None) and (not is_primary)
+        merger_leg = (frame_model == "fixed") and (next_id is not None) and ((not is_primary) or host_swap)
         sub_rel_pos, sub_rel_vel = rel_pos_full, rel_vel_full
         if merger_leg:
             next_mass_msun, next_radius_kpc = mass_msun, radius_kpc
@@ -1155,6 +1169,10 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             print(f"          leg: capped_by={capped_by}, t_leg_max={t_leg_max:.4f}, "
                   f"is_primary={is_primary}, subdivided={subdivided}, background: {bg_str}, "
                   f"H(z)={hubble_start.to(1/u.Gyr).value:.4f} /Gyr, reframe: {rp_str}", flush=True)
+            if host_swap:
+                print(f"          HOST-SWAP: {current_id} -> {next_id} on the same branch "
+                      f"(mass {swap_masses[0]:.3e} -> {swap_masses[1]:.3e} Msun); treated like a merger",
+                      flush=True)
 
             # ENERGY-BASED BOUNDEDNESS DIAGNOSTIC: E = KE + Phi_local (+ Phi_bg
             # if a background potential is active), evaluated at the CURRENT
