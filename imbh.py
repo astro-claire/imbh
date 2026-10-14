@@ -59,7 +59,8 @@ HOST_CONCENTRATION = 4.0
 #           accelerates WITH the host. On a continuation of the same host (no merger) the
 #           cluster's host-relative position/velocity are kept as integrated; at a real merger
 #           they are moved into the new host's frame with the old host's position carried to
-#           the new snapshot's time (tree_navigator.relative_state_matched). Background halos
+#           the new snapshot's time on a ballistic orbit in the new host's potential
+#           (tree_navigator.relative_state_ballistic). Background halos
 #           (main progenitor, satellite group) act as TIDAL fields -- their pull at the host's
 #           centre is subtracted (dynamical_friction.integrate_orbit tidal_backgrounds).
 #  'legacy' : the pre-Oct-2026 behaviour, kept only to reproduce old runs. It added the host's
@@ -1168,7 +1169,8 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             else:
                 # real merger (or a central/satellite swap or big mass jump on the same
                 # branch): into the new host's frame, at matching times
-                rel_pos_full, rel_vel_full = navigator.relative_state_matched(current_id, next_id)
+                rel_pos_full, rel_vel_full = navigator.relative_state_ballistic(
+                    current_id, next_id, concentration=concentration)
 
         # MERGER LEG ('fixed'): the old and new hosts are DIFFERENT objects, so the leg is
         # integrated entirely in the OLD host (its own mass/radius, no interpolation toward
@@ -1187,7 +1189,8 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
             main_end = navigator.main_branch_id_at_snap(next_snap)
             if bg_offset is not None and main_end is not None and main_end != current_id:
                 bg_mass_end_msun, bg_radius_end_kpc, _ = navigator.host_properties(main_end)
-                bg_offset_end = -navigator.relative_state_matched(current_id, main_end)[0]
+                bg_offset_end = -navigator.relative_state_ballistic(
+                    current_id, main_end, concentration=concentration)[0]
             else:
                 bg_mass_end_msun, bg_radius_end_kpc, bg_offset_end = bg_mass_msun, bg_radius_kpc, bg_offset
             grp_bg_end = grp_bg

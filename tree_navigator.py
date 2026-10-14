@@ -517,6 +517,72 @@ class MergerTreeNavigator:
 
         return rel_pos_kpc * u.kpc, rel_vel_kms * u.km / u.s
 
+    def _same_snap_progenitor(self, new_id, snap_old):
+        """new_id's own main progenitor AT snap_old (walking FirstProgenitorID), or the main-branch
+        row there if new_id is the main branch; None if neither has a row at exactly snap_old."""
+        ref = int(new_id)
+        while ref in self.id_to_row and self.snap_of(ref) > snap_old:
+            fp = int(self.data["FirstProgenitorID"][self._row(ref)])
+            if fp == -1 or fp not in self.id_to_row:
+                break
+            ref = fp
+        if ref in self.id_to_row and self.snap_of(ref) == snap_old:
+            return ref
+        if self._main_branch_by_snap.get(self.snap_of(new_id)) == int(new_id):
+            return self._main_branch_by_snap.get(snap_old)
+        return None
+
+    def relative_state_ballistic(self, old_id, new_id, concentration=4.0, hubble=True):
+        """
+        Like relative_state_matched, but old_id is carried to new_id's time on a BALLISTIC ORBIT
+        in new_id's potential instead of a straight line. Starts from old_id's state relative to
+        new_id's own progenitor at old_id's snapshot (an exact same-snapshot difference) and
+        integrates that relative orbit to new_id's snapshot in an NFW whose M200/R200 go
+        log-linearly in time from the progenitor's to new_id's. The straight line x_old + v_old*dt
+        badly overshoots when the old host is caught near pericentre (hundreds of km/s, tens of
+        kpc per snapshot): it keeps the pericentre speed out to large radii and can leave the
+        old host -- and every cluster handed over with it -- unbound. Falls back to
+        relative_state_matched when there is no same-snapshot progenitor (or it is old_id itself,
+        i.e. a primary continuation).
+        """
+        snap_old, snap_new = self.snap_of(old_id), self.snap_of(new_id)
+        if snap_old == snap_new:
+            return self.relative_state(old_id, new_id)
+        ref = self._same_snap_progenitor(new_id, snap_old)
+        if ref is None or int(ref) == int(old_id):
+            return self.relative_state_matched(old_id, new_id)
+        m0, r0, _ = self.host_properties(ref)
+        m1, r1, _ = self.host_properties(new_id)
+        if not (m0 > 0 and r0 > 0 and m1 > 0 and r1 > 0):
+            return self.relative_state_matched(old_id, new_id)
+        from scipy.integrate import solve_ivp
+        from dynamical_friction import NFWHost, _G
+        kms_to_kpcgyr = (1 * u.km / u.s).to(u.kpc / u.Gyr).value
+        dpos, dvel = self.relative_state(old_id, ref)
+        # SubhaloVel is a PECULIAR velocity: add the Hubble flow for the physical relative orbit
+        # (and take it off again at the end) when hubble=True
+        h0 = self.hubble_rate_at_snap(snap_old).to(1 / u.Gyr).value if hubble else 0.0
+        h1 = self.hubble_rate_at_snap(snap_new).to(1 / u.Gyr).value if hubble else 0.0
+        x0 = dpos.to(u.kpc).value
+        y0 = np.concatenate([x0, dvel.to(u.km / u.s).value * kms_to_kpcgyr + h0 * x0])
+        dt = float((self.age_at_snap(snap_new) - self.age_at_snap(snap_old)).to(u.Gyr).value)
+        r_soft = 0.01 * min(r0, r1)
+
+        def rhs(t, y):
+            w = t / dt
+            host = NFWHost(m0 ** (1 - w) * m1 ** w * u.Msun, r0 ** (1 - w) * r1 ** w * u.kpc,
+                           concentration=concentration)
+            r = np.linalg.norm(y[:3])
+            rs = max(r, r_soft)
+            acc = -_G * host.mass_enclosed(rs) / rs ** 3 * y[:3] if r > 0 else np.zeros(3)
+            return np.concatenate([y[3:], acc])
+
+        sol = solve_ivp(rhs, (0.0, dt), y0, method="RK45", rtol=1e-6, atol=1e-6)
+        if not sol.success:
+            return self.relative_state_matched(old_id, new_id)
+        y1 = sol.y[:, -1]
+        return y1[:3] * u.kpc, ((y1[3:] - h1 * y1[:3]) / kms_to_kpcgyr) * u.km / u.s
+
     def relative_state_matched(self, old_id, new_id):
         """
         Like relative_state, but TIME-MATCHED when old_id and new_id sit at different
