@@ -67,11 +67,18 @@ HOST_CONCENTRATION = 4.0
 #           cluster at EVERY snapshot, i.e. treated the cluster as standing still while its host
 #           moved (kpc per snapshot at high z), and applied the full (non-tidal) background
 #           pull. Clusters were thrown out of their hosts almost immediately.
-# 'fixed' only: a cluster that is OUTSIDE REHOST_MIN_RVIR * R_vir of a host that is not the
-# main branch AND not bound to it (KE + Phi_host > 0) is re-assigned, at the next snapshot, to
-# the main-branch progenitor (same-snapshot reframe). Integrating it in the frame of a small
-# host it has left would imprint that host's unmodelled accelerations on it.
+# 'fixed' only: RE-HOSTING. A cluster that is NOT bound to its current host (KE + Phi_host > 0;
+# a host that is not the main branch) is re-assigned, at the start of the next snapshot's leg
+# (same-snapshot reframe), to the larger structure it IS bound to: among the tree subhalos at that
+# snapshot at least as massive as the current host and within REHOST_SEARCH_RVIR of their own
+# R_vir, the one it is most deeply bound to in units of that host's V_vir^2 (so a cluster stripped
+# from a satellite stays with the satellite's group as the group falls in, instead of becoming a
+# lone test particle in the main progenitor's frame that misses the group's own dynamical
+# friction). If it is bound to none of them and lies beyond REHOST_MIN_RVIR * R_vir of its host,
+# it goes to the main-branch progenitor (the earlier behaviour). Integrating it in the frame of a
+# small host it has left would imprint that host's unmodelled accelerations on it.
 REHOST_MIN_RVIR = 1.0
+REHOST_SEARCH_RVIR = 2.0
 # 'fixed' only: a "primary" SubLink continuation is NOT treated as the same host when the host's
 # mass changes by more than this factor between snapshots -- a central/satellite identity swap on
 # the branch (e.g. the main progenitor briefly tracked as a small satellite during a major merger),
@@ -344,6 +351,32 @@ def draw_formation_age(navigator, start_snap, rng, mode="uniform"):
     age = rng.uniform(t_prev_gyr, t_snap_gyr) * u.Gyr
     z = float(z_at_value(navigator.cosmo.age, age, zmin=z_snap * 0.999, zmax=z_prev * 1.001).value)
     return age, z
+
+
+def _rehost_target(navigator, current_id, r_vec, v_vec, mass_msun, concentration):
+    """
+    ('fixed' re-hosting) The tree subhalo at current_id's snapshot that a cluster at r_vec/v_vec
+    (relative to current_id) should be handed to: among subhalos at least as massive as the
+    current host whose centre is within REHOST_SEARCH_RVIR of their own R_vir from the cluster,
+    the one with the most negative E / V_vir^2 (E = KE + Phi_NFW in that subhalo's frame).
+    Returns (subhalo_id, E/V_vir^2), or None if the cluster is bound to none of them.
+    """
+    r_kpc = r_vec.to(u.kpc).value
+    best = None
+    for cid in navigator.nearby_subhalos(current_id, r_kpc, max_group_r200=REHOST_SEARCH_RVIR):
+        m_c, r_c, _ = navigator.host_properties(cid)
+        if not (m_c >= mass_msun and r_c > 0):
+            continue
+        dp, dv = navigator.relative_state(current_id, cid)
+        r_new, v_new = r_vec + dp, v_vec + dv
+        if np.linalg.norm(r_new.to(u.kpc).value) > REHOST_SEARCH_RVIR * r_c:
+            continue
+        _, ke, phi, _ = _compute_specific_energy_kms2(r_new, v_new, m_c, r_c, concentration)
+        vvir2 = (G * m_c * u.Msun / (r_c * u.kpc)).to(u.km ** 2 / u.s ** 2).value
+        e_norm = (ke + phi) / vvir2
+        if e_norm < 0 and (best is None or e_norm < best[1]):
+            best = (int(cid), float(e_norm))
+    return best
 
 
 def _compute_specific_energy_kms2(r_vec, v_vec, mass_msun, radius_kpc, concentration,
@@ -955,25 +988,33 @@ def trace_cluster_to_snapshot(cluster_mass, r0_vec, v0_vec, start_subhalo_id, ta
     for step in range(max_steps):
         mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
 
-        # ('fixed') re-host a cluster that has left a non-main-branch host and is unbound
-        # from it: move it into the main-branch progenitor's frame (same snapshot)
+        # ('fixed') re-host a cluster that is unbound from a non-main-branch host: move it into the
+        # frame of the larger structure it is bound to, or of the main-branch progenitor
         if frame_model == "fixed" and step > 0:
             mb_id = navigator.main_branch_id_at_snap(snap)
-            r_now = float(np.linalg.norm(r_vec.to(u.kpc).value))
-            if mb_id is not None and mb_id != current_id and r_now > REHOST_MIN_RVIR * radius_kpc:
+            if mb_id is not None and mb_id != current_id:
                 _, ke_loc, phi_loc, _ = _compute_specific_energy_kms2(
                     r_vec, v_vec, mass_msun, radius_kpc, concentration)
                 if ke_loc + phi_loc > 0:
-                    rel_pos_mb, rel_vel_mb = navigator.relative_state(current_id, mb_id)
-                    if verbose:
-                        print(f"[step {step}] RE-HOST: unbound at {r_now:.3f} kpc "
-                              f"({r_now / radius_kpc:.2f} R_vir) of {current_id} -> main branch {mb_id}",
-                              flush=True)
-                    r_vec = r_vec + rel_pos_mb
-                    v_vec = v_vec + rel_vel_mb
-                    current_id = mb_id
-                    n_hops += 1
-                    mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
+                    r_now = float(np.linalg.norm(r_vec.to(u.kpc).value))
+                    target = _rehost_target(navigator, current_id, r_vec, v_vec, mass_msun,
+                                            concentration)
+                    if target is None and r_now > REHOST_MIN_RVIR * radius_kpc:
+                        target = (mb_id, None)
+                    if target is not None:
+                        new_id, e_norm = target
+                        rel_pos_new, rel_vel_new = navigator.relative_state(current_id, new_id)
+                        if verbose:
+                            kind = ("main branch" if new_id == mb_id else
+                                    f"bound structure (E = {e_norm:.2f} V_vir^2)")
+                            print(f"[step {step}] RE-HOST: unbound at {r_now:.3f} kpc "
+                                  f"({r_now / radius_kpc:.2f} R_vir) of {current_id} -> {kind} {new_id}",
+                                  flush=True)
+                        r_vec = r_vec + rel_pos_new
+                        v_vec = v_vec + rel_vel_new
+                        current_id = new_id
+                        n_hops += 1
+                        mass_msun, radius_kpc, snap = navigator.host_properties(current_id)
 
         hubble_start = navigator.hubble_rate_at_snap(snap)
 
@@ -1951,7 +1992,8 @@ def main():
 
     navigator = MergerTreeNavigator(tree_path, args.snap_redshift_path, box_size_ckpc_h=args.box_size,
                                     host_mass_model=args.host_mass_model,
-                                    fill_main_branch_gaps=not args.no_fill_main_branch_gaps)
+                                    fill_main_branch_gaps=not args.no_fill_main_branch_gaps,
+                                    repair_main_branch_glitches=(args.frame_model == "fixed"))
     print(f"host_mass_model = {args.host_mass_model!r}")
     print(f"frame_model = {args.frame_model!r}, inspiral capture at {args.inspiral_capture_frac:g} r_stop")
     target_age = navigator.age_at_snap(args.output_snap)

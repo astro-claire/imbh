@@ -197,7 +197,8 @@ def main():
 
         tree = os.path.join(args.tree_dir, f"sublink_full_{halo}.hdf5")
         nav = MergerTreeNavigator(tree, args.snap_redshift_path, box_size_ckpc_h=35000.0,
-                                  host_mass_model=args.host_mass_model)
+                                  host_mass_model=args.host_mass_model,
+                                  repair_main_branch_glitches=(args.frame_model == "fixed"))
         target_age = nav.age_at_snap(args.snap)
 
         for row in picks:

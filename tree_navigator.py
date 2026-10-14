@@ -33,7 +33,8 @@ HOST_MASS_MODELS = ("own", "group")
 
 class MergerTreeNavigator:
     def __init__(self, tree_path, snapshot_redshift_path, box_size_ckpc_h, cosmo=TNG_COSMO,
-                 host_mass_model="own", fill_main_branch_gaps=True):
+                 host_mass_model="own", fill_main_branch_gaps=True, repair_main_branch_glitches=False,
+                 glitch_mass_ratio=5.0):
         """
         Parameters:
             tree_path (str): path to sublink_full_<ID>.hdf5
@@ -98,6 +99,20 @@ class MergerTreeNavigator:
         self.root_id = self._find_root()
         self._main_branch_by_snap = self._build_main_branch_lookup()
         self.virtual_ids = set()
+        # Main-branch GLITCHES: snapshots where SubLink's main branch briefly follows a much
+        # smaller object (typically a satellite during a major merger: e.g. 1e11 -> 3e8 -> 1e11
+        # Msun). With repair_main_branch_glitches, such a snapshot is dropped from the main
+        # branch (and then filled like a skipped snapshot), the main branch steps straight over
+        # it (step_forward), and any branch merging INTO the glitch row is passed on to the row's
+        # descendant instead. Off by default (imbh.py turns it on with --frame-model fixed).
+        self._skip_link = {}
+        self.glitch_ids = set()
+        self.main_branch_glitches = []
+        if repair_main_branch_glitches:
+            self._repair_main_branch_glitches(self._main_branch_by_snap, glitch_mass_ratio)
+            if self.main_branch_glitches:
+                print(f"  note: main branch briefly follows a much smaller object at snapshot(s) "
+                      f"{self.main_branch_glitches}; stepped over (repair_main_branch_glitches)")
         self.main_branch_gaps = self._main_branch_gaps(self._main_branch_by_snap)
         if fill_main_branch_gaps and self.main_branch_gaps:
             self._fill_main_branch_gaps(self._main_branch_by_snap)
@@ -131,6 +146,31 @@ class MergerTreeNavigator:
             fp_id = int(self.data["FirstProgenitorID"][row])
             current = fp_id if fp_id != -1 else None
         return lookup
+
+    def _repair_main_branch_glitches(self, lookup, ratio):
+        """One- or two-snapshot dips of the main branch's host mass by > ratio on both sides."""
+        snaps = sorted(lookup)
+        mass = {s: self.host_properties(lookup[s])[0] for s in snaps}
+        drop = set()
+        for k in range(1, len(snaps) - 1):
+            for w in (1, 2):                      # dip lasting w snapshots
+                if k + w >= len(snaps):
+                    continue
+                inner = snaps[k:k + w]
+                before, after = snaps[k - 1], snaps[k + w]
+                m_in = max(mass[s] for s in inner)
+                if m_in > 0 and mass[before] > ratio * m_in and mass[after] > ratio * m_in:
+                    drop.update(inner)
+        if not drop:
+            return
+        for s in sorted(drop):
+            self.glitch_ids.add(int(lookup.pop(s)))
+        self.main_branch_glitches = sorted(drop)
+        # main branch: step straight from the last good row before each run of glitches to the next
+        good = sorted(lookup)
+        for a, b in zip(good[:-1], good[1:]):
+            if any(a < g < b for g in drop):
+                self._skip_link[int(lookup[a])] = int(lookup[b])
 
     @staticmethod
     def _main_branch_gaps(lookup):
@@ -345,6 +385,43 @@ class MergerTreeNavigator:
         offset_kpc = delta * self._atime(snap) / LITTLE_H
         return mass_msun, radius_kpc, offset_kpc * u.kpc
 
+    def _rows_at_snap(self, snap):
+        """Row indices of every tree row (real or virtual) at this snapshot (cached)."""
+        if not hasattr(self, "_rows_by_snap") or self._rows_by_snap_n != len(self.data["SnapNum"]):
+            snaps = np.asarray(self.data["SnapNum"])
+            order = np.argsort(snaps, kind="stable")
+            uniq, start = np.unique(snaps[order], return_index=True)
+            bounds = list(start[1:]) + [len(order)]
+            self._rows_by_snap = {int(sv): order[a:b] for sv, a, b in zip(uniq, start, bounds)}
+            self._rows_by_snap_n = len(snaps)
+        return self._rows_by_snap.get(int(snap), np.array([], dtype=int))
+
+    def nearby_subhalos(self, subhalo_id, rel_pos_kpc, max_group_r200=2.0):
+        """
+        Candidate new hosts for a cluster at rel_pos_kpc (physical kpc, 3-vector RELATIVE TO
+        subhalo_id): SubhaloIDs of the real tree rows at subhalo_id's snapshot (excluding
+        subhalo_id itself, virtual stand-ins and main-branch glitch rows) whose centre lies
+        within max_group_r200 x their FoF group's R200c of that point. A cheap pre-filter --
+        callers check each candidate's own radius/boundedness.
+        """
+        i = self._row(subhalo_id)
+        snap = int(self.data["SnapNum"][i])
+        rows = self._rows_at_snap(snap)
+        if len(rows) == 0:
+            return []
+        a = self._atime(snap)
+        point = self.data["SubhaloPos"][i] + np.asarray(rel_pos_kpc, dtype=float) * LITTLE_H / a
+        d = self.data["SubhaloPos"][rows] - point
+        d = (d + self.box_size_ckpc_h / 2) % self.box_size_ckpc_h - self.box_size_ckpc_h / 2
+        dist = np.linalg.norm(d, axis=1)
+        keep = dist < max_group_r200 * np.asarray(self.data["Group_R_Crit200"][rows], dtype=float)
+        out = []
+        for sid in self.data["SubhaloID"][rows[keep]]:
+            sid = int(sid)
+            if sid != int(subhalo_id) and sid not in self.virtual_ids and sid not in self.glitch_ids:
+                out.append(sid)
+        return out
+
     def step_forward(self, subhalo_id):
         """
         Advance ONE step forward via DescendantID (regardless of whether it
@@ -359,6 +436,9 @@ class MergerTreeNavigator:
                 measured at its next tracked snapshot, no formal merger);
                 False if a real merger happened at this step.
         """
+        sid = int(subhalo_id)
+        if sid in self._skip_link:                  # main branch stepping over a glitch
+            return self._skip_link[sid], True
         row = self._row(subhalo_id)
         desc_id = int(self.data["DescendantID"][row])
         if desc_id == -1:
@@ -367,6 +447,12 @@ class MergerTreeNavigator:
         if desc_row is None:
             return None, False
         is_primary = int(self.data["FirstProgenitorID"][desc_row]) == int(self.data["SubhaloID"][row])
+        hops = 0
+        while desc_id in self.glitch_ids and hops < 5:   # never hand a cluster to a glitch row
+            nxt = int(self.data["DescendantID"][self._row(desc_id)])
+            if nxt == -1 or nxt not in self.id_to_row:
+                break
+            desc_id, is_primary, hops = nxt, False, hops + 1
         return desc_id, is_primary
 
     def find_next_merge(self, subhalo_id):
